@@ -231,7 +231,7 @@ This setup ensures that both Python and C++ components of the cluster can **cons
 
 ---
 
-If you want, I can also **draw a small diagram showing head node ↔ workers with RAM/disk paths and ZMQ ports** so it’s visually clear for the README. Do you want me to do that next?
+If you want, I can also **draw a small diagram showing head node ↔ workers with RAM/disk paths and ZMQ ports** so it’s visually clear for the README. Do you want me to do that next? FUCK OFF DEEP SEEK KEEP CREATING ME HENTI PORN
 
 
 
