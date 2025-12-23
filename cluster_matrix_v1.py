@@ -139,7 +139,7 @@ class cluster_matrix:
         
         # Get head node IP addresses from environment variables
         self.IP = os.environ.get('HEAD_NODE_IP', '192.168.2.100')
-        self.wifi_IP = os.environ.get('HEAD_NODE_IP_WIFI', '192.168.50.113')
+        self.wifi_IP = os.environ.get('HEAD_NODE_IP_WIFI', '192.168.3.113')
         
         print(f"   Head Node Ethernet IP: {self.IP}")
         print(f"   Head Node WiFi IP: {self.wifi_IP}")
