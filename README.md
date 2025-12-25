@@ -1,12 +1,8 @@
 NEW UPDATES THE PROGRAM WORKS MUCH BETTER NOW!!!
 
-right now matrix operations are not happening parallel like they should. (fix coming later today!)
+code is much cleaner and more efficient!!!
 
-but code is much cleaner and more efficient 
-
-
-####FIX COMING SOON FOR MUCH BETTER PERFORMANCE###
-
+BELOW ARE OUTPUT FROM THE FRONT END 
 ======================================================================
 🏁 INITIALIZATION COMPLETE
 ======================================================================
@@ -18,7 +14,7 @@ but code is much cleaner and more efficient
 
 ✅ Cluster operation completed
 Result name: big_matrixxbig_matrix
-Cluster operation time: 16.44 seconds
+Cluster operation time: 8.35 seconds
 
 ============================================================
 🔍 PYTORCH REFERENCE (SINGLE NODE)
@@ -34,7 +30,7 @@ tensor([[0.5822, 0.4205, 0.3506, 0.7201, 0.6890],
         [0.3265, 0.1357, 0.2475, 0.8788, 0.5820]])
 
 Reference result shape: torch.Size([20000, 20000])
-Single-node PyTorch computation time: 22.24s
+Single-node PyTorch computation time: 22.74s
 First 2500 elements of reference result:
 tensor([6642.2144, 4998.1240, 4964.3613,  ..., 5005.1006, 4977.2671,
         5025.6562])
@@ -53,18 +49,465 @@ tensor([[6642.2144, 4998.1240, 4964.3613, 4969.4556, 4994.3457],
 ============================================================
 🏁 PERFORMANCE COMPARISON
 ============================================================
-CLUSTER OPERATION TIME:      16.4384 seconds
-SINGLE NODE PYTORCH TIME:    22.2420 seconds
+CLUSTER OPERATION TIME:      8.3546 seconds
+SINGLE NODE PYTORCH TIME:    22.7372 seconds
 ------------------------------------------------------------
-CLUSTER vs SINGLE NODE: 1.35x faster
-(ray-conda-env) rino@rino-Z370-HD3:~/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix$ 
+CLUSTER vs SINGLE NODE: 2.72x faster
+# Node configuration for the cluster
+               RX-5500         RX-6400
+IP_list = ['192.168.2.100','192.168.2.100']   
+percentages = [0.5,0.5]  
+CPU_GPU_select_list = [True, True]  
+backend_select_list = ['llama','llama']  
 
-- above is torch CPU vs 6400 and 5500 two GPUs that are not supported by CUDA.
 
-cluster_start_time = time.time()
-cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, True) <<----- above was run with send_back=True so the matrix was multiplied abd recombined to the correct results!!
-cluster_end_time = time.time()
+using a RX 5500 and RX 6400 AMD GPU 
 
+
+
+FULL OUTPUT FROM FRONT END RUN!
+
+============================================================
+🚀 CLUSTER MATRIX DISTRIBUTION SYSTEM TEST
+============================================================
+
+📦 Creating and distributing matrix A (split=True)...
+======================================================================
+🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM
+======================================================================
+
+📋 VALIDATING NODE CONFIGURATION...
+✅ Node configuration validated: 2 nodes configured
+✅ Percentage distribution validated: 1.000000
+
+🌐 CONFIGURING NETWORK SETTINGS...
+   Head Node Ethernet IP: 192.168.2.100
+   Head Node WiFi IP: 192.168.50.113
+   Head Node Ports: PULL=7779, PUSH=7780
+   Worker Node Ports: PULL=5557, PUSH=5558
+   Cluster Barrier Port: 7790
+
+📁 CONFIGURING STORAGE PATHS...
+   Local Paths:
+     - RAM Results: /dev/shm/matrix_results/
+     - Disk Folder: matrix_shards/
+     - RAM Folder: /dev/shm/matrix_shards/
+     - Project Dir: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/
+   Remote Paths:
+     - Disk Folder: matrix_shards/
+     - RAM Folder: /dev/shm/matrix_shards/
+     - RAM Results: /dev/shm/matrix_results/
+     - Project Dir: /home/rino/Desktop/Open_Cluster_AI_Station_beta/
+
+📊 INITIALIZING INSTANCE VARIABLES...
+   Matrix Name: big_matrix
+   Split Matrix: True
+   Dimension: 0
+
+📂 CREATING LOCAL DIRECTORIES...
+✅ All required directories already exist
+
+🔌 SETTING UP ZEROMQ CONNECTIONS...
+   Connecting to 1 unique nodes...
+   ✅ Connected to worker WiFi 192.168.3.13:5557
+   ✅ Connected to head node (self) 192.168.2.100:7779
+   Total sockets in pool: 1
+
+🔄 SETTING UP CLUSTER BARRIER/ACK RECEIVER...
+✅ Python frontend ACK receiver bound to port 7790
+
+📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...
+   Sending command: mkdir -p matrix_shards/ /dev/shm/matrix_shards/ /dev/shm/matrix_results/
+   ✅ Directory creation command sent to 192.168.2.100
+
+======================================================================
+🧮 MATRIX DISTRIBUTION PHASE
+======================================================================
+   Matrix file exists: True
+   Split matrix mode: True
+
+📝 CASE 1: NEW MATRIX - CONVERT, DISTRIBUTE, AND LOAD
+   Processing steps:
+   1. Convert to cluster matrix shards
+   2. Distribute shards to nodes
+   3. Load distributed shards
+======================================================================
+🔪 CONVERTING MATRIX TO DISTRIBUTED SHARDS
+======================================================================
+
+📦 LOADING ORIGINAL MATRIX...
+   File path: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/model_matrixs/big_matrix.pt
+✅ Successfully loaded matrix
+   - Shape: torch.Size([20000, 20000])
+   - Data type: torch.float32
+   - Device: cpu
+   - Original matrix shape stored: [20000, 20000]
+
+⚙️  CONFIGURING SHARD PARAMETERS...
+   Requested shards: 100
+   Split dimension (dim=0): size = 20000
+   ✅ Matrix size supports 100 shards
+   Final shard count: 100
+
+🔪 SPLITTING MATRIX INTO INITIAL SHARDS...
+   Creating exact shard sizes along dim=0 to cover all rows/cols
+✅ Successfully split matrix
+   - Created 100 shards
+   - Each shard shape: torch.Size([200, 20000])
+   - Shard sizes along dim 0: [200, 200, 200, 200, 200]... (first 5)
+   - Total elements in shards: 20000 (should equal 20000)
+
+🌐 DISTRIBUTING SHARDS TO CLUSTER NODES...
+   Number of nodes: 2
+   Node percentages: ['50.0%', '50.0%']
+   Total shards available: 100
+
+   Node   Shards   Percentage   Shape                Start    End     
+   --------------------------------------------------------------
+   0      50         50.0%    torch.Size([10000, 20000]) 0        49      
+   1      50         50.0%    torch.Size([10000, 20000]) 50       99      
+
+   📊 All 100 shards have been allocated
+
+📊 DISTRIBUTION VERIFICATION:
+   Original matrix size (dim 0): 20000
+   Total after distribution (dim 0): 20000
+   ✅ SUCCESS: All elements accounted for!
+
+   Distribution summary:
+   Node 0: torch.Size([10000, 20000]) (50.0% of total)
+   Node 1: torch.Size([10000, 20000]) (50.0% of total)
+
+======================================================================
+✅ MATRIX SHARD CONVERSION COMPLETE
+======================================================================
+Starting distribution of 2 shards to 1 unique nodes
+Processing shard 0 for node 192.168.2.100
+  Head node: Saving to DISK=matrix_shards/big_matrix_shard_0.bin
+  Head node: Saving to RAM=/dev/shm/matrix_shards/big_matrix_shard_0.bin
+Saving matrix to binary file: matrix_shards/big_matrix_shard_0.bin
+  Converting input to numpy array...
+    Input is PyTorch tensor: shape=torch.Size([10000, 20000]), dtype=torch.float32, device=cpu
+    Converted to CPU float32 numpy array
+  Final numpy array: shape=(10000, 20000), dtype=float32
+  Converting to 4D format...
+    2D (10000, 20000) -> 4D (1, 1, 10000, 20000)
+  Writing binary file...
+    Wrote ndim: 4
+    Dimensions: 1 × 1 × 10000 × 20000
+    Wrote 200,000,000 float32 elements
+  File saved successfully
+  File size: 800,000,020 bytes
+  Expected size: 800,000,020 bytes
+  ✓ File size verification passed
+  Memory usage: 762.94 MB
+  Save completed: matrix_shards/big_matrix_shard_0.bin
+Saving matrix to binary file: /dev/shm/matrix_shards/big_matrix_shard_0.bin
+  Converting input to numpy array...
+    Input is PyTorch tensor: shape=torch.Size([10000, 20000]), dtype=torch.float32, device=cpu
+    Converted to CPU float32 numpy array
+  Final numpy array: shape=(10000, 20000), dtype=float32
+  Converting to 4D format...
+    2D (10000, 20000) -> 4D (1, 1, 10000, 20000)
+  Writing binary file...
+    Wrote ndim: 4
+    Dimensions: 1 × 1 × 10000 × 20000
+    Wrote 200,000,000 float32 elements
+  File saved successfully
+  File size: 800,000,020 bytes
+  Expected size: 800,000,020 bytes
+  ✓ File size verification passed
+  Memory usage: 762.94 MB
+  Save completed: /dev/shm/matrix_shards/big_matrix_shard_0.bin
+  Added RAM path to file list
+Processing shard 1 for node 192.168.2.100
+  Head node: Saving to DISK=matrix_shards/big_matrix_shard_1.bin
+  Head node: Saving to RAM=/dev/shm/matrix_shards/big_matrix_shard_1.bin
+Saving matrix to binary file: matrix_shards/big_matrix_shard_1.bin
+  Converting input to numpy array...
+    Input is PyTorch tensor: shape=torch.Size([10000, 20000]), dtype=torch.float32, device=cpu
+    Converted to CPU float32 numpy array
+  Final numpy array: shape=(10000, 20000), dtype=float32
+  Converting to 4D format...
+    2D (10000, 20000) -> 4D (1, 1, 10000, 20000)
+  Writing binary file...
+    Wrote ndim: 4
+    Dimensions: 1 × 1 × 10000 × 20000
+    Wrote 200,000,000 float32 elements
+  File saved successfully
+  File size: 800,000,020 bytes
+  Expected size: 800,000,020 bytes
+  ✓ File size verification passed
+  Memory usage: 762.94 MB
+  Save completed: matrix_shards/big_matrix_shard_1.bin
+Saving matrix to binary file: /dev/shm/matrix_shards/big_matrix_shard_1.bin
+  Converting input to numpy array...
+    Input is PyTorch tensor: shape=torch.Size([10000, 20000]), dtype=torch.float32, device=cpu
+    Converted to CPU float32 numpy array
+  Final numpy array: shape=(10000, 20000), dtype=float32
+  Converting to 4D format...
+    2D (10000, 20000) -> 4D (1, 1, 10000, 20000)
+  Writing binary file...
+    Wrote ndim: 4
+    Dimensions: 1 × 1 × 10000 × 20000
+    Wrote 200,000,000 float32 elements
+  File saved successfully
+  File size: 800,000,020 bytes
+  Expected size: 800,000,020 bytes
+  ✓ File size verification passed
+  Memory usage: 762.94 MB
+  Save completed: /dev/shm/matrix_shards/big_matrix_shard_1.bin
+  Added RAM path to file list
+Waiting for ACKs from 0 remote nodes...
+✅ All ACKs received!
+Distribution complete: 2 shards saved and distributed
+
+======================================================================
+🏁 INITIALIZATION COMPLETE
+======================================================================
+✅ Cluster matrix initialization successful!
+   - Total nodes configured: 2
+   - Matrix handling mode: Split
+   - Backends: ['llama', 'llama']
+   - CPU/GPU selections: [True, True]
+
+📦 Creating and distributing matrix B (split=False)...
+======================================================================
+🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM
+======================================================================
+
+📋 VALIDATING NODE CONFIGURATION...
+✅ Node configuration validated: 2 nodes configured
+✅ Percentage distribution validated: 1.000000
+
+🌐 CONFIGURING NETWORK SETTINGS...
+   Head Node Ethernet IP: 192.168.2.100
+   Head Node WiFi IP: 192.168.50.113
+   Head Node Ports: PULL=7779, PUSH=7780
+   Worker Node Ports: PULL=5557, PUSH=5558
+   Cluster Barrier Port: 7790
+
+📁 CONFIGURING STORAGE PATHS...
+   Local Paths:
+     - RAM Results: /dev/shm/matrix_results/
+     - Disk Folder: matrix_shards/
+     - RAM Folder: /dev/shm/matrix_shards/
+     - Project Dir: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/
+   Remote Paths:
+     - Disk Folder: matrix_shards/
+     - RAM Folder: /dev/shm/matrix_shards/
+     - RAM Results: /dev/shm/matrix_results/
+     - Project Dir: /home/rino/Desktop/Open_Cluster_AI_Station_beta/
+
+📊 INITIALIZING INSTANCE VARIABLES...
+   Matrix Name: big_matrix
+   Split Matrix: False
+   Dimension: 0
+
+📂 CREATING LOCAL DIRECTORIES...
+✅ All required directories already exist
+
+🔌 SETTING UP ZEROMQ CONNECTIONS...
+   Connecting to 1 unique nodes...
+   ✅ Connected to worker WiFi 192.168.3.13:5557
+   ✅ Connected to head node (self) 192.168.2.100:7779
+   Total sockets in pool: 1
+
+🔄 SETTING UP CLUSTER BARRIER/ACK RECEIVER...
+✅ ACK receiver already exists on port 7790
+
+📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...
+   Sending command: mkdir -p matrix_shards/ /dev/shm/matrix_shards/ /dev/shm/matrix_results/
+   ✅ Directory creation command sent to 192.168.2.100
+
+======================================================================
+🧮 MATRIX DISTRIBUTION PHASE
+======================================================================
+   Matrix file exists: True
+   Split matrix mode: False
+
+📦 CASE 3: DISTRIBUTING FULL MATRIX (NO SPLITTING)
+   Processing steps:
+   1. Save full matrix in binary format
+   2. Distribute to all nodes
+Preparing full matrix: big_matrix.bin
+Local paths - DISK: matrix_shards/big_matrix.bin, RAM: /dev/shm/matrix_shards/big_matrix.bin
+Loading matrix from: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/model_matrixs/big_matrix.pt
+Matrix loaded - Shape: torch.Size([20000, 20000])
+Saving to local storage...
+Saving matrix to binary file: matrix_shards/big_matrix.bin
+  Converting input to numpy array...
+    Input is PyTorch tensor: shape=torch.Size([20000, 20000]), dtype=torch.float32, device=cpu
+    Converted to CPU float32 numpy array
+  Final numpy array: shape=(20000, 20000), dtype=float32
+  Converting to 4D format...
+    2D (20000, 20000) -> 4D (1, 1, 20000, 20000)
+  Writing binary file...
+    Wrote ndim: 4
+    Dimensions: 1 × 1 × 20000 × 20000
+    Wrote 400,000,000 float32 elements
+  File saved successfully
+  File size: 1,600,000,020 bytes
+  Expected size: 1,600,000,020 bytes
+  ✓ File size verification passed
+  Memory usage: 1525.88 MB
+  Save completed: matrix_shards/big_matrix.bin
+Saving matrix to binary file: /dev/shm/matrix_shards/big_matrix.bin
+  Converting input to numpy array...
+    Input is PyTorch tensor: shape=torch.Size([20000, 20000]), dtype=torch.float32, device=cpu
+    Converted to CPU float32 numpy array
+  Final numpy array: shape=(20000, 20000), dtype=float32
+  Converting to 4D format...
+    2D (20000, 20000) -> 4D (1, 1, 20000, 20000)
+  Writing binary file...
+    Wrote ndim: 4
+    Dimensions: 1 × 1 × 20000 × 20000
+    Wrote 400,000,000 float32 elements
+  File saved successfully
+  File size: 1,600,000,020 bytes
+  Expected size: 1,600,000,020 bytes
+  ✓ File size verification passed
+  Memory usage: 1525.88 MB
+  Save completed: /dev/shm/matrix_shards/big_matrix.bin
+Remote paths - RAM: /dev/shm/matrix_shards/big_matrix.bin, DISK: /home/rino/Desktop/Open_Cluster_AI_Station_beta/matrix_shards/big_matrix.bin
+Distributing to 0 remote node(s)...
+✅ All ACKs received!
+Full matrix distribution completed
+Total file paths tracked: 2
+
+======================================================================
+🏁 INITIALIZATION COMPLETE
+======================================================================
+✅ Cluster matrix initialization successful!
+   - Total nodes configured: 2
+   - Matrix handling mode: Full
+   - Backends: ['llama', 'llama']
+   - CPU/GPU selections: [True, True]
+
+============================================================
+🧮 PERFORMING CLUSTER MATRIX OPERATION
+============================================================
+Operation: MatrixA @ MatrixB.T
+Nodes: 2
+Backends: ['llama', 'llama']
+GPU usage: [True, True]
+
+============================================================
+🚀 STARTING CLUSTER OPERATION
+============================================================
+Matrix A: big_matrix
+Matrix B: big_matrix
+Operation: mul
+Transpose A: False, Transpose B: True
+Send back result: False
+Number of shards: 2
+
+📊 Result base: big_matrixxbig_matrix (send_back=False)
+⚠️  Could not validate shard 0: name '_infer_rows_cols_from_bin' is not defined
+⚠️  Could not validate shard 1: name '_infer_rows_cols_from_bin' is not defined
+✅ Shard count validation complete
+🧹 Removed stale result: /dev/shm/matrix_shards/big_matrixxbig_matrix_shard_1.bin
+🧹 Removed stale result: /dev/shm/matrix_shards/big_matrixxbig_matrix_shard_0.bin
+
+📤 DISTRIBUTING OPERATIONS TO NODES
+----------------------------------------
+
+Processing shard 0:
+  Node: 192.168.2.100
+  Backend: llama
+  Use GPU: True (GPU #0)
+  Matrix A path: /dev/shm/matrix_shards/big_matrix_shard_0.bin
+  Matrix B path: /dev/shm/matrix_shards/big_matrix.bin
+  Final transpose flags - A: false, B: false
+  Send back result: No (keep distributed)
+  Sending command to node...
+  ✅ Command sent to node 192.168.2.100
+  Incremented GPU counter for node 192.168.2.100 to 1
+
+Processing shard 1:
+  Node: 192.168.2.100
+  Backend: llama
+  Use GPU: True (GPU #1)
+  Matrix A path: /dev/shm/matrix_shards/big_matrix_shard_1.bin
+  Matrix B path: /dev/shm/matrix_shards/big_matrix.bin
+  Final transpose flags - A: false, B: false
+  Send back result: No (keep distributed)
+  Sending command to node...
+  ✅ Command sent to node 192.168.2.100
+  Incremented GPU counter for node 192.168.2.100 to 2
+
+⏳ WAITING FOR ACKS FROM NODES (2)
+✅ Received ACK 1/2
+✅ Received ACK 2/2
+✅ All ACKs received!
+
+============================================================
+✅ CLUSTER OPERATION COMPLETE
+============================================================
+Result base name: big_matrixxbig_matrix
+Operation time: 8.35 seconds
+======================================================================
+🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM
+======================================================================
+
+📋 VALIDATING NODE CONFIGURATION...
+✅ Node configuration validated: 2 nodes configured
+✅ Percentage distribution validated: 1.000000
+
+🌐 CONFIGURING NETWORK SETTINGS...
+   Head Node Ethernet IP: 192.168.2.100
+   Head Node WiFi IP: 192.168.50.113
+   Head Node Ports: PULL=7779, PUSH=7780
+   Worker Node Ports: PULL=5557, PUSH=5558
+   Cluster Barrier Port: 7790
+
+📁 CONFIGURING STORAGE PATHS...
+   Local Paths:
+     - RAM Results: /dev/shm/matrix_results/
+     - Disk Folder: matrix_shards/
+     - RAM Folder: /dev/shm/matrix_shards/
+     - Project Dir: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/
+   Remote Paths:
+     - Disk Folder: matrix_shards/
+     - RAM Folder: /dev/shm/matrix_shards/
+     - RAM Results: /dev/shm/matrix_results/
+     - Project Dir: /home/rino/Desktop/Open_Cluster_AI_Station_beta/
+
+📊 INITIALIZING INSTANCE VARIABLES...
+   Matrix Name: big_matrixxbig_matrix
+   Split Matrix: True
+   Dimension: 0
+
+📂 CREATING LOCAL DIRECTORIES...
+✅ All required directories already exist
+
+🔌 SETTING UP ZEROMQ CONNECTIONS...
+   Connecting to 1 unique nodes...
+   ✅ Connected to worker WiFi 192.168.3.13:5557
+   ✅ Connected to head node (self) 192.168.2.100:7779
+   Total sockets in pool: 1
+
+🔄 SETTING UP CLUSTER BARRIER/ACK RECEIVER...
+✅ ACK receiver already exists on port 7790
+
+📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...
+   Sending command: mkdir -p matrix_shards/ /dev/shm/matrix_shards/ /dev/shm/matrix_results/
+   ✅ Directory creation command sent to 192.168.2.100
+
+======================================================================
+🧮 MATRIX DISTRIBUTION PHASE
+======================================================================
+   Matrix file exists: False
+   Split matrix mode: True
+
+🔍 CASE 2: LOADING EXISTING DISTRIBUTED MATRIX SHARDS
+   Attempting to load pre-existing shards...
+Loading cluster matrix shards: big_matrixxbig_matrix
+Number of nodes/shard locations: 2
+Checking for existing shards in RAM: /dev/shm/matrix_shards/big_matrixxbig_matrix_shard_0.bin
+Found existing matrix shards in local RAM
+  Shard 0: Using existing RAM path
+  Shard 1: Using existing RAM path
 
 Matrix shard loading complete
 Total shard paths tracked: 2
@@ -80,7 +523,7 @@ Total shard paths tracked: 2
 
 ✅ Cluster operation completed
 Result name: big_matrixxbig_matrix
-Cluster operation time: 12.42 seconds
+Cluster operation time: 8.35 seconds
 
 ============================================================
 🔍 PYTORCH REFERENCE (SINGLE NODE)
@@ -96,7 +539,7 @@ tensor([[0.5822, 0.4205, 0.3506, 0.7201, 0.6890],
         [0.3265, 0.1357, 0.2475, 0.8788, 0.5820]])
 
 Reference result shape: torch.Size([20000, 20000])
-Single-node PyTorch computation time: 22.26s
+Single-node PyTorch computation time: 22.74s
 First 2500 elements of reference result:
 tensor([6642.2144, 4998.1240, 4964.3613,  ..., 5005.1006, 4977.2671,
         5025.6562])
@@ -115,16 +558,12 @@ tensor([[6642.2144, 4998.1240, 4964.3613, 4969.4556, 4994.3457],
 ============================================================
 🏁 PERFORMANCE COMPARISON
 ============================================================
-CLUSTER OPERATION TIME:      12.4215 seconds
-SINGLE NODE PYTORCH TIME:    22.2597 seconds
+CLUSTER OPERATION TIME:      8.3546 seconds
+SINGLE NODE PYTORCH TIME:    22.7372 seconds
 ------------------------------------------------------------
-CLUSTER vs SINGLE NODE: 1.79x faster
+CLUSTER vs SINGLE NODE: 2.72x faster
 (ray-conda-env) rino@rino-Z370-HD3:~/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix$ 
 
-
-cluster_start_time = time.time()
-cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, False)  <<< no combine so faster by alot for LLM's you only need to combine 2-3 time in the transformers so send back will be mostly False 
-cluster_end_time = time.time()
 
 # 🚀 **The Vision: Democratizing AI Compute**
 
