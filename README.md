@@ -1,3 +1,127 @@
+NEW UPDATES THE PROGRAM WORKS MUCH BETTER NOW!!!
+
+right now matrix operations are not happening parallel like they should.
+
+################################################################FIX COMING SOON FOR MUCH BETTER PERFORMANCE#################################################
+
+======================================================================
+🏁 INITIALIZATION COMPLETE
+======================================================================
+✅ Cluster matrix initialization successful!
+   - Total nodes configured: 2
+   - Matrix handling mode: Split
+   - Backends: ['llama', 'llama']
+   - CPU/GPU selections: [True, True]
+
+✅ Cluster operation completed
+Result name: big_matrixxbig_matrix
+Cluster operation time: 16.44 seconds
+
+============================================================
+🔍 PYTORCH REFERENCE (SINGLE NODE)
+============================================================
+
+Matrix A shape: torch.Size([20000, 20000])
+Matrix B shape: torch.Size([20000, 20000])
+Matrix A sample (5x5):
+tensor([[0.5822, 0.4205, 0.3506, 0.7201, 0.6890],
+        [0.8598, 0.2469, 0.4321, 0.2997, 0.8340],
+        [0.2097, 0.0890, 0.8809, 0.5067, 0.9566],
+        [0.4470, 0.5123, 0.3698, 0.0967, 0.0183],
+        [0.3265, 0.1357, 0.2475, 0.8788, 0.5820]])
+
+Reference result shape: torch.Size([20000, 20000])
+Single-node PyTorch computation time: 22.24s
+First 2500 elements of reference result:
+tensor([6642.2144, 4998.1240, 4964.3613,  ..., 5005.1006, 4977.2671,
+        5025.6562])
+
+Reference result sample (5x5):
+tensor([[6642.2144, 4998.1240, 4964.3613, 4969.4556, 4994.3457],
+        [4998.1240, 6641.9399, 4992.1772, 4975.1665, 5021.4575],
+        [4964.3613, 4992.1772, 6628.5098, 4965.4482, 4985.1729],
+        [4969.4556, 4975.1665, 4965.4482, 6643.5278, 4986.7500],
+        [4994.3457, 5021.4575, 4985.1729, 4986.7500, 6677.4839]])
+
+============================================================
+📥 LOADING CLUSTER RESULT
+============================================================
+
+============================================================
+🏁 PERFORMANCE COMPARISON
+============================================================
+CLUSTER OPERATION TIME:      16.4384 seconds
+SINGLE NODE PYTORCH TIME:    22.2420 seconds
+------------------------------------------------------------
+CLUSTER vs SINGLE NODE: 1.35x faster
+(ray-conda-env) rino@rino-Z370-HD3:~/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix$ 
+
+- above is torch CPU vs 6400 and 5500 to GPUs that are not supported by CUDA.
+
+cluster_start_time = time.time()
+cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, True) <<----- above was run with send_back=True so the matrix was multiplied abd recombined to the correct results!!
+cluster_end_time = time.time()
+
+
+Matrix shard loading complete
+Total shard paths tracked: 2
+
+======================================================================
+🏁 INITIALIZATION COMPLETE
+======================================================================
+✅ Cluster matrix initialization successful!
+   - Total nodes configured: 2
+   - Matrix handling mode: Split
+   - Backends: ['llama', 'llama']
+   - CPU/GPU selections: [True, True]
+
+✅ Cluster operation completed
+Result name: big_matrixxbig_matrix
+Cluster operation time: 12.42 seconds
+
+============================================================
+🔍 PYTORCH REFERENCE (SINGLE NODE)
+============================================================
+
+Matrix A shape: torch.Size([20000, 20000])
+Matrix B shape: torch.Size([20000, 20000])
+Matrix A sample (5x5):
+tensor([[0.5822, 0.4205, 0.3506, 0.7201, 0.6890],
+        [0.8598, 0.2469, 0.4321, 0.2997, 0.8340],
+        [0.2097, 0.0890, 0.8809, 0.5067, 0.9566],
+        [0.4470, 0.5123, 0.3698, 0.0967, 0.0183],
+        [0.3265, 0.1357, 0.2475, 0.8788, 0.5820]])
+
+Reference result shape: torch.Size([20000, 20000])
+Single-node PyTorch computation time: 22.26s
+First 2500 elements of reference result:
+tensor([6642.2144, 4998.1240, 4964.3613,  ..., 5005.1006, 4977.2671,
+        5025.6562])
+
+Reference result sample (5x5):
+tensor([[6642.2144, 4998.1240, 4964.3613, 4969.4556, 4994.3457],
+        [4998.1240, 6641.9399, 4992.1772, 4975.1665, 5021.4575],
+        [4964.3613, 4992.1772, 6628.5098, 4965.4482, 4985.1729],
+        [4969.4556, 4975.1665, 4965.4482, 6643.5278, 4986.7500],
+        [4994.3457, 5021.4575, 4985.1729, 4986.7500, 6677.4839]])
+
+============================================================
+📥 LOADING CLUSTER RESULT
+============================================================
+
+============================================================
+🏁 PERFORMANCE COMPARISON
+============================================================
+CLUSTER OPERATION TIME:      12.4215 seconds
+SINGLE NODE PYTORCH TIME:    22.2597 seconds
+------------------------------------------------------------
+CLUSTER vs SINGLE NODE: 1.79x faster
+(ray-conda-env) rino@rino-Z370-HD3:~/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix$ 
+
+
+cluster_start_time = time.time()
+cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, False)  <<< no combine so faster by alot for LLM's you only need to combine 2-3 time in the transformers so send back will be mostly False 
+cluster_end_time = time.time()
 
 # 🚀 **The Vision: Democratizing AI Compute**
 
