@@ -59,7 +59,7 @@ SINGLE NODE PYTORCH TIME:    22.2420 seconds
 CLUSTER vs SINGLE NODE: 1.35x faster
 (ray-conda-env) rino@rino-Z370-HD3:~/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix$ 
 
-- above is torch CPU vs 6400 and 5500 to GPUs that are not supported by CUDA.
+- above is torch CPU vs 6400 and 5500 two GPUs that are not supported by CUDA.
 
 cluster_start_time = time.time()
 cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, True) <<----- above was run with send_back=True so the matrix was multiplied abd recombined to the correct results!!
