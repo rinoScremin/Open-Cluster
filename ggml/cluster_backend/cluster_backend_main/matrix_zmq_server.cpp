@@ -1474,12 +1474,16 @@ class llama_zmq_server
                     int dims_a[4] = { cols_A, rows_A, depthA, batchA };
                     int dims_b[4] = { cols_B, rows_B, depthB, batchB };
 
-                    std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
-                    ggml_backend_t backend =
-                        (use_gpu && gpu_id >= 0 &&
-                        gpu_id < (int)matrix_backend_llama.ggml_backends.size())
-                        ? matrix_backend_llama.ggml_backends[gpu_id]
-                        : matrix_backend_llama.ggml_backends.back();
+                    // Only lock long enough to read the backend vector; release before compute
+                    ggml_backend_t backend;
+                    {
+                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+                        backend =
+                            (use_gpu && gpu_id >= 0 &&
+                            gpu_id < (int)matrix_backend_llama.ggml_backends.size())
+                            ? matrix_backend_llama.ggml_backends[gpu_id]
+                            : matrix_backend_llama.ggml_backends.back();
+                    }
 
                     // Execute
                     MatrixResult result = matrix_backend_llama.matrix_op_nd(
