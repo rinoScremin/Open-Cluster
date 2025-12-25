@@ -1,11 +1,11 @@
 NEW UPDATES THE PROGRAM WORKS MUCH BETTER NOW!!!
 
-right now matrix operations are not happening parallel like they should.
+right now matrix operations are not happening parallel like they should. (fix coming later today!)
 
 but code is much cleaner and more efficient 
 
 
-###################################FIX COMING SOON FOR MUCH BETTER PERFORMANCE##########################
+####FIX COMING SOON FOR MUCH BETTER PERFORMANCE###
 
 ======================================================================
 🏁 INITIALIZATION COMPLETE
