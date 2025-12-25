@@ -1,3 +1,40 @@
+# new sharding plan   4-NODE VERSION: <<<< COMING SOON (MAYBE LATER TONIGHT!!)
+# ------------------------
+MatrixA_half1 = first half of MatrixA rows     # (m/2 × k)
+MatrixA_half2 = second half of MatrixA rows    # (m/2 × k)
+
+MatrixB_shard1 = first half of MatrixB columns  # (k × n/2)
+MatrixB_shard2 = second half of MatrixB columns # (k × n/2)
+
+# Just compute directly:
+node 1 = MatrixA_half1 @ MatrixB_shard1 = MatrixC_half1_shard1
+node 2 = MatrixA_half1 @ MatrixB_shard2 = MatrixC_half1_shard2
+node 3 = MatrixA_half2 @ MatrixB_shard1 = MatrixC_half2_shard1
+node 4 = MatrixA_half2 @ MatrixB_shard2 = MatrixC_half2_shard2
+
+# No summation needed!
+matrixC = concat(
+    MatrixC_half1_shard1, MatrixC_half1_shard2,
+    MatrixC_half2_shard1, MatrixC_half2_shard2
+)
+
+
+**Here's the short summary of how to do it:**
+
+1. **Split MatrixA vertically** (by rows) → Get top half and bottom half
+2. **Split MatrixB horizontally** (by columns) → Get left half and right half  
+3. **Distribute to 4 nodes:**
+   - Node 1: Multiply A-top × B-left = C-top-left
+   - Node 2: Multiply A-top × B-right = C-top-right
+   - Node 3: Multiply A-bottom × B-left = C-bottom-left
+   - Node 4: Multiply A-bottom × B-right = C-bottom-right
+4. **Concatenate results** to rebuild full matrix C:
+   - Put C-top-left and C-top-right side by side → Top row of C
+   - Put C-bottom-left and C-bottom-right side by side → Bottom row of C
+   - Stack these two rows to get final C
+
+**Key insight:** Each node computes one quarter of the result matrix independently, no summation needed. This works perfectly because we split A by rows and B by columns.
+
 NEW UPDATES THE PROGRAM WORKS MUCH BETTER NOW!!!
 
 code is much cleaner and more efficient!!!
