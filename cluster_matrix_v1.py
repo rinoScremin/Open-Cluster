@@ -15,7 +15,68 @@ import json
 import mmap
 import shutil
 import glob
+import math
 
+# ======================================================
+# SHAPE + NUMERICAL COMPARISON
+# ======================================================
+
+def check_combined_result_values(c_ref_path, combined):
+    c_ref = torch.load(c_ref_path)
+    if c_ref.shape != combined.shape:
+        print(f"❌ Shape mismatch! Reference: {c_ref.shape}, Combined: {combined.shape}")
+    else:
+        print(f"✅ Shapes match: {c_ref.shape}")
+
+        # Ensure both are Torch tensors (defensive)
+        if not isinstance(c_ref, torch.Tensor):
+            c_ref = torch.from_numpy(c_ref)
+        if not isinstance(combined, torch.Tensor):
+            combined = torch.from_numpy(combined)
+
+        c_ref = c_ref.to(dtype=combined.dtype, device=combined.device)
+
+        # Calculate absolute differences
+        diff = torch.abs(c_ref - combined)
+
+        # Basic statistics
+        max_diff = torch.max(diff).item()
+        mean_diff = torch.mean(diff).item()
+
+        print(f"Max absolute difference:  {max_diff:.6e}")
+        print(f"Mean absolute difference: {mean_diff:.6e}")
+
+        # Looser tolerance for shard / float accumulation
+        tolerance = 0.15
+
+        if torch.allclose(c_ref, combined, rtol=tolerance, atol=tolerance):
+            print(f"✅ Results match within tolerance ({tolerance})")
+        else:
+            print(f"⚠️  Results differ beyond tolerance ({tolerance})")
+
+        significant_diff = diff > tolerance
+        num_different = torch.sum(significant_diff).item()
+        total_elements = c_ref.numel()
+
+        print(
+            f"Elements with > {tolerance} difference: "
+            f"{num_different}/{total_elements} "
+            f"({(num_different / total_elements * 100):.2f}%)"
+        )
+
+# ======================================================
+# VISUAL DEBUG: FIRST & SECOND HALF
+# ======================================================
+
+def print_matrix_sections(matrix, name, n_elements=100):
+    flat = matrix.flatten()
+    mid = flat.shape[0] // 2
+
+    print(f"\n{name} — first {n_elements} elements of first half:")
+    print(flat[:n_elements])
+
+    print(f"\n{name} — first {n_elements} elements of second half:")
+    print(flat[mid:mid + n_elements])
 
 def convert_bin_matrix_to_pt(filename, force_2d=True):  
     """  
@@ -71,7 +132,7 @@ def convert_bin_matrix_to_pt(filename, force_2d=True):
 class cluster_matrix:
     def __init__(self, matrix_file_path,
                 node_IP_list, CPU_GPU_select_list, node_percentages=[], back_end_select_list=[],
-                split_matrix=False, dim=0):
+                split_matrix=False, dim=0, pair_split_with_shape=None):
         
         print("=" * 70)
         print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
@@ -165,7 +226,10 @@ class cluster_matrix:
         self.back_end_select_list = back_end_select_list  # 'torch', 'llama', 'opencl'
         self.split_matrix = split_matrix
         self.OG_matrix_shape = []
-        
+        self.pair_split_with_shape = pair_split_with_shape
+        self.grid_rows = 0
+        self.grid_cols = 0
+
         # Extract matrix name from file path
         matrix_file_path_split = matrix_file_path.split('/')
         self.matrix_name = matrix_file_path_split[len(matrix_file_path_split)-1].split('.pt')[0]
@@ -279,7 +343,10 @@ class cluster_matrix:
             except Exception as e:
                 print(f"   ❌ Failed to send command to {node_ip}: {e}")
 
+    
         # =============== MATRIX DISTRIBUTION LOGIC ===============
+        '''
+        
         print("\n" + "=" * 70)
         print("🧮 MATRIX DISTRIBUTION PHASE")
         print("=" * 70)
@@ -339,68 +406,10 @@ class cluster_matrix:
             print(f"   - Matrix handling mode: {'Split' if split_matrix else 'Full'}")
             print(f"   - Backends: {self.back_end_select_list}")
             print(f"   - CPU/GPU selections: {self.CPU_GPU_select_list}")
-
-    def _clear_previous_results(self, base_result_name):
-        """
-        Remove stale result artifacts for a given operation base name.
-        Keeps input shards intact.
-        """
-        patterns = [
-            os.path.join(self.local_RAM_folder, f"{base_result_name}_combined.bin"),
-            os.path.join(self.local_RAM_folder, f"{base_result_name}_shard_*.bin"),
-            os.path.join(self.local_matrix_results_RAM_folder, f"{base_result_name}_*"),
-        ]
-        for pattern in patterns:
-            for path in glob.glob(pattern):
-                try:
-                    os.remove(path)
-                    print(f"🧹 Removed stale result: {path}")
-                except IsADirectoryError:
-                    shutil.rmtree(path, ignore_errors=True)
-                except Exception as exc:
-                    print(f"⚠️  Could not remove {path}: {exc}")
-
-    def _validate_shard_counts_and_shapes(self, other, transposeA, transposeB, operation="mul"):
-        """
-        Ensure shard counts match and inner dimensions are compatible
-        for the requested operation. Only validates shards reachable
-        from this controller.
-        """
-        if len(self.matrix_file_paths_list) != len(other.matrix_file_paths_list):
-            raise ValueError(
-                f"Shard count mismatch: {len(self.matrix_file_paths_list)} (A) vs "
-                f"{len(other.matrix_file_paths_list)} (B)"
-            )
-
-        for idx, (path_a, path_b) in enumerate(
-            zip(self.matrix_file_paths_list, other.matrix_file_paths_list)
-        ):
-            if not (os.path.exists(path_a) and os.path.exists(path_b)):
-                print(
-                    f"ℹ️  Skipping shape check for shard {idx}: "
-                    f"{'missing A' if not os.path.exists(path_a) else 'missing B'} locally"
-                )
-                continue
-            try:
-                rows_a, cols_a = _infer_rows_cols_from_bin(path_a)
-                rows_b, cols_b = _infer_rows_cols_from_bin(path_b)
-                if operation in ("add", "sub"):
-                    if rows_a != rows_b or cols_a != cols_b:
-                        raise ValueError(
-                            f"Shard {idx} shape mismatch for {operation}: A {rows_a}x{cols_a} vs B {rows_b}x{cols_b}"
-                        )
-                else:  # mul or other matmul-like
-                    inner_a = cols_a if not transposeA else rows_a
-                    inner_b = rows_b if not transposeB else cols_b
-                    if inner_a != inner_b:
-                        raise ValueError(
-                            f"Shard {idx} inner dimension mismatch: {inner_a} (A) vs {inner_b} (B)"
-                        )
-            except Exception as exc:
-                print(f"⚠️  Could not validate shard {idx}: {exc}")
-        print("✅ Shard count validation complete")
-
-    def wait_for_acks(self, expected_count):
+        
+        '''
+        
+    def wait_for_acks(self, expected_count, expected_msg="ACK"):
         """
         Wait for ACKs from all expected nodes on the Python front end cluster port.
         """
@@ -408,9 +417,9 @@ class cluster_matrix:
         while acks < expected_count:
             try:
                 msg = self.ack_receiver_socket.recv_string(flags=zmq.NOBLOCK)
-                if msg == "ACK":
+                if msg == expected_msg:
                     acks += 1
-                    print(f"✅ Received ACK {acks}/{expected_count}")
+                    print(f"✅ Received {expected_msg} {acks}/{expected_count}")
             except zmq.Again:
                 # No message yet, sleep briefly to avoid 100% CPU
                 time.sleep(0.01)
@@ -454,140 +463,91 @@ class cluster_matrix:
             socket.close()
         self.zmq_context.term()
 
-    def convert_to_cluster_matrix_shards(self, number_of_shards=100):
-        print("=" * 70)
-        print("🔪 CONVERTING MATRIX TO DISTRIBUTED SHARDS")
-        print("=" * 70)
-        
-        # =============== LOAD ORIGINAL MATRIX ===============
-        print("\n📦 LOADING ORIGINAL MATRIX...")
-        print(f"   File path: {self.matrix_file_path}")
-        
-        try:
-            matrix = torch.load(self.matrix_file_path)
-            print(f"✅ Successfully loaded matrix")
-            print(f"   - Shape: {matrix.shape}")
-            print(f"   - Data type: {matrix.dtype}")
-            print(f"   - Device: {matrix.device if hasattr(matrix, 'device') else 'CPU'}")
-        except Exception as e:
-            print(f"❌ FAILED to load matrix: {e}")
-            raise
-        
-        # Store original matrix shape for reference
-        self.OG_matrix_shape = list(matrix.shape)
-        print(f"   - Original matrix shape stored: {self.OG_matrix_shape}")
-        
-        # =============== VALIDATE AND ADJUST SHARD COUNT ===============
-        print("\n⚙️  CONFIGURING SHARD PARAMETERS...")
-        print(f"   Requested shards: {number_of_shards}")
-        print(f"   Split dimension (dim={self.dim}): size = {matrix.shape[self.dim]}")
-        
-        matrix_dim_size = matrix.shape[self.dim]
-        
-        # Adjust number_of_shards if matrix dimension is smaller than requested shards
-        if matrix_dim_size < number_of_shards:
-            print(f"   ⚠️  Matrix dimension ({matrix_dim_size}) is smaller than requested shards ({number_of_shards})")
-            number_of_shards = matrix_dim_size
-            print(f"   ✅ Adjusted to {number_of_shards} shards (1 shard per matrix element in dimension {self.dim})")
-        else:
-            print(f"   ✅ Matrix size supports {number_of_shards} shards")
-        
-        print(f"   Final shard count: {number_of_shards}")
-        
-        # =============== SPLIT MATRIX INTO INITIAL SHARDS ===============
-        print("\n🔪 SPLITTING MATRIX INTO INITIAL SHARDS...")
-        print(f"   Creating exact shard sizes along dim={self.dim} to cover all rows/cols")
-        
-        try:
-            base = matrix_dim_size // number_of_shards
-            remainder = matrix_dim_size % number_of_shards
-            chunk_sizes = [base + 1 if i < remainder else base for i in range(number_of_shards)]
-            matrix_shards = list(torch.split(matrix, chunk_sizes, dim=self.dim))
-            print(f"✅ Successfully split matrix")
-            print(f"   - Created {len(matrix_shards)} shards")
-            print(f"   - Each shard shape: {matrix_shards[0].shape if matrix_shards else 'N/A'}")
-            
-            # Verify shard distribution
-            shard_sizes = [shard.shape[self.dim] for shard in matrix_shards]
-            print(f"   - Shard sizes along dim {self.dim}: {shard_sizes[:5]}... (first 5)")
-            print(f"   - Total elements in shards: {sum(shard_sizes)} (should equal {matrix_dim_size})")
-            
-        except Exception as e:
-            print(f"❌ FAILED to split matrix: {e}")
-            raise
-        
-        # =============== DISTRIBUTE SHARDS TO NODES ===============
-        print("\n🌐 DISTRIBUTING SHARDS TO CLUSTER NODES...")
-        print(f"   Number of nodes: {len(self.node_percentages)}")
-        print(f"   Node percentages: {[f'{p*100:.1f}%' for p in self.node_percentages]}")
-        print(f"   Total shards available: {len(matrix_shards)}")
-        
-        start_merged_index = 0
-        self.node_matrices = []
-        total_shards = len(matrix_shards)
-        
-        print(f"\n   {'Node':<6} {'Shards':<8} {'Percentage':<12} {'Shape':<20} {'Start':<8} {'End':<8}")
-        print("   " + "-" * 62)
-        
-        node_count = len(self.node_percentages)
-        base_shards = total_shards // node_count if node_count > 0 else 0
-        remainder = total_shards % node_count if node_count > 0 else 0
-        shards_per_node = [base_shards + (1 if i < remainder else 0) for i in range(node_count)]
-        
-        for i, node_percentage in enumerate(self.node_percentages):
-            shards_to_take = shards_per_node[i]
-            end_index = start_merged_index + shards_to_take
-            
-            # Merge the shards for this node
-            if shards_to_take > 0 and start_merged_index < end_index:
-                merged_shard = self.merged_matrix(matrix_shards, start_merged_index, end_index)
-                self.node_matrices.append(merged_shard)
-                
-                print(f"   {i:<6} {shards_to_take:<8} {node_percentage*100:>6.1f}%    {str(merged_shard.shape):<20} {start_merged_index:<8} {end_index-1:<8}")
-                
-                # Update starting index for next node
-                start_merged_index = end_index
+    def convert_to_cluster_matrix_grid(self):
+
+        full_matrix = torch.load(self.matrix_file_path)
+        self.OG_matrix_shape = list(full_matrix.shape)
+
+        # -------------------------------------------------
+        # BOTH A (dim=2) AND B (dim=3) SPLIT ON ROWS (dim 0)
+        # KEEP INNER DIMENSION = 20000
+        # -------------------------------------------------
+        if self.dim not in (2, 3):
+            raise ValueError("dim must be 2 (A) or 3 (B)")
+
+        split_dim = 0  # ✅ ALWAYS ROW SPLIT
+        total_rows = full_matrix.size(0)
+
+        shard_sizes = []
+        remaining = total_rows
+
+        for i, pct in enumerate(self.node_percentages):
+            if i == len(self.node_percentages) - 1:
+                shard = remaining
             else:
-                empty_shape = list(matrix.shape)
-                empty_shape[self.dim] = 0
-                empty_tensor = torch.tensor([], dtype=matrix.dtype).reshape(empty_shape)
-                self.node_matrices.append(empty_tensor)
-                print(f"   {i:<6} {shards_to_take:<8} {node_percentage*100:>6.1f}%    {str(empty_tensor.shape):<20} {start_merged_index:<8} {start_merged_index-1:<8}")
-        
-        if start_merged_index < total_shards:
-            print(f"\n   ⚠️  Remaining shards not allocated, assigning to last node")
-            tail = self.merged_matrix(matrix_shards, start_merged_index, total_shards)
-            self.node_matrices[-1] = torch.cat([self.node_matrices[-1], tail], dim=self.dim) if self.node_matrices else tail
-            start_merged_index = total_shards
-        
-        print(f"\n   📊 All {total_shards} shards have been allocated")
-        
-        # =============== VERIFICATION ===============
-        print("\n📊 DISTRIBUTION VERIFICATION:")
-        
-        # Calculate total elements from distributed matrices
-        total_elements_after_dist = sum([node_mat.shape[self.dim] for node_mat in self.node_matrices])
-        
-        print(f"   Original matrix size (dim {self.dim}): {matrix_dim_size}")
-        print(f"   Total after distribution (dim {self.dim}): {total_elements_after_dist}")
-        
-        if total_elements_after_dist == matrix_dim_size:
-            print("   ✅ SUCCESS: All elements accounted for!")
-        else:
-            print(f"   ⚠️  WARNING: Element mismatch ({matrix_dim_size} vs {total_elements_after_dist})")
-        
-        # Show distribution summary
-        print(f"\n   Distribution summary:")
-        for i, node_mat in enumerate(self.node_matrices):
-            percentage = (node_mat.shape[self.dim] / matrix_dim_size * 100) if matrix_dim_size > 0 else 0
-            print(f"   Node {i}: {node_mat.shape} ({percentage:.1f}% of total)")
-        
-        print("\n" + "=" * 70)
-        print("✅ MATRIX SHARD CONVERSION COMPLETE")
-        print("=" * 70)
-        
+                shard = int(math.floor(total_rows * pct))
+                remaining -= shard
+            shard_sizes.append(shard)
+
+        shards = torch.split(full_matrix, shard_sizes, dim=split_dim)
+
+        self.node_matrices = list(shards)
+
+        # Linear distribution (NOT a 2D grid)
+        self.grid_rows = len(self.node_matrices)
+        self.grid_cols = 1
+
+        # Debug print (keep this)
+        print(len(self.node_matrices))
+        for s in self.node_matrices:
+            print(s.shape)
+
         return self.node_matrices
- 
+
+    def convert_to_cluster_matrix_shards(self):
+        """
+        Split the original matrix into shards according to node percentages.
+        Stores the shards in self.node_matrices.
+        """
+        if self.matrix_file_path is None:
+            raise ValueError("Matrix file path not set.")
+
+        # Load full matrix
+        full_matrix = torch.load(self.matrix_file_path)
+        total_rows = full_matrix.size(self.dim)  # typically dim=0
+        self.node_matrices = []
+
+        # Convert percentages to row counts
+        if hasattr(self, 'node_percentages') and self.node_percentages:
+            total_percentage = sum(self.node_percentages)
+            if abs(total_percentage - 1.0) > 1e-6:
+                raise ValueError(f"Node percentages must sum to 1. Got {total_percentage}")
+            rows_per_node = [int(total_rows * p) for p in self.node_percentages]
+            # Adjust for rounding error
+            diff = total_rows - sum(rows_per_node)
+            if diff != 0:
+                rows_per_node[-1] += diff
+        else:
+            # Default: even split among nodes
+            num_nodes = len(self.node_IP_list)
+            base_rows = total_rows // num_nodes
+            rows_per_node = [base_rows] * num_nodes
+            rows_per_node[-1] += total_rows - sum(rows_per_node)
+
+        # Slice the full matrix into shards
+        start_idx = 0
+        for node_idx, row_count in enumerate(rows_per_node):
+            end_idx = start_idx + row_count
+            shard = full_matrix.narrow(self.dim, start_idx, row_count).clone()
+            self.node_matrices.append(shard)
+            start_idx = end_idx
+
+        print(f"✅ Created {len(self.node_matrices)} shards according to node percentages")
+        for i, shard in enumerate(self.node_matrices):
+            print(f"  Node {i}: shard shape {shard.shape}")
+
+        return self.node_matrices
+
     def merged_matrix(self, matrix_shards, start_index, end_index):
         """
         Merge row shards from start_index (inclusive) to end_index (exclusive).
@@ -666,6 +626,192 @@ class cluster_matrix:
         self.wait_for_acks(len(unique_node_IP_list)-1)
         
         print(f"Distribution complete: {len(self.matrix_file_paths_list)} shards saved and distributed")
+        return self.matrix_file_paths_list
+
+    def save_distribute_full_matrix_bin(self):
+        """
+        Save a FULL matrix (no splitting) as binary and distribute to all nodes.
+        """
+        # Create filename: replace .pt with .bin
+        save_name = self.matrix_name.split('.pt')[0] + '.bin'
+        print(f"Preparing full matrix: {save_name}")
+        
+        # Define local file paths
+        save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
+        local_save_file_path_RAM = os.path.join(self.local_RAM_folder, save_name)
+        print(f"Local paths - DISK: {save_file_path_DISK}, RAM: {local_save_file_path_RAM}")
+        
+        # Load the full matrix from PyTorch file
+        print(f"Loading matrix from: {self.matrix_file_path}")
+        full_matrix = torch.load(self.matrix_file_path)
+        print(f"Matrix loaded - Shape: {full_matrix.shape}")
+        
+        # Save to binary format locally
+        print("Saving to local storage...")
+        self.save_matrix_binary(full_matrix.float(), save_file_path_DISK)
+        self.save_matrix_binary(full_matrix.float(), local_save_file_path_RAM)
+
+        # Define remote paths (absolute disk path)
+        remote_disk_dir_full = os.path.join(self.remote_project_dir, self.remote_DISK_folder)
+        remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, save_name)
+        remote_save_file_path_DISK = os.path.join(remote_disk_dir_full, save_name)
+        print(f"Remote paths - RAM: {remote_save_file_path_RAM}, DISK: {remote_save_file_path_DISK}")
+        
+        # Track file paths for each node
+        for node_ip in self.node_IP_list:
+            if node_ip == self.IP:
+                # Head node uses local RAM path
+                self.matrix_file_paths_list.append(local_save_file_path_RAM)
+            else:
+                # Remote nodes use remote RAM path
+                self.matrix_file_paths_list.append(remote_save_file_path_RAM)
+        
+        # Get UNIQUE IPs (no duplicates)
+        unique_node_IP_list = list(set(self.node_IP_list))
+        unique_remote_count = len([ip for ip in unique_node_IP_list if ip != self.IP])
+        
+        print(f"Distributing to {unique_remote_count} remote node(s)...")
+        
+        # Send file to each unique remote node
+        for node_ip in unique_node_IP_list:
+            if node_ip != self.IP:  # Skip local node
+                print(f"Sending to {node_ip}")
+
+                # Ensure dirs exist on remote
+                mkdir_cmd = f"mkdir -p {remote_disk_dir_full} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}"
+                self.zmq_send_command(node_ip, mkdir_cmd)
+
+                # Step 1: Send the file to remote node's RAM
+                self.zmq_send_file(node_ip, save_file_path_DISK)
+                
+                # Step 2: Tell remote node to copy from RAM to DISK for persistence
+                copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
+                self.zmq_send_command(node_ip, copy_command)
+        
+        # Wait for acknowledgments from remote nodes
+        self.wait_for_acks(len(unique_node_IP_list)-1)
+        
+        print(f"Full matrix distribution completed")
+        print(f"Total file paths tracked: {len(self.matrix_file_paths_list)}")
+        return 0
+
+    def save_distribute_matrix_grid_bin(self):
+        """
+        Distribute broadcast shards for distributed GEMM.
+
+        Matrix A (dim=2):
+            - Row shards A_row{i} → broadcast across grid columns
+
+        Matrix B (dim=3):
+            - Row shards B_row{j} → broadcast across grid rows
+            - Transpose happens at compute time (B_row.T)
+
+        Populates self.matrix_file_paths_list with RAM paths in correct order
+        for cluster_shard_operation.
+        """
+
+        if not hasattr(self, 'node_matrices') or not self.node_matrices:
+            raise ValueError("Call convert_to_cluster_matrix_grid first")
+
+        if not self.node_IP_list:
+            raise ValueError("node_IP_list empty")
+
+        print(f"📐 Grid: {self.grid_rows} × {self.grid_cols}")
+
+        self.matrix_file_paths_list = []
+        os.makedirs(self.local_DISK_folder, exist_ok=True)
+        os.makedirs(self.local_RAM_folder, exist_ok=True)
+
+        ip_saved_files = {}
+        matrix_base = self.matrix_name.split('.pt')[0]
+
+        # ---------------------------
+        # MATRIX A — ROW SHARDS
+        # ---------------------------
+        if self.dim == 2:
+            print("\n📤 Distributing Matrix A row shards")
+            for grid_row in range(self.grid_rows):
+                shard = self.node_matrices[grid_row]
+                filename = f"{matrix_base}_A_row{grid_row+1}.bin"
+
+                for grid_col in range(self.grid_cols):
+                    node_idx = grid_row * self.grid_cols + grid_col
+                    if node_idx >= len(self.node_IP_list):
+                        continue
+
+                    node_IP = self.node_IP_list[node_idx]
+
+                    if node_IP not in ip_saved_files:
+                        ip_saved_files[node_IP] = set()
+
+                    if filename in ip_saved_files[node_IP]:
+                        continue
+
+                    print(f"   → Node {node_IP} gets {filename} {tuple(shard.shape)}")
+
+                    save_disk = os.path.join(self.local_DISK_folder, filename)
+                    self.save_matrix_binary(shard.float(), save_disk)
+
+                    if node_IP == self.IP:
+                        save_ram = os.path.join(self.local_RAM_folder, filename)
+                        self.save_matrix_binary(shard.float(), save_ram)
+                        self.matrix_file_paths_list.append(save_ram)
+                    else:
+                        self.zmq_send_file(node_IP, save_disk)
+                        remote_save_ram = os.path.join(self.remote_RAM_folder, filename)
+                        self.matrix_file_paths_list.append(remote_save_ram)
+
+                    ip_saved_files[node_IP].add(filename)
+
+        # ---------------------------
+        # MATRIX B — ROW SHARDS
+        # ---------------------------
+        else:
+            print("\n📤 Distributing Matrix B row shards")
+            for grid_col in range(self.grid_cols):
+                shard = self.node_matrices[grid_col]
+                filename = f"{matrix_base}_B_row{grid_col+1}.bin"
+
+                for grid_row in range(self.grid_rows):
+                    node_idx = grid_row * self.grid_cols + grid_col
+                    if node_idx >= len(self.node_IP_list):
+                        continue
+
+                    node_IP = self.node_IP_list[node_idx]
+
+                    if node_IP not in ip_saved_files:
+                        ip_saved_files[node_IP] = set()
+
+                    if filename in ip_saved_files[node_IP]:
+                        continue
+
+                    print(f"   → Node {node_IP} gets {filename} {tuple(shard.shape)}")
+
+                    save_disk = os.path.join(self.local_DISK_folder, filename)
+                    self.save_matrix_binary(shard.float(), save_disk)
+
+                    if node_IP == self.IP:
+                        save_ram = os.path.join(self.local_RAM_folder, filename)
+                        self.save_matrix_binary(shard.float(), save_ram)
+                        self.matrix_file_paths_list.append(save_ram)
+                    else:
+                        self.zmq_send_file(node_IP, save_disk)
+                        remote_save_ram = os.path.join(self.remote_RAM_folder, filename)
+                        self.matrix_file_paths_list.append(remote_save_ram)
+
+                    ip_saved_files[node_IP].add(filename)
+
+        # ---------------------------
+        # ACK SYNC
+        # ---------------------------
+        remote_nodes = list(set(self.node_IP_list) - {self.IP})
+        print(f"\n⏳ Waiting for ACKs from {len(remote_nodes)} nodes")
+        self.wait_for_acks(len(remote_nodes), 'ACK')
+
+        self.blocks_distributed = True
+
+        print("\n✅ Distribution complete")
+        print(f"Total shards: {len(self.matrix_file_paths_list)}")
         return self.matrix_file_paths_list
 
     def save_matrix_binary(self, matrix, filename):
@@ -782,6 +928,68 @@ class cluster_matrix:
         print(f"  Save completed: {filename}")
         return file_size
 
+    def load_cluster_matrix(self):
+        """
+        Load a full matrix (not split) from disk and distribute to all nodes.
+        """
+        try:
+            # Create filename for the binary matrix
+            base_name = self.matrix_name + '.bin'
+            combined_name = self.matrix_name + '_combined.bin'
+            print(f"Loading full matrix: {base_name}")
+            
+            base_disk_path = os.path.join(self.local_project_dir, self.local_DISK_folder, base_name)
+            
+            if not os.path.exists(base_disk_path):
+                print(
+                    "Error: Base matrix binary not found. Combined outputs are write-only "
+                    "and cannot be reused as inputs. Regenerate shards or rerun the operation "
+                    "with send_back=False to keep a distributed input."
+                )
+                return False
+
+            source_path = base_disk_path
+            source_filename = base_name
+            print(f"Source file: {source_path}")
+            # Copy to RAM for local access
+            local_ram_path = os.path.join(self.local_RAM_folder, base_name)
+            print(f"Copying to local RAM...")
+            subprocess.run(f'cp {source_path} {self.local_RAM_folder}', shell=True, check=True)
+            
+            # Get unique nodes to avoid duplicate transfers
+            unique_node_IP_list = list(set(self.node_IP_list))
+            
+            # Define remote paths (mirror the source filename)
+            remote_disk_path = self.remote_DISK_folder + source_filename
+            remote_RAM_path = self.remote_RAM_folder + source_filename
+            
+            # Track file paths for all nodes
+            for node_ip in self.node_IP_list:
+                if node_ip == self.IP:
+                    # Head node uses local RAM path
+                    self.matrix_file_paths_list.append(local_ram_path)
+                else:
+                    # Remote nodes use remote RAM path
+                    self.matrix_file_paths_list.append(remote_RAM_path)
+            
+            # Distribute to remote nodes
+            print(f"Distributing to remote nodes...")
+            for node_ip in unique_node_IP_list:
+                if node_ip != self.IP:
+                    # Send file to remote node
+                    self.zmq_send_file(node_ip, source_path)
+                    
+                    # Send command to copy from remote disk to remote RAM
+                    copy_command = f'cp {self.remote_project_dir}{remote_disk_path} {self.remote_RAM_folder}'
+                    self.zmq_send_command(node_ip, copy_command)
+                    
+        except Exception as e:
+            print(f"Error loading matrix: {e}")
+            return False
+        
+        print(f"Matrix loaded successfully")
+        return True
+
     def load_cluster_matrix_shards(self):
         """
         Load distributed matrix shards from storage.
@@ -882,7 +1090,7 @@ class cluster_matrix:
         
         return True
  
-    def cluster_operation(self, cluster_matrixB, TransposeA, TransposeB, send_back_result=False, operation='mul'):
+    def cluster_shard_operation(self, cluster_matrixB, TransposeA, TransposeB, send_back_result=False, operation='mul'):
         """
         Perform a distributed matrix operation across the cluster.
         
@@ -908,27 +1116,6 @@ class cluster_matrix:
         print(f"Send back result: {send_back_result}")
         print(f"Number of shards: {len(self.node_IP_list)}")
         start_time = time.time()
-        
-        # ===== SETUP RESULT FILENAMES =====
-        # Result names match the operand order we send to the server:
-        # self (matrix A) first, then cluster_matrixB (matrix B)
-        base_result_name = f"{self.matrix_name}x{cluster_matrixB.matrix_name}"
-        print(f"\n📊 Result base: {base_result_name} (send_back={send_back_result})")
-
-        # ===== LOCAL SIMULATION SHORT-CIRCUIT FOR SELF-TESTS =====
-        if getattr(self, "_local_simulate", False) or getattr(cluster_matrixB, "_local_simulate", False) or os.environ.get("CLUSTER_MATRIX_LOCAL_SIM", "0") == "1":
-            return self._simulate_cluster_operation(
-                base_result_name,
-                cluster_matrixB,
-                TransposeA,
-                TransposeB,
-                send_back_result,
-                operation,
-            )
-
-        # ===== VALIDATION & CLEANUP =====
-        self._validate_shard_counts_and_shapes(cluster_matrixB, TransposeA, TransposeB, operation)
-        self._clear_previous_results(base_result_name)
         
         # ===== TRACK GPU USAGE PER NODE =====
         # This ensures multiple GPUs on the same node get used properly
@@ -989,37 +1176,20 @@ class cluster_matrix:
             send_back_str = str(send_back_str)
             
             # ===== BUILD COMMAND FOR SPECIFIC BACKEND =====
-            if back_end_select == 'llama':
-                command = (
-                    f"server_command={back_end_select} "
-                    f"{matrix_b} "          # GGML expects B first
-                    f"{TransposeB_str} "
-                    f"{matrix_a} "          # Then A
-                    f"{TransposeA_str} "
-                    f"{use_gpu_str} "
-                    f"{current_gpu_number} "
-                    f"{send_back_str} "
-                    f"{operation} "
-                    f"2 "
-                    f"{shard_index}"
-                )
-            elif back_end_select == 'torch':
-                command = (
-                    f"server_command={back_end_select} "
-                    f"{matrix_a} "
-                    f"{TransposeA_str} "
-                    f"{matrix_b} "
-                    f"{TransposeB_str} "
-                    f"{use_gpu_str} "
-                    f"{current_gpu_number} "
-                    f"{send_back_str} "
-                    f"{operation} "
-                    f"2 "
-                    f"{shard_index}"
-                )
-            else:
-                raise ValueError(f"Unsupported backend selected: {back_end_select}")
-            
+            command = (
+                f"server_command={back_end_select} "
+                f"{matrix_a} "          # GGML expects B first
+                f"{TransposeA_str} "
+                f"{matrix_b} "          # Then A
+                f"{TransposeB_str} "
+                f"{use_gpu_str} "
+                f"{current_gpu_number} "
+                f"{send_back_str} "
+                f"{operation} "
+                f"2 "
+                f"{shard_index}"
+            )
+   
             # ===== SEND COMMAND TO NODE =====
             print(f"  Sending command to node...")
             socket_eth = self.llama_socket_pool[node_IP]
@@ -1035,414 +1205,419 @@ class cluster_matrix:
         unique_nodes = list(set(self.node_IP_list))
         expected_acks = len(self.node_IP_list)  # one ACK per shard/operation
         print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
-        self.wait_for_acks(expected_acks)
+        self.wait_for_acks(expected_acks, "ACK_matrixOp_complete")
         
         # ===== OPERATION COMPLETE =====
         print(f"\n{'='*60}")
         print(f"✅ CLUSTER OPERATION COMPLETE")
         print(f"{'='*60}")
-        print(f"Result base name: {base_result_name}")
         print(f"Operation time: {time.time() - start_time:.2f} seconds")
 
         # When keep-distributed, return a cluster_matrix wired to the shard outputs
-        result_cluster_matrix = cluster_matrix(
-            base_result_name,
+        # ===== SETUP RESULT FILENAMES =====
+        # Result names match the operand order we send to the server:
+        # self (matrix A) first, then cluster_matrixB (matrix B)
+
+        base_result_name=''
+        if back_end_select == 'torch':
+            base_result_name = f"{self.matrix_name}x{cluster_matrixB.matrix_name}"
+            print(f"\n📊 Result base: {base_result_name} (send_back={send_back_result})")
+        if back_end_select == 'llama':
+            base_result_name = f"{cluster_matrixB.matrix_name}x{self.matrix_name}"
+            print(f"\n📊 Result base: {base_result_name} (send_back={send_back_result})")
+
+
+
+        if send_back_result:
+            self.wait_for_acks(1, "ACK_combined_matrix_saved")
+            path = self.local_RAM_folder + base_result_name + '_combined.bin'
+            combined_matrix = convert_bin_matrix_to_pt(path)
+            os.remove(path)  # Clean up any existing combined file
+            return combined_matrix
+        else:
+            result_cluster_matrix = cluster_matrix(
+                base_result_name,
+                self.node_IP_list,
+                self.CPU_GPU_select_list,
+                self.node_percentages,
+                self.back_end_select_list,
+                True
+            )
+            return result_cluster_matrix
+        return False  # Return the distributed result instance
+
+    def cluster_grid_operation(self, cluster_matrixB, TransposeA, TransposeB, send_back_result=False, operation='mul'):
+        """
+        Perform a distributed matrix operation across the cluster using the full grid GEMM pattern.
+        Each row shard of Matrix A multiplies with each column shard of Matrix B.
+
+        Args:
+            cluster_matrixB: Another cluster_matrix instance for the second operand
+            TransposeA: Whether to transpose matrix A
+            TransposeB: Whether to transpose matrix B  
+            send_back_result: Whether to combine results into single file (True) 
+                            or keep distributed (False)
+            operation: Operation to perform ('mul', 'add', 'sub')
+
+        Returns:
+            Base name of the result file(s)
+        """
+        print(f"\n{'='*60}")
+        print(f"🚀 STARTING CLUSTER GRID OPERATION")
+        print(f"{'='*60}")
+        print(f"Matrix A: {self.matrix_name}")
+        print(f"Matrix B: {cluster_matrixB.matrix_name}")
+        print(f"Operation: {operation}")
+        print(f"Transpose A: {TransposeA}, Transpose B: {TransposeB}")
+        print(f"Send back result: {send_back_result}")
+        print(f"A shards: {len(self.matrix_file_paths_list)}, B shards: {len(cluster_matrixB.matrix_file_paths_list)}")
+        start_time = time.time()
+
+        node_gpu_counters = {}
+
+        total_ops = len(self.matrix_file_paths_list)  # A row shards
+        print(f"\n📤 DISTRIBUTING GRID OPERATIONS TO NODES ({total_ops} ops)")
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, matrix_a) in enumerate(zip(
             self.node_IP_list,
             self.CPU_GPU_select_list,
-            self.node_percentages,
             self.back_end_select_list,
-            True
-        )
-        return result_cluster_matrix  # Return the distributed result instance
+            self.matrix_file_paths_list
+        )):
+            # Initialize GPU counter
+            if node_IP not in node_gpu_counters:
+                node_gpu_counters[node_IP] = 0
+            current_gpu_number = node_gpu_counters[node_IP]
 
-    def save_distribute_full_matrix_bin(self):
-        """
-        Save a FULL matrix (no splitting) as binary and distribute to all nodes.
-        """
-        # Create filename: replace .pt with .bin
-        save_name = self.matrix_name.split('.pt')[0] + '.bin'
-        print(f"Preparing full matrix: {save_name}")
-        
-        # Define local file paths
-        save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
-        local_save_file_path_RAM = os.path.join(self.local_RAM_folder, save_name)
-        print(f"Local paths - DISK: {save_file_path_DISK}, RAM: {local_save_file_path_RAM}")
-        
-        # Load the full matrix from PyTorch file
-        print(f"Loading matrix from: {self.matrix_file_path}")
-        full_matrix = torch.load(self.matrix_file_path)
-        print(f"Matrix loaded - Shape: {full_matrix.shape}")
-        
-        # Save to binary format locally
-        print("Saving to local storage...")
-        self.save_matrix_binary(full_matrix.float(), save_file_path_DISK)
-        self.save_matrix_binary(full_matrix.float(), local_save_file_path_RAM)
+            # Map A shard to correct B shard (broadcast across grid)
+            b_shard_index = shard_index % len(cluster_matrixB.matrix_file_paths_list)
+            matrix_b = cluster_matrixB.matrix_file_paths_list[b_shard_index]
 
-        # Define remote paths (absolute disk path)
-        remote_disk_dir_full = os.path.join(self.remote_project_dir, self.remote_DISK_folder)
-        remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, save_name)
-        remote_save_file_path_DISK = os.path.join(remote_disk_dir_full, save_name)
-        print(f"Remote paths - RAM: {remote_save_file_path_RAM}, DISK: {remote_save_file_path_DISK}")
-        
-        # Track file paths for each node
-        for node_ip in self.node_IP_list:
-            if node_ip == self.IP:
-                # Head node uses local RAM path
-                self.matrix_file_paths_list.append(local_save_file_path_RAM)
-            else:
-                # Remote nodes use remote RAM path
-                self.matrix_file_paths_list.append(remote_save_file_path_RAM)
-        
-        # Get UNIQUE IPs (no duplicates)
-        unique_node_IP_list = list(set(self.node_IP_list))
-        unique_remote_count = len([ip for ip in unique_node_IP_list if ip != self.IP])
-        
-        print(f"Distributing to {unique_remote_count} remote node(s)...")
-        
-        # Send file to each unique remote node
-        for node_ip in unique_node_IP_list:
-            if node_ip != self.IP:  # Skip local node
-                print(f"Sending to {node_ip}")
+            print(f"\nProcessing operation {shard_index}:")
+            print(f"  Node: {node_IP}")
+            print(f"  Backend: {back_end_select}")
+            print(f"  Use GPU: {CPU_GPU_select} (GPU #{current_gpu_number})")
+            print(f"  Matrix A path: {matrix_a}")
+            print(f"  Matrix B path: {matrix_b}")
 
-                # Ensure dirs exist on remote
-                mkdir_cmd = f"mkdir -p {remote_disk_dir_full} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}"
-                self.zmq_send_command(node_ip, mkdir_cmd)
+            # Backend-specific transpose handling
+            local_TransposeA = TransposeA
+            local_TransposeB = TransposeB
+            if back_end_select == 'llama':
+                local_TransposeB = not TransposeB
 
-                # Step 1: Send the file to remote node's RAM
-                self.zmq_send_file(node_ip, save_file_path_DISK)
-                
-                # Step 2: Tell remote node to copy from RAM to DISK for persistence
-                copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
-                self.zmq_send_command(node_ip, copy_command)
-        
-        # Wait for acknowledgments from remote nodes
-        self.wait_for_acks(len(unique_node_IP_list)-1)
-        
-        print(f"Full matrix distribution completed")
-        print(f"Total file paths tracked: {len(self.matrix_file_paths_list)}")
-        return 0
+            TransposeA_str = str(local_TransposeA).lower()
+            TransposeB_str = str(local_TransposeB).lower()
+            use_gpu_str = str(CPU_GPU_select).lower()
 
-    def load_cluster_matrix(self):
-        """
-        Load a full matrix (not split) from disk and distribute to all nodes.
-        """
-        try:
-            # Create filename for the binary matrix
-            base_name = self.matrix_name + '.bin'
-            combined_name = self.matrix_name + '_combined.bin'
-            print(f"Loading full matrix: {base_name}")
-            
-            base_disk_path = os.path.join(self.local_project_dir, self.local_DISK_folder, base_name)
-            
-            if not os.path.exists(base_disk_path):
-                print(
-                    "Error: Base matrix binary not found. Combined outputs are write-only "
-                    "and cannot be reused as inputs. Regenerate shards or rerun the operation "
-                    "with send_back=False to keep a distributed input."
-                )
-                return False
+            # Send-back flag
+            send_back_str = str(len(self.node_IP_list)) if send_back_result else "0"
+            print(f"  Final transpose flags - A: {TransposeA_str}, B: {TransposeB_str}")
+            print(f"  Send back result: {send_back_result} ({send_back_str})")
 
-            source_path = base_disk_path
-            source_filename = base_name
-            print(f"Source file: {source_path}")
-            # Copy to RAM for local access
-            local_ram_path = os.path.join(self.local_RAM_folder, base_name)
-            print(f"Copying to local RAM...")
-            subprocess.run(f'cp {source_path} {self.local_RAM_folder}', shell=True, check=True)
-            
-            # Get unique nodes to avoid duplicate transfers
-            unique_node_IP_list = list(set(self.node_IP_list))
-            
-            # Define remote paths (mirror the source filename)
-            remote_disk_path = self.remote_DISK_folder + source_filename
-            remote_RAM_path = self.remote_RAM_folder + source_filename
-            
-            # Track file paths for all nodes
-            for node_ip in self.node_IP_list:
-                if node_ip == self.IP:
-                    # Head node uses local RAM path
-                    self.matrix_file_paths_list.append(local_ram_path)
-                else:
-                    # Remote nodes use remote RAM path
-                    self.matrix_file_paths_list.append(remote_RAM_path)
-            
-            # Distribute to remote nodes
-            print(f"Distributing to remote nodes...")
-            for node_ip in unique_node_IP_list:
-                if node_ip != self.IP:
-                    # Send file to remote node
-                    self.zmq_send_file(node_ip, source_path)
-                    
-                    # Send command to copy from remote disk to remote RAM
-                    copy_command = f'cp {self.remote_project_dir}{remote_disk_path} {self.remote_RAM_folder}'
-                    self.zmq_send_command(node_ip, copy_command)
-                    
-        except Exception as e:
-            print(f"Error loading matrix: {e}")
-            return False
-        
-        print(f"Matrix loaded successfully")
-        return True
+            # Build command
+            command = (
+                f"server_command={back_end_select} "
+                f"{matrix_a} "
+                f"{TransposeA_str} "
+                f"{matrix_b} "
+                f"{TransposeB_str} "
+                f"{use_gpu_str} "
+                f"{current_gpu_number} "
+                f"{send_back_str} "
+                f"{operation} "
+                f"2 "
+                f"{shard_index}"
+            )
 
-    def parallel_interface_file_transfer(self, filename, target_node_ip, split_fraction=0.5):
-        """
-        Transfer file using both Ethernet and WiFi interfaces in parallel.
-        Sends exactly 2 parts per message (matches C++ receiver).
-        
-        ⚠️  EXPERIMENTAL FEATURE - STILL UNDER DEVELOPMENT ⚠️
-        This feature splits file transfer across multiple network interfaces
-        for potentially faster transfers, but is not fully tested.
-        
-        Args:
-            filename: Path to file to transfer
-            target_node_ip: Target node's Ethernet IP
-        Args:
-            split_fraction: Fraction of bytes to send over Ethernet (rest via WiFi).
-        Returns:
-            bool: True if transfer successful, False otherwise
-        """
-        # Check if file exists
-        if not os.path.exists(filename):
-            print(f"Error: File not found: {filename}")
-            return False
-        
-        # Get Ethernet socket for the target node
-        if target_node_ip not in self.llama_socket_pool:
-            print(f"Error: No Ethernet socket for {target_node_ip}")
-            return False
-        socket_eth = self.llama_socket_pool[target_node_ip]
-        
-        # Try to find corresponding WiFi socket
-        socket_wifi = None
-        
-        # Look up WiFi IP based on Ethernet IP mapping
-        unique_node_ips = list(dict.fromkeys(self.node_IP_list))
-        try:
-            node_index = unique_node_ips.index(target_node_ip)
-            if node_index < len(self.IP_list_wifi):
-                wifi_ip = self.IP_list_wifi[node_index]
-                if wifi_ip in self.llama_socket_pool_wifi:
-                    socket_wifi = self.llama_socket_pool_wifi[wifi_ip]
-        except (ValueError, IndexError):
-            print(f"Note: Could not find WiFi IP for {target_node_ip}")
-        
-        # Fallback to Ethernet-only if no WiFi socket
-        if socket_wifi is None:
-            print(f"Warning: No WiFi socket, using Ethernet only")
-            return self.zmq_send_file(target_node_ip, filename)
-        
-        # Get file information
-        file_size = os.path.getsize(filename)
-        base_name = os.path.basename(filename)
-        
-        # Split file into two chunks based on requested ratio
-        split_fraction = max(0.05, min(0.95, split_fraction))
-        chunk_size = int(file_size * split_fraction)
-        
-        print(f"Starting parallel transfer: {filename}")
-        print(f"File size: {file_size:,} bytes")
-        print(f"Split size: ETH={chunk_size:,} bytes, WiFi={file_size - chunk_size:,} bytes")
-        
-        # Send file in 2 chunks (Ethernet and WiFi)
-        with open(filename, 'rb') as f:
-            # CHUNK 1: Send via Ethernet
-            eth_chunk = f.read(chunk_size)
-            if eth_chunk:
-                eth_message = [
-                    f"P_SEND_{base_name}".encode(),  # Filename with prefix
-                    eth_chunk                         # Data chunk
-                ]
-                socket_eth.send_multipart(eth_message)
-                print(f"ETH chunk sent: {len(eth_chunk):,} bytes")
-            
-            # CHUNK 2: Send via WiFi  
-            wifi_chunk = f.read(chunk_size)
-            if wifi_chunk:
-                wifi_message = [
-                    f"P_SEND_{base_name}".encode(),  # Same filename
-                    wifi_chunk                       # Data chunk
-                ]
-                socket_wifi.send_multipart(wifi_message)
-                print(f"WiFi chunk sent: {len(wifi_chunk):,} bytes")
-            
-            # Send any remaining data via Ethernet (for odd-sized files)
-            remaining = f.read(chunk_size)
-            if remaining:
-                socket_eth.send_multipart([f"P_SEND_{base_name}".encode(), remaining])
-                print(f"Extra ETH chunk sent: {len(remaining):,} bytes")
-        
-        # Calculate total bytes sent
-        total_sent = len(eth_chunk if eth_chunk else b'') + len(wifi_chunk if wifi_chunk else b'') + len(remaining if remaining else b'')
-        
-        print(f"Parallel transfer complete: {total_sent:,} bytes sent")
-        print(f"Note: This is an experimental feature")
-        
-        return True
+            # Send command
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            print(f"  ✅ Command sent to node {node_IP}")
 
+            if CPU_GPU_select:
+                node_gpu_counters[node_IP] += 1
+                print(f"  Incremented GPU counter for node {node_IP} to {node_gpu_counters[node_IP]}")
+
+        # Wait for all ACKs
+        expected_acks = len(self.matrix_file_paths_list)
+        print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
+        self.wait_for_acks(expected_acks, "ACK_matrixOp_complete")
+
+        print(f"\n{'='*60}")
+        print(f"✅ CLUSTER GRID OPERATION COMPLETE")
+        print(f"{'='*60}")
+        print(f"Operation time: {time.time() - start_time:.2f} seconds")
+
+        # Prepare result cluster
+        base_result_name = f"{cluster_matrixB.matrix_name}x{self.matrix_name}" if 'llama' in self.back_end_select_list else f"{self.matrix_name}x{cluster_matrixB.matrix_name}"
+
+        if send_back_result:
+            self.wait_for_acks(1, "ACK_combined_matrix_saved")
+            path = self.local_RAM_folder + base_result_name + '_combined.bin'
+            combined_matrix = convert_bin_matrix_to_pt(path)
+            os.remove(path)
+            return combined_matrix
+        else:
+            result_cluster_matrix = cluster_matrix(
+                base_result_name,
+                self.node_IP_list,
+                self.CPU_GPU_select_list,
+                self.node_percentages,
+                self.back_end_select_list,
+                True
+            )
+            return result_cluster_matrix
 
 #######################################------MAIN FUNCTION - TESTING-----######################################  
-# Node configuration for the cluster
-#IP_list = ['192.168.2.100', '192.168.2.100', '192.168.2.100', '192.168.2.102', '192.168.2.103']  
-#percentages = [0.45, 0.35, 0.10, 0.05, 0.05]  
-#CPU_GPU_select_list = [True, True, False, True, True]  
-#backend_select_list = ['llama', 'llama', 'torch', 'llama', 'llama']  
-
-
-#test_matrix = torch.rand((20000, 20000), device="cpu")
-
-#torch.save(test_matrix, '/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/model_matrixs/big_matrix.pt')
-
-# Node configuration for the cluster
-IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
-percentages = [0.25,0.25,0.25,0.25]  
-CPU_GPU_select_list = [True, True, True, True]  
-backend_select_list = ['llama','llama','llama','llama']  
-
-
-# Test matrix file paths
-test_matrix_path = '/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/model_matrixs/big_matrix.pt'  
-test_matrix_path2 = '/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/model_matrixs/big_matrix.pt'  
-
-test_matrix_load = 'big_matrix'
-test_matrix_load2 = 'big_matrix'
-
-
-print("\n" + "="*60)
-print("🚀 CLUSTER MATRIX DISTRIBUTION SYSTEM TEST")
-print("="*60)
-
-# --- Create and save matrix A (split mode) ---  
-print("\n📦 Creating and distributing matrix A (split=True)...")  
-matrixA = cluster_matrix(test_matrix_path, IP_list, CPU_GPU_select_list, 
-                        percentages, backend_select_list, True)  
-
-# --- Create and save matrix B (no split mode) ---  
-print("\n📦 Creating and distributing matrix B (split=False)...")  
-matrixB = cluster_matrix(test_matrix_path2, IP_list, CPU_GPU_select_list, 
-                        percentages, backend_select_list, False)  
-
-# --- Perform cluster matrix multiplication ---  
-print("\n" + "="*60)
-print("🧮 PERFORMING CLUSTER MATRIX OPERATION")
-print("="*60)
-print("Operation: MatrixA @ MatrixB.T")
-print(f"Nodes: {len(IP_list)}")
-print(f"Backends: {backend_select_list}")
-print(f"GPU usage: {CPU_GPU_select_list}")
-
-cluster_start_time = time.time()
-cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, True)  
-cluster_end_time = time.time()
-
-print(f"\n✅ Cluster operation completed")
-print(f"Result name: {cluster_matrixC.matrix_name}")
-print(f"Cluster operation time: {cluster_end_time - cluster_start_time:.2f} seconds")
-
-# ======================================================
-# PYTORCH REFERENCE CALCULATIONS (SINGLE NODE)
-# ======================================================
-print("\n" + "="*60)
-print("🔍 PYTORCH REFERENCE (SINGLE NODE)")
-print("="*60)
-
-# Load the original PyTorch matrices
-a = torch.load(test_matrix_path)
-b = torch.load(test_matrix_path2)
-
-print(f"\nMatrix A shape: {a.shape}")
-print(f"Matrix B shape: {b.shape}")
-print(f"Matrix A sample (5x5):")
-print(a[:5, :5])
-
-# Perform reference multiplication on single node
-pytorch_start_time = time.time()
-c_ref = a @ b.T  # A @ B.T (TransposeB=True)
-pytorch_end_time = time.time()
-
-print(f"\nReference result shape: {c_ref.shape}")
-print(f"Single-node PyTorch computation time: {pytorch_end_time - pytorch_start_time:.2f}s")
-print(f"First 2500 elements of reference result:")
-print(c_ref.flatten()[:2500])
-print(f"\nReference result sample (5x5):")
-print(c_ref[:5, :5])
-
-# ======================================================
-# LOAD CLUSTER RESULT
-# ======================================================
-print("\n" + "="*60)
-print("📥 LOADING CLUSTER RESULT")
-print("="*60)
-
-# Load the combined result from cluster computation
-#combined_result_path = "/dev/shm/matrix_shards/big_matrixxbig_matrix_combined.bin"
-#print(f"Loading cluster result from: {combined_result_path}")
-
-#combined = convert_bin_matrix_to_pt(combined_result_path)
-#print(f"Cluster result shape: {combined.shape}")
-#print(f"Cluster result sample (5x5):")
-#print(combined[:5, :5])
-
-# ======================================================
-# PERFORMANCE COMPARISON
-# ======================================================
-print("\n" + "="*60)
-print("🏁 PERFORMANCE COMPARISON")
-print("="*60)
-
-cluster_time = cluster_end_time - cluster_start_time
-pytorch_time = pytorch_end_time - pytorch_start_time
-
-print(f"CLUSTER OPERATION TIME:      {cluster_time:.4f} seconds")
-print(f"SINGLE NODE PYTORCH TIME:    {pytorch_time:.4f} seconds")
-print("-" * 60)
-
-# Calculate speedup/difference
-if pytorch_time > 0:
-    speedup = pytorch_time / cluster_time
-    print(f"CLUSTER vs SINGLE NODE: {speedup:.2f}x {'faster' if speedup > 1 else 'slower'}")
-
-'''
-# Check if shapes match
-if c_ref.shape != combined.shape:
-    print(f"❌ Shape mismatch! Reference: {c_ref.shape}, Combined: {combined.shape}")
-else:
-    print(f"✅ Shapes match: {c_ref.shape}")
+if __name__ == "__main__":
     
-    # Calculate differences
-    diff = torch.abs(c_ref - combined)
-    
-    # Basic statistics
-    max_diff = torch.max(diff).item()
-    mean_diff = torch.mean(diff).item()
-    
-    print(f"Max absolute difference: {max_diff:.6e}")
-    print(f"Mean absolute difference: {mean_diff:.6e}")
-        
-    # Looser tolerance for shard/float errors
-    tolerance = 0.15
-    if torch.allclose(c_ref, combined, rtol=tolerance, atol=tolerance):
-        print(f"✅ Results match within tolerance ({tolerance})")
-    else:
-        print(f"⚠️  Results differ beyond tolerance ({tolerance})")
-        
-        # Count elements with significant differences
-        significant_diff = diff > tolerance
-        num_different = torch.sum(significant_diff).item()
-        total_elements = c_ref.numel()
-        print(f"Elements with > {tolerance} difference: {num_different}/{total_elements} "
-            f"({(num_different/total_elements*100):.2f}%)")
+    # ----------------- CREATE MATRICES -----------------
+    '''
+    A = np.random.rand(10000, 20000)
+    B = np.random.rand(15000, 20000)
 
-# =========================
-# Visual debug: first and second half
-# =========================
-def print_matrix_sections(matrix, name, n_elements=100):
-    flat = matrix.flatten()
-    mid = flat.shape[0] // 2
-    print(f"\n{name} - first {n_elements} elements of first half:")
-    print(flat[:n_elements])
-    print(f"\n{name} - first {n_elements} elements of second half:")
-    print(flat[mid:mid + n_elements])
+    A2 = np.random.rand(5000, 7000)
+    B2 = np.random.rand(9000, 7000)
 
-print_matrix_sections(c_ref, "Torch reference")
-# print_matrix_sections(combined, "Combined cluster result")
-'''
+    A3 = np.random.rand(1500, 500)
+    B3 = np.random.rand(1000, 500)
+
+    torch.save(torch.tensor(A, dtype=torch.float32), 'model_matrixs/big_matrixA.pt')
+    torch.save(torch.tensor(B, dtype=torch.float32), 'model_matrixs/big_matrixB.pt')   
+    
+    torch.save(torch.tensor(A2, dtype=torch.float32), 'model_matrixs/mid_matrixA.pt')
+    torch.save(torch.tensor(B2, dtype=torch.float32), 'model_matrixs/mid_matrixB.pt')   
+
+    torch.save(torch.tensor(A3, dtype=torch.float32), 'model_matrixs/small_matrixA.pt')
+    torch.save(torch.tensor(B3, dtype=torch.float32), 'model_matrixs/small_matrixB.pt')
+    '''  
+
+    # ----------------- FILE PATHS -----------------
+    big_test_matrix_pathA = 'model_matrixs/big_matrixA.pt'  
+    big_test_matrix_pathB = 'model_matrixs/big_matrixB.pt'  
+
+    mid_test_matrix_pathA = 'model_matrixs/mid_matrixA.pt'  
+    mid_test_matrix_pathB = 'model_matrixs/mid_matrixB.pt'  
+
+    small_test_matrix_pathA = 'model_matrixs/small_matrixA.pt'  
+    small_test_matrix_pathB = 'model_matrixs/small_matrixB.pt'  
+
+    
+    # ----------------- REFERENCE RESULTS -----------------
+    '''
+    big_a = torch.load(big_test_matrix_pathA)
+    big_b = torch.load(big_test_matrix_pathB)
+    big_c_ref = big_a @ big_b.T  # A @ B.T
+    torch.save(big_c_ref, 'model_matrixs/big_c_ref.pt')
+
+    mid_a = torch.load(mid_test_matrix_pathA)
+    mid_b = torch.load(mid_test_matrix_pathB)
+    mid_c_ref = mid_a @ mid_b.T
+    torch.save(mid_c_ref, 'model_matrixs/mid_c_ref.pt')
+
+    small_a = torch.load(small_test_matrix_pathA)
+    small_b = torch.load(small_test_matrix_pathB)
+    small_c_ref = small_a @ small_b.T
+    torch.save(small_c_ref, 'model_matrixs/small_c_ref.pt')
+    '''
+ 
+    #############################TESTING CLUSTER MATRIX OPERATIONS SYSTEM 1#############################
+    '''
+    # ----------------- CLUSTER TEST (BIG MATRIX) -----------------
+    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
+    percentages = [0.4,0.4,0.1,0.1]  
+    CPU_GPU_select_list = [ True, True, True, True ]  
+    backend_select_list = ['llama','llama','llama','llama'] 
+
+    
+    big_new_matrixA = cluster_matrix(big_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list, True, 0)
+    big_new_matrixA.convert_to_cluster_matrix_shards()
+    big_new_matrixA.save_distribute_matrix_shards_bin()
+    big_new_matrixB = cluster_matrix(big_test_matrix_pathB, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list, False) 
+    big_new_matrixB.save_distribute_full_matrix_bin()
+    big_new_matrixC = big_new_matrixA.cluster_shard_operation(big_new_matrixB, False, True, True)  
+    check_combined_result_values('model_matrixs/big_c_ref.pt',big_new_matrixC)
+    
+    load_matrixA = cluster_matrix('big_matrixA', IP_list, CPU_GPU_select_list, 
+                            percentages, backend_select_list)
+    load_matrixA.load_cluster_matrix_shards()
+    load_matrixB = cluster_matrix('big_matrixB', IP_list, CPU_GPU_select_list, 
+                            percentages, backend_select_list) 
+    load_matrixB.load_cluster_matrix()
+    load_matrixD = load_matrixA.cluster_shard_operation(load_matrixB, False, True, True) 
+    check_combined_result_values('model_matrixs/big_c_ref.pt',load_matrixD)
+
+    # ----------------- CLUSTER TEST (MID MATRIX) -----------------
+    mid_new_matrixA = cluster_matrix(mid_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list, True, 0)
+    mid_new_matrixA.convert_to_cluster_matrix_shards()
+    mid_new_matrixA.save_distribute_matrix_shards_bin()
+    mid_new_matrixB = cluster_matrix(mid_test_matrix_pathB, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list, False) 
+    mid_new_matrixB.save_distribute_full_matrix_bin()
+    mid_new_matrixC = mid_new_matrixA.cluster_shard_operation(mid_new_matrixB, False, True, True)  
+    check_combined_result_values('model_matrixs/mid_c_ref.pt',mid_new_matrixC)
+    
+    load_mid_matrixA = cluster_matrix('mid_matrixA', IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list)
+    load_mid_matrixA.load_cluster_matrix_shards()
+    load_mid_matrixB = cluster_matrix('mid_matrixB', IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list) 
+    load_mid_matrixB.load_cluster_matrix()
+    load_mid_matrixD = load_mid_matrixA.cluster_shard_operation(load_mid_matrixB, False, True, True) 
+    check_combined_result_values('model_matrixs/mid_c_ref.pt',load_mid_matrixD)
+
+    # ----------------- 5 NODE TEST -----------------
+    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.101','192.168.2.104']   
+    percentages = [0.4,0.4,0.05,0.05,0.1]  
+    CPU_GPU_select_list = [ True, True, True, True, True ]  
+    backend_select_list = ['llama','llama','llama','llama', 'llama'] 
+
+    node5_big_matrixA = cluster_matrix(big_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list, True, 0)
+    node5_big_matrixA.convert_to_cluster_matrix_shards()
+    node5_big_matrixA.save_distribute_matrix_shards_bin()
+    node5_big_matrixB = cluster_matrix(big_test_matrix_pathB, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list) 
+    node5_big_matrixB.save_distribute_full_matrix_bin()
+    node5_big_matrixC = node5_big_matrixA.cluster_shard_operation(node5_big_matrixB, False, True, True)  
+    check_combined_result_values('model_matrixs/big_c_ref.pt',node5_big_matrixC)
+
+    node5_big_mid_matrixA = cluster_matrix('big_matrixA', IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list)    
+    node5_big_mid_matrixA.load_cluster_matrix_shards()
+    node5_big_mid_matrixB = cluster_matrix('big_matrixB', IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list) 
+    node5_big_mid_matrixB.load_cluster_matrix()
+    node5_big_mid_matrixD = node5_big_mid_matrixA.cluster_shard_operation(node5_big_mid_matrixB, False, True, True) 
+    check_combined_result_values('model_matrixs/big_c_ref.pt',node5_big_mid_matrixD)
+
+    node5_mid_matrixA = cluster_matrix(mid_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list, True, 0)
+    node5_mid_matrixA.convert_to_cluster_matrix_shards()
+    node5_mid_matrixA.save_distribute_matrix_shards_bin()
+    node5_mid_matrixB = cluster_matrix(mid_test_matrix_pathB, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list) 
+    node5_mid_matrixB.save_distribute_full_matrix_bin()
+    node5_mid_matrixC = node5_mid_matrixA.cluster_shard_operation(node5_mid_matrixB, False, True, True)  
+    check_combined_result_values('model_matrixs/mid_c_ref.pt',node5_mid_matrixC)
+
+    node5_big_mid_matrixA = cluster_matrix('mid_matrixA', IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list)    
+    node5_big_mid_matrixA.load_cluster_matrix_shards()
+    node5_big_mid_matrixB = cluster_matrix('mid_matrixB', IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list) 
+    node5_big_mid_matrixB.load_cluster_matrix()
+    node5_big_mid_matrixD = node5_big_mid_matrixA.cluster_shard_operation(node5_big_mid_matrixB, False, True, True) 
+    check_combined_result_values('model_matrixs/mid_c_ref.pt',node5_big_mid_matrixD)
+  
+
+
+###########################################cluster_grid_operation##############################################                                  
+ 
+    matrixA = cluster_matrix(test_matrix_path, IP_list, CPU_GPU_select_list, 
+                            percentages, backend_select_list, True, 2)
+    matrixA.convert_to_cluster_matrix_grid()
+    matrixA.save_distribute_matrix_grid_bin()
+
+    matrixB = cluster_matrix(test_matrix_path2, IP_list, CPU_GPU_select_list, 
+                            percentages, backend_select_list, True, 3) 
+    matrixB.convert_to_cluster_matrix_grid()
+    matrixB.save_distribute_matrix_grid_bin()
+    cluster_matrixC = matrixA.cluster_grid_operation(matrixB, False, False, False)  
+    
+ 
+###########################################cluster_shard_operation##############################################
+  
+
+    # Node configuration for the cluster
+    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.100'
+               ,'192.168.2.101','192.168.2.101'
+               ,'192.168.2.104']   
+
+    percentages = [0.2,0.2,0.2,0.2,0.1,0.1]  
+    CPU_GPU_select_list = [ True, True, True, True, True, True ]  
+    backend_select_list = ['llama','llama','llama','llama','llama','llama']  
+
+    matrixA = cluster_matrix(test_matrix_path, IP_list, CPU_GPU_select_list, 
+                            percentages, backend_select_list, True, 2)
+    matrixA.convert_to_cluster_matrix_grid()
+    #matrixA.save_distribute_matrix_grid_bin()
+
+    matrixB = cluster_matrix(test_matrix_path2, IP_list, CPU_GPU_select_list, 
+                            percentages, backend_select_list, True, 3) 
+    matrixB.convert_to_cluster_matrix_grid()
+    matrixB.save_distribute_matrix_grid_bin()
+    cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, False)  
+ 
+###############################################################################################
+ 
+    # Node configuration for the cluster
+    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.100'
+               ,'192.168.2.101','192.168.2.101'
+               ,'192.168.2.101','192.168.2.101'
+               ,'192.168.2.104']   
+
+    percentages = [0.2,0.2,0.1,0.1,0.1,0.1,0.1,0.1]  
+    CPU_GPU_select_list = [ True, True, True, True, True, True, True, True ]  
+    backend_select_list = ['llama','llama','llama','llama','llama','llama','llama','llama']  
+
+    matrixA = cluster_matrix(test_matrix_path, IP_list, CPU_GPU_select_list, 
+                            percentages, backend_select_list, True, 2)
+    matrixA.convert_to_cluster_matrix_grid()
+    matrixA.save_distribute_matrix_grid_bin()
+
+    matrixB = cluster_matrix(test_matrix_path2, IP_list, CPU_GPU_select_list, 
+                            percentages, backend_select_list, True, 3)
+    
+    #matrixB.convert_to_cluster_matrix_grid()
+    #matrixB.save_distribute_matrix_grid_bin()
+    #cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, False)  
+    '''
+
+############################# TESTING CLUSTER MATRIX OPERATIONS SYSTEM 2 #############################
+
+
+IP_list = [
+    '192.168.2.100','192.168.2.100','192.168.2.100',
+    '192.168.2.101','192.168.2.101','192.168.2.104'
+]
+
+percentages = [0.3, 0.3, 0.1, 0.1, 0.1, 0.1]
+CPU_GPU_select_list = [True, True, True, True, True, True]
+# You already have this variable defined:
+backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama'] 
+
+# Use it instead of empty list:
+matrix_A = cluster_matrix(
+    matrix_file_path=big_test_matrix_pathA,
+    node_IP_list=IP_list,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    node_percentages=percentages,
+    back_end_select_list=backend_select_list,  # Use the actual variable!
+    split_matrix=True,
+    dim=2
+)
+test = matrix_A.convert_to_cluster_matrix_grid()
+matrix_A.save_distribute_matrix_grid_bin()
+
+matrix_B = cluster_matrix(
+    matrix_file_path=big_test_matrix_pathB,
+    node_IP_list=IP_list,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    node_percentages=percentages,
+    back_end_select_list=backend_select_list,  # Use the actual variable!
+    split_matrix=True,
+    dim=3
+)
+matrix_B.convert_to_cluster_matrix_grid()
+matrix_B.save_distribute_matrix_grid_bin()
+
+# With our corrected system where B is already transposed to Bᵀ:
+result = matrix_A.cluster_grid_operation(matrix_B,False,True,False)
+
+# This computes: A × Bᵀ where B is already Bᵀ from convert_to_cluster_matrix_grid()
+# No additional transpose needed!
