@@ -1423,14 +1423,13 @@ if __name__ == "__main__":
     '''
  
     #############################TESTING CLUSTER MATRIX OPERATIONS SYSTEM 1#############################
-    '''
+'''
     # ----------------- CLUSTER TEST (BIG MATRIX) -----------------
     IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
     percentages = [0.4,0.4,0.1,0.1]  
     CPU_GPU_select_list = [ True, True, True, True ]  
     backend_select_list = ['llama','llama','llama','llama'] 
 
-    
     big_new_matrixA = cluster_matrix(big_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
                              percentages, backend_select_list, True, 0)
     big_new_matrixA.convert_to_cluster_matrix_shards()
@@ -1514,71 +1513,11 @@ if __name__ == "__main__":
     node5_big_mid_matrixD = node5_big_mid_matrixA.cluster_shard_operation(node5_big_mid_matrixB, False, True, True) 
     check_combined_result_values('model_matrixs/mid_c_ref.pt',node5_big_mid_matrixD)
   
-
-
-###########################################cluster_grid_operation##############################################                                  
- 
-    matrixA = cluster_matrix(test_matrix_path, IP_list, CPU_GPU_select_list, 
-                            percentages, backend_select_list, True, 2)
-    matrixA.convert_to_cluster_matrix_grid()
-    matrixA.save_distribute_matrix_grid_bin()
-
-    matrixB = cluster_matrix(test_matrix_path2, IP_list, CPU_GPU_select_list, 
-                            percentages, backend_select_list, True, 3) 
-    matrixB.convert_to_cluster_matrix_grid()
-    matrixB.save_distribute_matrix_grid_bin()
-    cluster_matrixC = matrixA.cluster_grid_operation(matrixB, False, False, False)  
-    
- 
-###########################################cluster_shard_operation##############################################
-  
-
-    # Node configuration for the cluster
-    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.100'
-               ,'192.168.2.101','192.168.2.101'
-               ,'192.168.2.104']   
-
-    percentages = [0.2,0.2,0.2,0.2,0.1,0.1]  
-    CPU_GPU_select_list = [ True, True, True, True, True, True ]  
-    backend_select_list = ['llama','llama','llama','llama','llama','llama']  
-
-    matrixA = cluster_matrix(test_matrix_path, IP_list, CPU_GPU_select_list, 
-                            percentages, backend_select_list, True, 2)
-    matrixA.convert_to_cluster_matrix_grid()
-    #matrixA.save_distribute_matrix_grid_bin()
-
-    matrixB = cluster_matrix(test_matrix_path2, IP_list, CPU_GPU_select_list, 
-                            percentages, backend_select_list, True, 3) 
-    matrixB.convert_to_cluster_matrix_grid()
-    matrixB.save_distribute_matrix_grid_bin()
-    cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, False)  
- 
-###############################################################################################
- 
-    # Node configuration for the cluster
-    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.100'
-               ,'192.168.2.101','192.168.2.101'
-               ,'192.168.2.101','192.168.2.101'
-               ,'192.168.2.104']   
-
-    percentages = [0.2,0.2,0.1,0.1,0.1,0.1,0.1,0.1]  
-    CPU_GPU_select_list = [ True, True, True, True, True, True, True, True ]  
-    backend_select_list = ['llama','llama','llama','llama','llama','llama','llama','llama']  
-
-    matrixA = cluster_matrix(test_matrix_path, IP_list, CPU_GPU_select_list, 
-                            percentages, backend_select_list, True, 2)
-    matrixA.convert_to_cluster_matrix_grid()
-    matrixA.save_distribute_matrix_grid_bin()
-
-    matrixB = cluster_matrix(test_matrix_path2, IP_list, CPU_GPU_select_list, 
-                            percentages, backend_select_list, True, 3)
-    
-    #matrixB.convert_to_cluster_matrix_grid()
-    #matrixB.save_distribute_matrix_grid_bin()
-    #cluster_matrixC = matrixA.cluster_operation(matrixB, False, True, False)  
-    '''
+'''
 
 ############################# TESTING CLUSTER MATRIX OPERATIONS SYSTEM 2 #############################
+
+
 
 
 IP_list = [
