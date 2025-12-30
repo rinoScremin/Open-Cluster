@@ -315,9 +315,8 @@ class llama_zmq_server
             std::cout << "==============================\n" << std::endl;
         }
 
-        void send_ack() 
+        void send_ack(std::string ack_msg = "ACK") 
         {
-            std::string ack_msg = "ACK";
             zmq::message_t ack(ack_msg.data(), ack_msg.size());
             ack_sender.send(ack, zmq::send_flags::none);
         }
@@ -702,19 +701,41 @@ class llama_zmq_server
                     std::string backend_name;
 
                     // Dispatch to unified matrix operation function
-                    operation_success = matrix_operation(
-                        command_type,
-                        command_args[1].c_str(),   // Matrix A path
-                        transposeA,
-                        command_args[3].c_str(),   // Matrix B path
-                        transposeB,
-                        use_gpu,
-                        gpu_id,
-                        send_back,
-                        operation_type,
-                        n_dims,
-                        shard_index_override
-                    );
+                    
+                    if (command_type == "llama")
+                    {
+                        operation_success = matrix_operation(
+                            command_type,
+                            command_args[3].c_str(),   // Matrix B path
+                            transposeB,
+                            command_args[1].c_str(),   // Matrix A path
+                            transposeA,
+                            use_gpu,
+                            gpu_id,
+                            send_back,
+                            operation_type,
+                            n_dims,
+                            shard_index_override
+                        );
+                    }
+                    else
+                    {
+                        operation_success = matrix_operation(
+                            command_type,
+                            command_args[1].c_str(),   // Matrix A path
+                            transposeA,
+                            command_args[3].c_str(),   // Matrix B path
+                            transposeB,
+                            use_gpu,
+                            gpu_id,
+                            send_back,
+                            operation_type,
+                            n_dims,
+                            shard_index_override
+                        );
+                    }
+
+
                     
                     if (command_type == "llama")
                         backend_name = "LLaMA/Vulkan";
@@ -837,7 +858,7 @@ class llama_zmq_server
             for (auto &rf : local_reserved_files)
             {
                 std::string filename = rf.save_parallel_file_name.empty() ? std::string("unknown") : rf.save_parallel_file_name[0];
-
+                //send_ack(filename);
                 // Helper lambda to write raw bytes to path
                 auto write_raw = [&](const std::filesystem::path &path, const std::vector<uint8_t> &bytes) -> bool {
                     std::filesystem::create_directories(path.parent_path());
@@ -1238,6 +1259,7 @@ class llama_zmq_server
                                 (combined_name + "_combined.bin");  
 
                             save_matrix_bin(final_path.c_str(), full);  
+                            send_ack("ACK_combined_matrix_saved");
                             std::cout << "Combined matrix saved: " << final_path << std::endl;  
                         }  
 
@@ -1695,7 +1717,7 @@ class llama_zmq_server
                 op_success = false;
             }
 
-            try { send_ack(); } catch (...) {}
+            try { send_ack("ACK_matrixOp_complete"); } catch (...) {}
             return op_success;
         }
 
@@ -1773,6 +1795,7 @@ class llama_zmq_server
 
             return output_filename;
         }
+
 };
 
 int main()
