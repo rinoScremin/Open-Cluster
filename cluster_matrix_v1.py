@@ -201,7 +201,7 @@ class cluster_matrix:
         self.remote_DISK_folder = os.environ.get('REMOTE_DISK_FOLDER', 'matrix_shards/')
         self.remote_RAM_folder = os.environ.get('REMOTE_RAM_FOLDER', '/dev/shm/matrix_shards/')
         self.remote_matrix_results_RAM_folder = os.environ.get('REMOTE_MATRIX_RESULTS_RAM_FOLDER', '/dev/shm/matrix_results/')
-        self.remote_project_dir = os.environ.get('REMOTE_PROJECT_DIR', '/home/rino/Desktop/Open_Cluster_AI_Station_beta/')
+        self.remote_project_dir = os.environ.get('REMOTE_PROJECT_DIR', '/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/')
         
         print(f"   Remote Paths:")
         print(f"     - Disk Folder: {self.remote_DISK_folder}")
@@ -333,7 +333,7 @@ class cluster_matrix:
         # =============== CREATE REMOTE DIRECTORIES ===============
         print("\n📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...")
         
-        command = f'mkdir -p {self.remote_DISK_folder} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}'
+        command = f'mkdir -p {self.remote_project_dir}{self.remote_DISK_folder} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}'
         print(f"   Sending command: {command}")
         
         for node_ip, socket in self.llama_socket_pool.items():
@@ -464,44 +464,18 @@ class cluster_matrix:
         self.zmq_context.term()
 
     def convert_to_cluster_matrix_grid(self):
-
         full_matrix = torch.load(self.matrix_file_path)
         self.OG_matrix_shape = list(full_matrix.shape)
-
         # -------------------------------------------------
         # BOTH A (dim=2) AND B (dim=3) SPLIT ON ROWS (dim 0)
         # KEEP INNER DIMENSION = 20000
         # -------------------------------------------------
-        if self.dim not in (2, 3):
-            raise ValueError("dim must be 2 (A) or 3 (B)")
-
-        split_dim = 0  # ✅ ALWAYS ROW SPLIT
-        total_rows = full_matrix.size(0)
-
-        shard_sizes = []
-        remaining = total_rows
-
-        for i, pct in enumerate(self.node_percentages):
-            if i == len(self.node_percentages) - 1:
-                shard = remaining
-            else:
-                shard = int(math.floor(total_rows * pct))
-                remaining -= shard
-            shard_sizes.append(shard)
-
-        shards = torch.split(full_matrix, shard_sizes, dim=split_dim)
-
-        self.node_matrices = list(shards)
-
-        # Linear distribution (NOT a 2D grid)
-        self.grid_rows = len(self.node_matrices)
-        self.grid_cols = 1
-
-        # Debug print (keep this)
-        print(len(self.node_matrices))
-        for s in self.node_matrices:
-            print(s.shape)
-
+        if self.dim == 2: # this means matrix A
+            A_1, A_2 = torch.split(full_matrix, split_size_or_sections=full_matrix.size(0) // 2, dim=0) 
+            self.node_matrices = [A_1,A_2]  
+        if self.dim == 3: # this means matrix A
+            number_of_shards = len(self.node_IP_list) / 2
+            self.node_matrices = torch.split(full_matrix, split_size_or_sections=full_matrix.size(0) // int(number_of_shards), dim=0) 
         return self.node_matrices
 
     def convert_to_cluster_matrix_shards(self):
@@ -695,123 +669,229 @@ class cluster_matrix:
         print(f"Total file paths tracked: {len(self.matrix_file_paths_list)}")
         return 0
 
-    def save_distribute_matrix_grid_bin(self):
+    def save_distribute_matrixA_grid_bin(self):
         """
         Distribute broadcast shards for distributed GEMM.
-
-        Matrix A (dim=2):
-            - Row shards A_row{i} → broadcast across grid columns
-
-        Matrix B (dim=3):
-            - Row shards B_row{j} → broadcast across grid rows
-            - Transpose happens at compute time (B_row.T)
-
-        Populates self.matrix_file_paths_list with RAM paths in correct order
-        for cluster_shard_operation.
         """
-
-        if not hasattr(self, 'node_matrices') or not self.node_matrices:
-            raise ValueError("Call convert_to_cluster_matrix_grid first")
-
-        if not self.node_IP_list:
-            raise ValueError("node_IP_list empty")
-
-        print(f"📐 Grid: {self.grid_rows} × {self.grid_cols}")
-
-        self.matrix_file_paths_list = []
-        os.makedirs(self.local_DISK_folder, exist_ok=True)
-        os.makedirs(self.local_RAM_folder, exist_ok=True)
-
-        ip_saved_files = {}
-        matrix_base = self.matrix_name.split('.pt')[0]
 
         # ---------------------------
         # MATRIX A — ROW SHARDS
         # ---------------------------
         if self.dim == 2:
             print("\n📤 Distributing Matrix A row shards")
-            for grid_row in range(self.grid_rows):
-                shard = self.node_matrices[grid_row]
-                filename = f"{matrix_base}_A_row{grid_row+1}.bin"
+            
+            # ---------------------------
+            # MATRIX A — SAVE LOCALLY (save both files to head node)
+            # ---------------------------
+            self.matrix_file_paths_list = []
 
-                for grid_col in range(self.grid_cols):
-                    node_idx = grid_row * self.grid_cols + grid_col
-                    if node_idx >= len(self.node_IP_list):
-                        continue
+            # Create disk folder path
+            disk_folder_path = os.path.join(self.local_project_dir, self.local_DISK_folder)
+            os.makedirs(disk_folder_path, exist_ok=True)
 
-                    node_IP = self.node_IP_list[node_idx]
+            # Create file paths
+            matrixA1_file_path = os.path.join(self.local_RAM_folder, f'{self.matrix_name}_shard_0.bin')
+            matrixA2_file_path = os.path.join(self.local_RAM_folder, f'{self.matrix_name}_shard_1.bin')
 
-                    if node_IP not in ip_saved_files:
-                        ip_saved_files[node_IP] = set()
+            # Save matrices locally to RAM
+            self.save_matrix_binary(self.node_matrices[0], matrixA1_file_path)
+            self.save_matrix_binary(self.node_matrices[1], matrixA2_file_path)
 
-                    if filename in ip_saved_files[node_IP]:
-                        continue
+            # Copy to project directory AND disk folder
+            import subprocess
+            
+            # Copy shard 0 to both locations
+            shard0_disk_path = os.path.join(disk_folder_path, f'{self.matrix_name}_shard_0.bin')
+            subprocess.run(['cp', matrixA1_file_path, self.local_project_dir], check=True)
+            subprocess.run(['cp', matrixA1_file_path, shard0_disk_path], check=True)
+            print(f"  Copied shard 0 to: {self.local_project_dir}/{self.matrix_name}_shard_0.bin")
+            print(f"  Copied shard 0 to: {shard0_disk_path}")
+            
+            # Copy shard 1 to both locations
+            shard1_disk_path = os.path.join(disk_folder_path, f'{self.matrix_name}_shard_1.bin')
+            subprocess.run(['cp', matrixA2_file_path, self.local_project_dir], check=True)
+            subprocess.run(['cp', matrixA2_file_path, shard1_disk_path], check=True)
+            print(f"  Copied shard 1 to: {self.local_project_dir}/{self.matrix_name}_shard_1.bin")
+            print(f"  Copied shard 1 to: {shard1_disk_path}")
 
-                    print(f"   → Node {node_IP} gets {filename} {tuple(shard.shape)}")
+            # Determine how many nodes get each shard
+            total_nodes = len(self.node_IP_list)
+            half_nodes = total_nodes // 2  # Integer division
+            
+            # Track which IPs we've already sent files to
+            shard0_sent_to_ips = set()
+            shard1_sent_to_ips = set()
+            
+            # Temporary list to store [IP, file_path] pairs
+            ip_shard_pairs = []
+            
+            for index, node_IP in enumerate(self.node_IP_list):
+                # Determine which shard this node gets
+                if index < half_nodes:
+                    file_path = matrixA1_file_path
+                    shard_type = 0
+                else:
+                    file_path = matrixA2_file_path
+                    shard_type = 1
+                
+                # Store the IP and file path pair
+                ip_shard_pairs.append([node_IP, file_path])
+                
+                # Send files to remote nodes (skip local IP)
+                if node_IP != self.IP:
+                    if shard_type == 0 and node_IP not in shard0_sent_to_ips:
+                        # Send the file to remote RAM
+                        self.zmq_send_file(node_IP, matrixA1_file_path)
+                        self.wait_for_acks(1)
+                        
+                        # Send command to copy from RAM to disk
+                        remote_filename = os.path.basename(matrixA1_file_path)
+                        remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, remote_filename)
+                        remote_save_file_path_DISK = os.path.join(self.remote_project_dir, self.remote_DISK_folder, remote_filename)
+                        copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
+                        self.zmq_send_command(node_IP, copy_command)
+                        
+                        shard0_sent_to_ips.add(node_IP)
+                        print(f'Sent shard 0 to IP: {node_IP}')
+                    
+                    elif shard_type == 1 and node_IP not in shard1_sent_to_ips:
+                        # Send the file to remote RAM
+                        self.zmq_send_file(node_IP, matrixA2_file_path)
+                        self.wait_for_acks(1)
+                        
+                        # Send command to copy from RAM to disk
+                        remote_filename = os.path.basename(matrixA2_file_path)
+                        remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, remote_filename)
+                        remote_save_file_path_DISK = os.path.join(self.remote_project_dir, self.remote_DISK_folder, remote_filename)
+                        copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
+                        self.zmq_send_command(node_IP, copy_command)
+                        
+                        shard1_sent_to_ips.add(node_IP)
+                        print(f'Sent shard 1 to IP: {node_IP}')
+            
+            # Print the IP-shard assignments for debugging
+            print("\n📋 Node shard assignments:")
+            for ip, path in ip_shard_pairs:
+                shard_name = "shard_0" if path == matrixA1_file_path else "shard_1"
+                print(f"  {ip} -> {shard_name}")
+            
+            # Now extract just the file paths (remove IPs) and store in matrix_file_paths_list
+            self.matrix_file_paths_list = [file_path for _, file_path in ip_shard_pairs]
+            
+            print(f"\n✅ Final matrix_file_paths_list (paths only):")
+            for i, path in enumerate(self.matrix_file_paths_list):
+                shard_name = "shard_0" if path == matrixA1_file_path else "shard_1"
+                print(f"  Node {i}: {shard_name}")
 
-                    save_disk = os.path.join(self.local_DISK_folder, filename)
-                    self.save_matrix_binary(shard.float(), save_disk)
+        return self.matrix_file_paths_list
 
-                    if node_IP == self.IP:
-                        save_ram = os.path.join(self.local_RAM_folder, filename)
-                        self.save_matrix_binary(shard.float(), save_ram)
-                        self.matrix_file_paths_list.append(save_ram)
-                    else:
-                        self.zmq_send_file(node_IP, save_disk)
-                        remote_save_ram = os.path.join(self.remote_RAM_folder, filename)
-                        self.matrix_file_paths_list.append(remote_save_ram)
-
-                    ip_saved_files[node_IP].add(filename)
-
-        # ---------------------------
-        # MATRIX B — ROW SHARDS
-        # ---------------------------
-        else:
+    def save_distribute_matrixB_grid_bin(self):
+        """
+        Distribute Matrix B shards for distributed GEMM.
+        For dim=3, Matrix B shards are distributed across nodes in a repeating pattern.
+        """
+        
+        if self.dim == 3:
             print("\n📤 Distributing Matrix B row shards")
-            for grid_col in range(self.grid_cols):
-                shard = self.node_matrices[grid_col]
-                filename = f"{matrix_base}_B_row{grid_col+1}.bin"
+            
+            # ---------------------------
+            # MATRIX B — SAVE LOCALLY (save all shards to head node)
+            # ---------------------------
+            self.matrix_file_paths_list = []
+            
+            # Create disk folder path
+            disk_folder_path = os.path.join(self.local_project_dir, self.local_DISK_folder)
+            os.makedirs(disk_folder_path, exist_ok=True)
+            
+            # Save all matrix shards locally
+            for index, matrix_tile in enumerate(self.node_matrices):
+                save_name = f'{self.matrix_name}_shard_{index}.bin'
+                save_path = os.path.join(self.local_RAM_folder, save_name)
+                
+                # Save matrix to binary file in RAM
+                self.save_matrix_binary(matrix_tile, save_path)
+                
+                # Copy to project directory AND disk folder
+                import subprocess
+                
+                # Copy to project root
+                subprocess.run(['cp', save_path, self.local_project_dir], check=True)
+                
+                # Copy to disk folder
+                shard_disk_path = os.path.join(disk_folder_path, save_name)
+                subprocess.run(['cp', save_path, shard_disk_path], check=True)
+                
+                print(f"  Saved and copied shard {index}:")
+                print(f"    RAM: {save_path}")
+                print(f"    Project root: {self.local_project_dir}/{save_name}")
+                print(f"    Disk folder: {shard_disk_path}")
+            
+            # Create the distribution pattern
+            num_shards = len(self.node_matrices)  # Number of unique shards
+            num_nodes = len(self.node_IP_list)
+            
+            # Create the repeating pattern
+            pattern = []
+            for i in range(num_nodes):
+                shard_index = i % num_shards  # 0, 1, 2, ..., num_shards-1, 0, 1, ...
+                save_name = f'{self.matrix_name}_shard_{shard_index}.bin'
+                save_path = os.path.join(self.local_RAM_folder, save_name)
+                pattern.append(save_path)
+            
+            self.matrix_file_paths_list = pattern
+            
+            # Track which IPs have received which shards
+            shards_sent_to_ips = {}  # Dictionary: {shard_index: set_of_IPs}
+            for i in range(num_shards):
+                shards_sent_to_ips[i] = set()
+            
+            # Temporary list to store [IP, file_path] pairs
+            ip_shard_pairs = []
+            
+            for i, node_IP in enumerate(self.node_IP_list):
+                shard_index = i % num_shards
+                save_name = f'{self.matrix_name}_shard_{shard_index}.bin'
+                save_path = os.path.join(self.local_RAM_folder, save_name)
+                
+                # Store the IP and file path pair
+                ip_shard_pairs.append([node_IP, save_path])
+                
+                # Send files to remote nodes (skip local IP)
+                if node_IP != self.IP:
+                    if node_IP not in shards_sent_to_ips[shard_index]:
+                        # Send the file to remote RAM
+                        self.zmq_send_file(node_IP, save_path)
+                        self.wait_for_acks(1)
+                        
+                        # Send command to copy from RAM to disk
+                        remote_filename = os.path.basename(save_path)
+                        remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, remote_filename)
+                        remote_save_file_path_DISK = os.path.join(self.remote_project_dir, self.remote_DISK_folder, remote_filename)
+                        copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
+                        self.zmq_send_command(node_IP, copy_command)
+                        
+                        shards_sent_to_ips[shard_index].add(node_IP)
+                        print(f'Sent shard {shard_index} to IP: {node_IP}')
+            
+            # Print the IP-shard assignments for debugging
+            print("\n📋 Node shard assignments:")
+            for ip, path in ip_shard_pairs:
+                # Extract shard number from filename
+                import re
+                match = re.search(r'shard_(\d+)', path)
+                shard_num = match.group(1) if match else "unknown"
+                print(f"  {ip} -> shard_{shard_num}")
+            
+            print(f"\n✅ Final matrix_file_paths_list (paths only):")
+            for i, path in enumerate(self.matrix_file_paths_list):
+                match = re.search(r'shard_(\d+)', path)
+                shard_num = match.group(1) if match else "unknown"
+                print(f"  Node {i}: shard_{shard_num}")
+        
+        else:
+            print(f"\n⚠️  Wrong dimension for Matrix B distribution: dim={self.dim} (expected 3)")
+            self.matrix_file_paths_list = []
 
-                for grid_row in range(self.grid_rows):
-                    node_idx = grid_row * self.grid_cols + grid_col
-                    if node_idx >= len(self.node_IP_list):
-                        continue
-
-                    node_IP = self.node_IP_list[node_idx]
-
-                    if node_IP not in ip_saved_files:
-                        ip_saved_files[node_IP] = set()
-
-                    if filename in ip_saved_files[node_IP]:
-                        continue
-
-                    print(f"   → Node {node_IP} gets {filename} {tuple(shard.shape)}")
-
-                    save_disk = os.path.join(self.local_DISK_folder, filename)
-                    self.save_matrix_binary(shard.float(), save_disk)
-
-                    if node_IP == self.IP:
-                        save_ram = os.path.join(self.local_RAM_folder, filename)
-                        self.save_matrix_binary(shard.float(), save_ram)
-                        self.matrix_file_paths_list.append(save_ram)
-                    else:
-                        self.zmq_send_file(node_IP, save_disk)
-                        remote_save_ram = os.path.join(self.remote_RAM_folder, filename)
-                        self.matrix_file_paths_list.append(remote_save_ram)
-
-                    ip_saved_files[node_IP].add(filename)
-
-        # ---------------------------
-        # ACK SYNC
-        # ---------------------------
-        remote_nodes = list(set(self.node_IP_list) - {self.IP})
-        print(f"\n⏳ Waiting for ACKs from {len(remote_nodes)} nodes")
-        self.wait_for_acks(len(remote_nodes), 'ACK')
-
-        self.blocks_distributed = True
-
-        print("\n✅ Distribution complete")
-        print(f"Total shards: {len(self.matrix_file_paths_list)}")
         return self.matrix_file_paths_list
 
     def save_matrix_binary(self, matrix, filename):
@@ -1090,6 +1170,216 @@ class cluster_matrix:
         
         return True
  
+    def load_cluster_matrixA_grid(self):
+        """
+        Load Matrix A shards from disk to RAM for distributed GEMM.
+        Simple version: just copy from local_DISK_folder to local_RAM_folder
+        """
+        
+        if self.dim != 2:
+            print(f"Error: This function is for Matrix A (dim=2), but got dim={self.dim}")
+            return False
+        
+        print(f"\n📥 Loading Matrix A grid shards from disk to RAM")
+        
+        # Initialize the file paths list
+        self.matrix_file_paths_list = []
+        
+        # Determine how many nodes get each shard
+        total_nodes = len(self.node_IP_list)
+        half_nodes = total_nodes // 2  # Integer division
+        
+        # Create file names for Matrix A shards
+        shard0_filename = f'{self.matrix_name}_shard_0.bin'
+        shard1_filename = f'{self.matrix_name}_shard_1.bin'
+        
+        # Define disk paths - CORRECTED: should be in local_project_dir + local_DISK_folder
+        local_shard0_disk_path = os.path.join(self.local_project_dir, self.local_DISK_folder, shard0_filename)
+        local_shard1_disk_path = os.path.join(self.local_project_dir, self.local_DISK_folder, shard1_filename)
+        
+        # Define RAM paths
+        local_shard0_ram_path = os.path.join(self.local_RAM_folder, shard0_filename)
+        local_shard1_ram_path = os.path.join(self.local_RAM_folder, shard1_filename)
+        
+        # Check if shards exist in disk
+        print(f"Looking for shards in: {os.path.join(self.local_project_dir, self.local_DISK_folder)}")
+        print(f"  Shard 0 path: {local_shard0_disk_path}")
+        print(f"  Shard 1 path: {local_shard1_disk_path}")
+        
+        if not os.path.exists(local_shard0_disk_path):
+            print(f"❌ Error: shard_0 not found at: {local_shard0_disk_path}")
+            return False
+        
+        if not os.path.exists(local_shard1_disk_path):
+            print(f"❌ Error: shard_1 not found at: {local_shard1_disk_path}")
+            return False
+        
+        # Copy shard 0 from disk to RAM
+        print(f"\n📋 Copying shard_0 from disk to RAM...")
+        shard0_copy_cmd = f'cp "{local_shard0_disk_path}" "{local_shard0_ram_path}"'
+        print(f"  Command: {shard0_copy_cmd}")
+        subprocess.run(shard0_copy_cmd, shell=True, check=True)
+        print(f"  ✅ shard_0 copied to RAM")
+        
+        # Copy shard 1 from disk to RAM  
+        print(f"\n📋 Copying shard_1 from disk to RAM...")
+        shard1_copy_cmd = f'cp "{local_shard1_disk_path}" "{local_shard1_ram_path}"'
+        print(f"  Command: {shard1_copy_cmd}")
+        subprocess.run(shard1_copy_cmd, shell=True, check=True)
+        print(f"  ✅ shard_1 copied to RAM")
+        
+        # Create the distribution pattern (same as save_distribute_matrixA_grid_bin)
+        print(f"\n📋 Creating distribution pattern for {total_nodes} nodes:")
+        
+        # Track which IPs have been processed for remote commands
+        shard0_processed_ips = set()
+        shard1_processed_ips = set()
+        
+        for index, node_IP in enumerate(self.node_IP_list):
+            if index < half_nodes:
+                # First half gets shard_0
+                self.matrix_file_paths_list.append(local_shard0_ram_path)
+                print(f"  Node {index} ({node_IP}): assigned shard_0")
+                
+                # Send command to remote nodes to copy their shard from disk to RAM
+                if node_IP != self.IP and node_IP not in shard0_processed_ips:
+                    remote_disk_path = os.path.join(self.remote_DISK_folder, shard0_filename)
+                    remote_ram_path = os.path.join(self.remote_RAM_folder, shard0_filename)
+                    # CORRECTED: remote_disk_path should be prefixed with remote_project_dir
+                    remote_copy_command = f'cp "{self.remote_project_dir}{remote_disk_path}" "{remote_ram_path}"'
+                    
+                    print(f"    Sending to remote {node_IP}: {remote_copy_command}")
+                    self.zmq_send_command(node_IP, remote_copy_command)
+                    shard0_processed_ips.add(node_IP)
+                    
+            else:
+                # Second half gets shard_1
+                self.matrix_file_paths_list.append(local_shard1_ram_path)
+                print(f"  Node {index} ({node_IP}): assigned shard_1")
+                
+                # Send command to remote nodes to copy their shard from disk to RAM
+                if node_IP != self.IP and node_IP not in shard1_processed_ips:
+                    remote_disk_path = os.path.join(self.remote_DISK_folder, shard1_filename)
+                    remote_ram_path = os.path.join(self.remote_RAM_folder, shard1_filename)
+                    # CORRECTED: remote_disk_path should be prefixed with remote_project_dir
+                    remote_copy_command = f'cp "{self.remote_project_dir}{remote_disk_path}" "{remote_ram_path}"'
+                    
+                    print(f"    Sending to remote {node_IP}: {remote_copy_command}")
+                    self.zmq_send_command(node_IP, remote_copy_command)
+                    shard1_processed_ips.add(node_IP)
+        
+        # ===== LOADING COMPLETE =====
+        print(f"\n✅ Matrix A grid loading complete")
+        print(f"   Total nodes: {total_nodes}")
+        print(f"   First {half_nodes} nodes: shard_0")
+        print(f"   Remaining {total_nodes - half_nodes} nodes: shard_1")
+        print(f"   File paths tracked: {len(self.matrix_file_paths_list)}")
+        
+        return True
+
+    def load_cluster_matrixB_grid(self):
+        """
+        Load Matrix B shards from disk to RAM for distributed GEMM.
+        """
+        
+        if self.dim != 3:
+            print(f"Error: This function is for Matrix B (dim=3), but got dim={self.dim}")
+            return False
+        
+        print(f"\n📥 Loading Matrix B grid shards from disk to RAM")
+        
+        # Initialize the file paths list
+        self.matrix_file_paths_list = []
+        
+        # Determine number of nodes
+        total_nodes = len(self.node_IP_list)
+        print(f"Total nodes: {total_nodes}")
+        
+        # Find how many shards exist by checking disk
+        # Look for files like: big_matrixB_shard_0.bin, big_matrixB_shard_1.bin, etc.
+        
+        # Check for shard files in the disk folder
+        disk_folder_path = os.path.join(self.local_project_dir, self.local_DISK_folder)
+        
+        if not os.path.exists(disk_folder_path):
+            print(f"❌ Error: Disk folder not found: {disk_folder_path}")
+            return False
+        
+        # Count shards by looking for files
+        num_shards = 0
+        while True:
+            shard_filename = f'{self.matrix_name}_shard_{num_shards}.bin'
+            shard_disk_path = os.path.join(disk_folder_path, shard_filename)
+            
+            if os.path.exists(shard_disk_path):
+                num_shards += 1
+            else:
+                break
+        
+        if num_shards == 0:
+            print(f"❌ Error: No Matrix B shards found in: {disk_folder_path}")
+            print(f"  Looking for files like: {self.matrix_name}_shard_*.bin")
+            return False
+        
+        print(f"Found {num_shards} Matrix B shards on disk")
+        
+        # Copy all shards from disk to RAM
+        print(f"\n📋 Copying {num_shards} shards from disk to RAM...")
+        
+        for i in range(num_shards):
+            shard_filename = f'{self.matrix_name}_shard_{i}.bin'
+            shard_disk_path = os.path.join(disk_folder_path, shard_filename)
+            shard_ram_path = os.path.join(self.local_RAM_folder, shard_filename)
+            
+            copy_cmd = f'cp "{shard_disk_path}" "{shard_ram_path}"'
+            print(f"  Shard {i}: {copy_cmd}")
+            subprocess.run(copy_cmd, shell=True, check=True)
+        
+        print(f"  ✅ All {num_shards} shards copied to RAM")
+        
+        # Create the repeating distribution pattern (same as save function)
+        print(f"\n📋 Creating distribution pattern for {total_nodes} nodes:")
+        
+        # Track which shards have been sent to which IPs
+        shards_sent_to_ips = {}
+        for i in range(num_shards):
+            shards_sent_to_ips[i] = set()
+        
+        for i, node_IP in enumerate(self.node_IP_list):
+            shard_index = i % num_shards
+            shard_filename = f'{self.matrix_name}_shard_{shard_index}.bin'
+            shard_ram_path = os.path.join(self.local_RAM_folder, shard_filename)
+            
+            # Store the RAM path for this node
+            self.matrix_file_paths_list.append(shard_ram_path)
+            
+            print(f"  Node {i} ({node_IP}): assigned shard_{shard_index}")
+            
+            # Send command to remote nodes to copy their shard from disk to RAM
+            if node_IP != self.IP and node_IP not in shards_sent_to_ips[shard_index]:
+                remote_disk_path = os.path.join(self.remote_DISK_folder, shard_filename)
+                remote_ram_path = os.path.join(self.remote_RAM_folder, shard_filename)
+                remote_copy_command = f'cp "{self.remote_project_dir}{remote_disk_path}" "{remote_ram_path}"'
+                
+                print(f"    Sending to remote {node_IP}: {remote_copy_command}")
+                self.zmq_send_command(node_IP, remote_copy_command)
+                
+                shards_sent_to_ips[shard_index].add(node_IP)
+        
+        # Print the final assignments
+        print(f"\n📋 Node shard assignments:")
+        for i, node_IP in enumerate(self.node_IP_list):
+            shard_index = i % num_shards
+            print(f"  {node_IP} -> shard_{shard_index}")
+        
+        print(f"\n✅ Matrix B grid loading complete")
+        print(f"   Total nodes: {total_nodes}")
+        print(f"   Unique shards: {num_shards}")
+        print(f"   Distribution pattern: 0..{num_shards-1} repeating")
+        print(f"   File paths tracked: {len(self.matrix_file_paths_list)}")
+        
+        return True
+
     def cluster_shard_operation(self, cluster_matrixB, TransposeA, TransposeB, send_back_result=False, operation='mul'):
         """
         Perform a distributed matrix operation across the cluster.
@@ -1246,128 +1536,7 @@ class cluster_matrix:
             return result_cluster_matrix
         return False  # Return the distributed result instance
 
-    def cluster_grid_operation(self, cluster_matrixB, TransposeA, TransposeB, send_back_result=False, operation='mul'):
-        """
-        Perform a distributed matrix operation across the cluster using the full grid GEMM pattern.
-        Each row shard of Matrix A multiplies with each column shard of Matrix B.
 
-        Args:
-            cluster_matrixB: Another cluster_matrix instance for the second operand
-            TransposeA: Whether to transpose matrix A
-            TransposeB: Whether to transpose matrix B  
-            send_back_result: Whether to combine results into single file (True) 
-                            or keep distributed (False)
-            operation: Operation to perform ('mul', 'add', 'sub')
-
-        Returns:
-            Base name of the result file(s)
-        """
-        print(f"\n{'='*60}")
-        print(f"🚀 STARTING CLUSTER GRID OPERATION")
-        print(f"{'='*60}")
-        print(f"Matrix A: {self.matrix_name}")
-        print(f"Matrix B: {cluster_matrixB.matrix_name}")
-        print(f"Operation: {operation}")
-        print(f"Transpose A: {TransposeA}, Transpose B: {TransposeB}")
-        print(f"Send back result: {send_back_result}")
-        print(f"A shards: {len(self.matrix_file_paths_list)}, B shards: {len(cluster_matrixB.matrix_file_paths_list)}")
-        start_time = time.time()
-
-        node_gpu_counters = {}
-
-        total_ops = len(self.matrix_file_paths_list)  # A row shards
-        print(f"\n📤 DISTRIBUTING GRID OPERATIONS TO NODES ({total_ops} ops)")
-
-        for shard_index, (node_IP, CPU_GPU_select, back_end_select, matrix_a) in enumerate(zip(
-            self.node_IP_list,
-            self.CPU_GPU_select_list,
-            self.back_end_select_list,
-            self.matrix_file_paths_list
-        )):
-            # Initialize GPU counter
-            if node_IP not in node_gpu_counters:
-                node_gpu_counters[node_IP] = 0
-            current_gpu_number = node_gpu_counters[node_IP]
-
-            # Map A shard to correct B shard (broadcast across grid)
-            b_shard_index = shard_index % len(cluster_matrixB.matrix_file_paths_list)
-            matrix_b = cluster_matrixB.matrix_file_paths_list[b_shard_index]
-
-            print(f"\nProcessing operation {shard_index}:")
-            print(f"  Node: {node_IP}")
-            print(f"  Backend: {back_end_select}")
-            print(f"  Use GPU: {CPU_GPU_select} (GPU #{current_gpu_number})")
-            print(f"  Matrix A path: {matrix_a}")
-            print(f"  Matrix B path: {matrix_b}")
-
-            # Backend-specific transpose handling
-            local_TransposeA = TransposeA
-            local_TransposeB = TransposeB
-            if back_end_select == 'llama':
-                local_TransposeB = not TransposeB
-
-            TransposeA_str = str(local_TransposeA).lower()
-            TransposeB_str = str(local_TransposeB).lower()
-            use_gpu_str = str(CPU_GPU_select).lower()
-
-            # Send-back flag
-            send_back_str = str(len(self.node_IP_list)) if send_back_result else "0"
-            print(f"  Final transpose flags - A: {TransposeA_str}, B: {TransposeB_str}")
-            print(f"  Send back result: {send_back_result} ({send_back_str})")
-
-            # Build command
-            command = (
-                f"server_command={back_end_select} "
-                f"{matrix_a} "
-                f"{TransposeA_str} "
-                f"{matrix_b} "
-                f"{TransposeB_str} "
-                f"{use_gpu_str} "
-                f"{current_gpu_number} "
-                f"{send_back_str} "
-                f"{operation} "
-                f"2 "
-                f"{shard_index}"
-            )
-
-            # Send command
-            socket_eth = self.llama_socket_pool[node_IP]
-            socket_eth.send_multipart([command.encode()])
-            print(f"  ✅ Command sent to node {node_IP}")
-
-            if CPU_GPU_select:
-                node_gpu_counters[node_IP] += 1
-                print(f"  Incremented GPU counter for node {node_IP} to {node_gpu_counters[node_IP]}")
-
-        # Wait for all ACKs
-        expected_acks = len(self.matrix_file_paths_list)
-        print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
-        self.wait_for_acks(expected_acks, "ACK_matrixOp_complete")
-
-        print(f"\n{'='*60}")
-        print(f"✅ CLUSTER GRID OPERATION COMPLETE")
-        print(f"{'='*60}")
-        print(f"Operation time: {time.time() - start_time:.2f} seconds")
-
-        # Prepare result cluster
-        base_result_name = f"{cluster_matrixB.matrix_name}x{self.matrix_name}" if 'llama' in self.back_end_select_list else f"{self.matrix_name}x{cluster_matrixB.matrix_name}"
-
-        if send_back_result:
-            self.wait_for_acks(1, "ACK_combined_matrix_saved")
-            path = self.local_RAM_folder + base_result_name + '_combined.bin'
-            combined_matrix = convert_bin_matrix_to_pt(path)
-            os.remove(path)
-            return combined_matrix
-        else:
-            result_cluster_matrix = cluster_matrix(
-                base_result_name,
-                self.node_IP_list,
-                self.CPU_GPU_select_list,
-                self.node_percentages,
-                self.back_end_select_list,
-                True
-            )
-            return result_cluster_matrix
 
 #######################################------MAIN FUNCTION - TESTING-----######################################  
 if __name__ == "__main__":
@@ -1517,19 +1686,18 @@ if __name__ == "__main__":
 
 ############################# TESTING CLUSTER MATRIX OPERATIONS SYSTEM 2 #############################
 
-
-
-
 IP_list = [
     '192.168.2.100','192.168.2.100','192.168.2.100',
     '192.168.2.101','192.168.2.101','192.168.2.104'
 ]
 
-percentages = [0.3, 0.3, 0.1, 0.1, 0.1, 0.1]
+percentages = [0.2, 0.2, 0.2, 0.2, 0.1, 0.1]
 CPU_GPU_select_list = [True, True, True, True, True, True]
 # You already have this variable defined:
 backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama'] 
 
+
+'''
 # Use it instead of empty list:
 matrix_A = cluster_matrix(
     matrix_file_path=big_test_matrix_pathA,
@@ -1540,8 +1708,8 @@ matrix_A = cluster_matrix(
     split_matrix=True,
     dim=2
 )
-test = matrix_A.convert_to_cluster_matrix_grid()
-matrix_A.save_distribute_matrix_grid_bin()
+matrix_A.convert_to_cluster_matrix_grid()
+matrix_A.save_distribute_matrixA_grid_bin()
 
 matrix_B = cluster_matrix(
     matrix_file_path=big_test_matrix_pathB,
@@ -1553,10 +1721,36 @@ matrix_B = cluster_matrix(
     dim=3
 )
 matrix_B.convert_to_cluster_matrix_grid()
-matrix_B.save_distribute_matrix_grid_bin()
+matrix_B.save_distribute_matrixB_grid_bin()
+'''
 
-# With our corrected system where B is already transposed to Bᵀ:
-result = matrix_A.cluster_grid_operation(matrix_B,False,True,False)
+#result = matrix_A.cluster_grid_operation(matrix_B,False,True,False)
 
-# This computes: A × Bᵀ where B is already Bᵀ from convert_to_cluster_matrix_grid()
-# No additional transpose needed!
+# Use it instead of empty list:
+
+
+matrix_A = cluster_matrix(
+    matrix_file_path='big_matrixA',
+    node_IP_list=IP_list,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    node_percentages=percentages,
+    back_end_select_list=backend_select_list,  # Use the actual variable!
+    split_matrix=True,
+    dim=2
+)
+matrix_A.load_cluster_matrixA_grid()
+
+
+matrix_B = cluster_matrix(
+    matrix_file_path='big_matrixB',
+    node_IP_list=IP_list,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    node_percentages=percentages,
+    back_end_select_list=backend_select_list,  # Use the actual variable!
+    split_matrix=True,
+    dim=3
+)
+matrix_B.load_cluster_matrixB_grid()
+
+
+result = matrix_A.cluster_shard_operation(matrix_B,False,True,False)
