@@ -132,7 +132,7 @@ def convert_bin_matrix_to_pt(filename, force_2d=True):
 class cluster_matrix:
     def __init__(self, matrix_file_path,
                 node_IP_list, CPU_GPU_select_list, node_percentages=[], back_end_select_list=[],
-                split_matrix=False, dim=0, pair_split_with_shape=None):
+                split_matrix=False, dim=0):
         
         print("=" * 70)
         print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
@@ -151,6 +151,8 @@ class cluster_matrix:
             raise ValueError("Node configuration error: All lists must have the same length")
 
         # Check that percentages sum to (roughly) 1.0
+        half_node_percentages = len(node_percentages) // 2
+        sys2_split_percentages = node_percentages[:half_node_percentages]
         total_percent = sum(node_percentages)
         if abs(total_percent - 1.0) > 1e-6:
             print(f"❌ PERCENTAGE ERROR: Node percentages sum to {total_percent:.6f}, should be 1.0")
@@ -226,7 +228,7 @@ class cluster_matrix:
         self.back_end_select_list = back_end_select_list  # 'torch', 'llama', 'opencl'
         self.split_matrix = split_matrix
         self.OG_matrix_shape = []
-        self.pair_split_with_shape = pair_split_with_shape
+        self.sys2_split_percentages = sys2_split_percentages
         self.grid_rows = 0
         self.grid_cols = 0
 
@@ -463,7 +465,6 @@ class cluster_matrix:
             socket.close()
         self.zmq_context.term()
 
-
     def convert_to_cluster_matrix_grid(self):
         full_matrix = torch.load(self.matrix_file_path)
         self.OG_matrix_shape = list(full_matrix.shape)
@@ -473,27 +474,65 @@ class cluster_matrix:
             split_point = full_matrix.size(0) // 2
             A_1 = full_matrix[:split_point, :]
             A_2 = full_matrix[split_point:, :]
+            
+            # Store just the 2 unique shards
             self.node_matrices = [A_1, A_2]  
             print(f"✅ Matrix A: {full_matrix.shape} → [{A_1.shape}, {A_2.shape}]")
 
         elif self.dim == 3:  # Matrix B for GEMM
-            total_rows = full_matrix.size(0)  # e.g., 15000
-            total_nodes = len(self.node_IP_list)  # e.g., 6
+            total_rows = full_matrix.size(0)
+            total_nodes = len(self.node_IP_list)
+            unique_B_shards = total_nodes // 2
             
-            # For GEMM: B should have total_nodes // 2 unique shards
-            unique_B_shards = total_nodes // 2  # 3 for 6 nodes
-            print(f"✅ Matrix B: {full_matrix.shape} → splitting into {unique_B_shards} unique shards")
+            # Validate we have enough nodes
+            if total_nodes < 2:
+                raise ValueError(f"System 2 requires at least 2 nodes, got {total_nodes}")
+            if total_nodes % 2 != 0:
+                raise ValueError(f"System 2 requires even number of nodes, got {total_nodes}")
             
-            # Calculate chunk sizes for unique shards
-            base_chunk_size = total_rows // unique_B_shards  # 15000 ÷ 3 = 5000
-            remainder = total_rows % unique_B_shards  # 0
-            
-            # Create split sizes for unique shards
-            split_sizes = [base_chunk_size] * unique_B_shards
-            
-            # Distribute remainder
-            for i in range(remainder):
-                split_sizes[i] += 1
+            # Use sys2_split_percentages if provided
+            if hasattr(self, 'sys2_split_percentages') and self.sys2_split_percentages is not None:
+                # Validate percentages
+                if len(self.sys2_split_percentages) != unique_B_shards:
+                    raise ValueError(
+                        f"sys2_split_percentages must have length {unique_B_shards} "
+                        f"(total_nodes//2), got {len(self.sys2_split_percentages)}"
+                    )
+                
+                if abs(sum(self.sys2_split_percentages) - 1.0) > 0.01:  # Allow small floating point errors
+                    raise ValueError(
+                        f"sys2_split_percentages must sum to 1.0, got {sum(self.sys2_split_percentages)}"
+                    )
+                
+                print(f"✅ Matrix B: {full_matrix.shape} → splitting into {unique_B_shards} shards using percentages {self.sys2_split_percentages}")
+                
+                # Calculate split sizes based on percentages
+                split_sizes = []
+                
+                for i in range(unique_B_shards - 1):
+                    size = int(total_rows * self.sys2_split_percentages[i])
+                    split_sizes.append(size)
+                
+                # Last shard gets remaining rows
+                allocated = sum(split_sizes)
+                last_size = total_rows - allocated
+                split_sizes.append(last_size)
+                
+                # Validate sizes
+                if sum(split_sizes) != total_rows:
+                    # Adjust last size to fix rounding errors
+                    split_sizes[-1] = total_rows - sum(split_sizes[:-1])
+                
+            else:
+                # Default: equal split
+                print(f"✅ Matrix B: {full_matrix.shape} → splitting into {unique_B_shards} equal shards")
+                
+                base_chunk_size = total_rows // unique_B_shards
+                remainder = total_rows % unique_B_shards
+                
+                split_sizes = [base_chunk_size] * unique_B_shards
+                for i in range(remainder):
+                    split_sizes[i] += 1
             
             print(f"Split sizes for {unique_B_shards} unique shards: {split_sizes}")
             print(f"Sum check: {sum(split_sizes)} = {total_rows} {'✓' if sum(split_sizes) == total_rows else '✗'}")
@@ -501,17 +540,21 @@ class cluster_matrix:
             # Split B into unique shards
             B_unique_chunks = torch.split(full_matrix, split_sizes, dim=0)
             
-            # Create repeating pattern for all nodes
-            self.node_matrices = []
+            # Create base repeating pattern (will be reordered)
+            base_pattern = []
             for i in range(total_nodes):
-                shard_index = i % unique_B_shards  # 0,1,2,0,1,2 for 6 nodes
-                self.node_matrices.append(B_unique_chunks[shard_index])
+                shard_index = i % unique_B_shards
+                base_pattern.append(B_unique_chunks[shard_index])
             
-            print(f"✅ Created {total_nodes} B shards (repeating pattern):")
+            self.node_matrices = base_pattern
+            
+            print(f"✅ Created {total_nodes} B shards (before reordering):")
             for i, chunk in enumerate(self.node_matrices):
                 shard_num = i % unique_B_shards
-                print(f"  Node {i}: gets B{shard_num} {chunk.shape}")
-            
+                print(f"  Node {i} (original): gets B{shard_num} {chunk.shape}")
+        
+        # Apply dynamic reordering
+        #return self._reorder_system2_dynamic(self.node_matrices)
         return self.node_matrices
 
     def convert_to_cluster_matrix_shards(self):
@@ -1247,14 +1290,20 @@ class cluster_matrix:
         )):
             print(f"\nProcessing shard {shard_index}:")
             
-            # Initialize or get GPU counter for this node
+            # Get GPU number for this node
             if node_IP not in node_gpu_counters:
                 node_gpu_counters[node_IP] = 0
+            
             current_gpu_number = node_gpu_counters[node_IP]
+            
+            # INCREMENT NOW for next operation on this node
+            if CPU_GPU_select:
+                node_gpu_counters[node_IP] += 1
             
             print(f"  Node: {node_IP}")
             print(f"  Backend: {back_end_select}")
             print(f"  Use GPU: {CPU_GPU_select} (GPU #{current_gpu_number})")
+            print(f"  Next GPU for this node will be: #{node_gpu_counters[node_IP]}")
             
             # Get file paths for both matrices
             matrix_a = node_matrix  # Current matrix shard
@@ -1306,17 +1355,12 @@ class cluster_matrix:
                 f"2 "
                 f"{shard_index}"
             )
-   
+    
             # ===== SEND COMMAND TO NODE =====
             print(f"  Sending command to node...")
             socket_eth = self.llama_socket_pool[node_IP]
             socket_eth.send_multipart([command.encode()])
             print(f"  ✅ Command sent to node {node_IP}")
-            
-            # Only increment GPU counter if this node is using GPU
-            if CPU_GPU_select:
-                node_gpu_counters[node_IP] += 1
-                print(f"  Incremented GPU counter for node {node_IP} to {node_gpu_counters[node_IP]}")
         
         # ===== WAIT FOR ACKS FROM ALL NODES =====
         unique_nodes = list(set(self.node_IP_list))
@@ -1362,8 +1406,6 @@ class cluster_matrix:
             )
             return result_cluster_matrix
         return False  # Return the distributed result instance
-
-
 
 #######################################------MAIN FUNCTION - TESTING-----######################################  
 if __name__ == "__main__":
@@ -1419,7 +1461,8 @@ if __name__ == "__main__":
     '''
  
     #############################TESTING CLUSTER MATRIX OPERATIONS SYSTEM 1#############################
-
+    #'''
+    
     # ----------------- CLUSTER TEST (BIG MATRIX) -----------------
     IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
     percentages = [0.4,0.4,0.1,0.1]  
@@ -1508,10 +1551,11 @@ if __name__ == "__main__":
     node5_big_mid_matrixB.load_cluster_matrix()
     node5_big_mid_matrixD = node5_big_mid_matrixA.cluster_shard_operation(node5_big_mid_matrixB, False, True, True) 
     check_combined_result_values('model_matrixs/mid_c_ref.pt',node5_big_mid_matrixD)
-  
+    #'''
 
 
     ############################# TESTING CLUSTER MATRIX OPERATIONS SYSTEM 2 #############################
+    #'''
 
     IP_list = [
         '192.168.2.100','192.168.2.100','192.168.2.100',
@@ -1624,3 +1668,53 @@ if __name__ == "__main__":
 
     result = mid_sys2_load_matrix_A.cluster_shard_operation(mid_sys2_load_matrix_B,False,True,True)
     check_combined_result_values('model_matrixs/mid_c_ref.pt',result)
+    #'''
+
+
+    '''
+    
+    IP_list = [
+        '192.168.2.100','192.168.2.100','192.168.2.101',
+        '192.168.2.100','192.168.2.101','192.168.2.104'
+    ]
+
+    percentages_distribute_order = [0.50,0.25,0.25, 0, 0, 0]
+    CPU_GPU_select_list = [True, True, True, True, True, True]
+    # You already have this variable defined:
+    backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama'] 
+
+
+    # Use it instead of empty list:
+    big_sys2_matrix_A = cluster_matrix(
+        matrix_file_path=big_test_matrix_pathA,
+        node_IP_list=IP_list,
+        CPU_GPU_select_list=CPU_GPU_select_list,
+        node_percentages=percentages_distribute_order,
+        back_end_select_list=backend_select_list,  # Use the actual variable!
+        split_matrix=True,
+        dim=2
+    )
+    testA = big_sys2_matrix_A.convert_to_cluster_matrix_grid()
+    big_sys2_matrix_A.save_distribute_matrixA_grid_bin()
+    for matrixA in testA:
+        print(matrixA.shape)
+
+
+    big_sys2_matrix_B = cluster_matrix(
+        matrix_file_path=big_test_matrix_pathB,
+        node_IP_list=IP_list,
+        CPU_GPU_select_list=CPU_GPU_select_list,
+        node_percentages=percentages_distribute_order,
+        back_end_select_list=backend_select_list,  # Use the actual variable!
+        split_matrix=True,
+        dim=3
+    )
+    testB = big_sys2_matrix_B.convert_to_cluster_matrix_grid()
+    big_sys2_matrix_B.save_distribute_matrix_shards_bin()
+
+    for matrixB in testB:
+        print(matrixB.shape)
+
+    result = big_sys2_matrix_A.cluster_shard_operation(big_sys2_matrix_B,False,True,True)
+    check_combined_result_values('model_matrixs/big_c_ref.pt',result)
+    '''
