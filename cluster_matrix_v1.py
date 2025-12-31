@@ -1562,7 +1562,7 @@ if __name__ == "__main__":
         '192.168.2.101','192.168.2.101','192.168.2.104'
     ]
 
-    percentages =  [0.17, 0.17, 0.17, 0.17, 0.16, 0.16]
+    percentages =  [0.50,0.25,0.25, 0, 0, 0]
     CPU_GPU_select_list = [True, True, True, True, True, True]
     # You already have this variable defined:
     backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama'] 
@@ -1671,50 +1671,3 @@ if __name__ == "__main__":
     #'''
 
 
-    '''
-    
-    IP_list = [
-        '192.168.2.100','192.168.2.100','192.168.2.101',
-        '192.168.2.100','192.168.2.101','192.168.2.104'
-    ]
-
-    percentages_distribute_order = [0.50,0.25,0.25, 0, 0, 0]
-    CPU_GPU_select_list = [True, True, True, True, True, True]
-    # You already have this variable defined:
-    backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama'] 
-
-
-    # Use it instead of empty list:
-    big_sys2_matrix_A = cluster_matrix(
-        matrix_file_path=big_test_matrix_pathA,
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages_distribute_order,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=2
-    )
-    testA = big_sys2_matrix_A.convert_to_cluster_matrix_grid()
-    big_sys2_matrix_A.save_distribute_matrixA_grid_bin()
-    for matrixA in testA:
-        print(matrixA.shape)
-
-
-    big_sys2_matrix_B = cluster_matrix(
-        matrix_file_path=big_test_matrix_pathB,
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages_distribute_order,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=3
-    )
-    testB = big_sys2_matrix_B.convert_to_cluster_matrix_grid()
-    big_sys2_matrix_B.save_distribute_matrix_shards_bin()
-
-    for matrixB in testB:
-        print(matrixB.shape)
-
-    result = big_sys2_matrix_A.cluster_shard_operation(big_sys2_matrix_B,False,True,True)
-    check_combined_result_values('model_matrixs/big_c_ref.pt',result)
-    '''
