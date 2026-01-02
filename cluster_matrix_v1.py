@@ -458,8 +458,6 @@ class cluster_matrix:
             socket.close()
         self.zmq_context.term()
 
-
-
     def convert_to_hierarchical_matrix_shards(self):
         """
         Apply hierarchical splits to the matrix.
@@ -596,8 +594,6 @@ class cluster_matrix:
             print(f"    {matrix_id}[{i}]: {shard.shape}")
         
         return self.node_matrices
-
-
 
     def convert_to_cluster_matrix_grid(self):
         """
