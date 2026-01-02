@@ -17,10 +17,6 @@ import shutil
 import glob
 import math
 
-# ======================================================
-# SHAPE + NUMERICAL COMPARISON
-# ======================================================
-
 def check_combined_result_values(c_ref_path, combined):
     c_ref = torch.load(c_ref_path)
     if c_ref.shape != combined.shape:
@@ -63,10 +59,6 @@ def check_combined_result_values(c_ref_path, combined):
             f"{num_different}/{total_elements} "
             f"({(num_different / total_elements * 100):.2f}%)"
         )
-
-# ======================================================
-# VISUAL DEBUG: FIRST & SECOND HALF
-# ======================================================
 
 def print_matrix_sections(matrix, name, n_elements=100):
     flat = matrix.flatten()
@@ -132,7 +124,7 @@ def convert_bin_matrix_to_pt(filename, force_2d=True):
 class cluster_matrix:
     def __init__(self, matrix_file_path,
                 node_IP_list, CPU_GPU_select_list, node_percentages=[], back_end_select_list=[],
-                split_matrix=False, dim=0, split_depth=0):
+                split_matrix=False, dim=0, matrix_labeling='' ,split_depth=0):
         
         print("=" * 70)
         print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
@@ -229,9 +221,10 @@ class cluster_matrix:
         self.split_matrix = split_matrix
         self.OG_matrix_shape = []
         self.sys2_split_percentages = sys2_split_percentages
-        self.grid_rows = 0
-        self.grid_cols = 0
+        self.matrix_labeling= matrix_labeling
         self.split_depth = split_depth
+
+        
 
         # Extract matrix name from file path
         matrix_file_path_split = matrix_file_path.split('/')
@@ -468,28 +461,24 @@ class cluster_matrix:
 
     def init_cluster_matrix_depth_split(self):
 
-        if self.split_depth > 0 and self.dim == 2: # if matrix A
+        if self.split_depth > 0 and self.matrix_labeling == 'a': # if matrix A
             self.node_matrices = torch.load(self.matrix_file_path)
             return self.node_matrices
         
-
-        if self.split_depth > 0 and self.dim == 3: # if matrix B
+        if self.split_depth > 0 and self.matrix_labeling == 'b': # if matrix B
             """
             should return just set matrixs up for 'cluster_shard_depth_operation' function by spliting matrixB
             into matrixB_1, matrixB_2
 
             and leaving matrixA as is(just set self.node_matrices to torch.load(self.matrix_file_path)) 
             """
-
             #save init values
             saved_node_percentages = self.node_percentages
             saved_node_IP_list = self.node_IP_list
-            saved_dim = self.dim
 
             #set new init values it set up for the 'cluster_shard_depth_operation' function 
             self.node_percentages = [0.5,0.5]
             self.node_IP_list = ['0.0.0.0','0.0.0.0']
-            self.dim = 0
 
             # get depth 1 starting shardeds for (depth = N)
             self.node_matrices = self.convert_to_cluster_matrix_shards()
@@ -498,39 +487,125 @@ class cluster_matrix:
             # set 'node_IP_list' back and 'self.dim' we will need for later 
 
             self.node_IP_list = saved_node_IP_list
-            self.dim = saved_dim
             return self.node_matrices
-            
-        
         return False
 
-    def convert_to_cluster_matrix_grid(self,dim=0):
+    def create_matrix_depth_shards_bin(self):
+        """
+        Apply hierarchical splits to the matrix.
+        For Matrix A: starts with full matrix (10000, 20000)
+        For Matrix B: starts with 2 shards (7500, 20000) each
+        """
+        print(f"🚀 Creating hierarchical shards for {'Matrix A' if self.dim == 2 else 'Matrix B'}")
+        print(f"   Split depth: {self.split_depth}")
+        
+        # Get current shards from init_cluster_matrix_depth_split()
+        current_shards = self.node_matrices
+        if not isinstance(current_shards, list):
+            current_shards = [current_shards]
+        
+        print(f"📊 Starting with: {len(current_shards)} shard(s)")
+        for i, shard in enumerate(current_shards):
+            print(f"    {'A' if self.dim == 2 else 'B'}[{i}]: {shard.shape}")
+        
+        depth_index = 0
+        
+        while depth_index < self.split_depth:
+            print(f"\n🔧 Depth level {depth_index + 1}/{self.split_depth}")
+            
+            # Determine split type based on depth
+            # System 2 (split by columns): depth=1,3,5...
+            # System 1 (split by rows): depth=2,4,6...
+            
+            if (depth_index + 1) % 2 == 1:  # System 2: Split by columns
+                print("🔄 System 2: Splitting by columns (dim=1)")
+                new_shards = []
+                
+                for shard in current_shards:
+                    # Ensure 2D tensor
+                    if shard.dim() == 1:
+                        shard = shard.unsqueeze(0)
+                    
+                    # Check if we can split columns
+                    if shard.size(1) > 1:
+                        split_point = shard.size(1) // 2
+                        shard1 = shard[:, :split_point]
+                        shard2 = shard[:, split_point:]
+                        new_shards.extend([shard1, shard2])
+                    else:
+                        # Can't split further
+                        new_shards.append(shard)
+            
+            else:  # System 1: Split by rows
+                print("🔄 System 1: Splitting by rows (dim=0)")
+                new_shards = []
+                
+                for shard in current_shards:
+                    # Ensure 2D tensor
+                    if shard.dim() == 1:
+                        shard = shard.unsqueeze(0)
+                    
+                    # Check if we can split rows
+                    if shard.size(0) > 1:
+                        split_point = shard.size(0) // 2
+                        shard1 = shard[:split_point, :]
+                        shard2 = shard[split_point:, :]
+                        new_shards.extend([shard1, shard2])
+                    else:
+                        # Can't split further
+                        new_shards.append(shard)
+            
+            current_shards = new_shards
+            depth_index += 1
+            
+            print(f"📈 After depth {depth_index}: {len(current_shards)} shards")
+            if len(current_shards) <= 10:
+                for i, shard in enumerate(current_shards):
+                    print(f"    {'A' if self.dim == 2 else 'B'}[{i}]: {shard.shape}")
+            else:
+                print(f"    (Showing first 10 of {len(current_shards)} shards)")
+                for i, shard in enumerate(current_shards[:10]):
+                    print(f"    {'A' if self.dim == 2 else 'B'}[{i}]: {shard.shape}")
+        
+        # Set the final shards
+        if self.dim == 2:  # Matrix A
+            # Duplicate for round-robin pairing with B shards
+            self.node_matrices = current_shards + current_shards
+        else:  # Matrix B
+            self.node_matrices = current_shards
+
+        print(f"\n✅ Hierarchical shards created for {'Matrix A' if self.dim == 2 else 'Matrix B'}!")
+        print(f"   Total shards: {len(self.node_matrices)}")
+        
+        return self.node_matrices
+
+    def convert_to_cluster_matrix_grid(self):
+        """
+        Split matrix according to System 2 pattern using self.dim.
+        Matrix A (label='a'): should use dim=1 (split by columns)
+        Matrix B (label='b'): should use dim=0 (split by rows)
+        """
         full_matrix = torch.load(self.matrix_file_path)
         self.OG_matrix_shape = list(full_matrix.shape)
         
-
-        if self.dim == 2:  # Matrix A
-            # Split along the specified dimension
-            split_point = full_matrix.size(dim) // 2
+        split_dim = self.dim  # Always use self.dim
+        
+        if self.matrix_labeling == 'a':  # Matrix A
+            # For System 2: Matrix A should be split into 2 equal parts
+            dim_size = full_matrix.size(split_dim)
+            split_size = dim_size // 2
             
-            if dim == 0:
-                # Split along rows
-                A_1 = full_matrix[:split_point, :]
-                A_2 = full_matrix[split_point:, :]
-            elif dim == 1:
-                # Split along columns
-                A_1 = full_matrix[:, :split_point]
-                A_2 = full_matrix[:, split_point:]
-            else:
-                raise ValueError(f"dim must be 0 or 1, got {dim}")
+            # Use torch.split to get the 2 shards
+            shards = torch.split(full_matrix, split_size, dim=split_dim)
             
-            # Store just the 2 unique shards
-            self.node_matrices = [A_1, A_2]  
-            print(f"✅ Matrix A: {full_matrix.shape} → [{A_1.shape}, {A_2.shape}] (split along dim={dim})")
+            # torch.split returns a tuple, convert to list
+            self.node_matrices = list(shards)
+            
+            print(f"✅ Matrix A: {full_matrix.shape} → [{shards[0].shape}, {shards[1].shape}] (split along dim={split_dim})")
 
-
-        elif self.dim == 3:  # Matrix B for GEMM
-            total_rows = full_matrix.size(0)
+        elif self.matrix_labeling == 'b':  # Matrix B for GEMM
+            # Get total size along the specified dimension
+            dim_size = full_matrix.size(split_dim)
             total_nodes = len(self.node_IP_list)
             unique_B_shards = total_nodes // 2
             
@@ -549,7 +624,7 @@ class cluster_matrix:
                         f"(total_nodes//2), got {len(self.sys2_split_percentages)}"
                     )
                 
-                if abs(sum(self.sys2_split_percentages) - 1.0) > 0.01:  # Allow small floating point errors
+                if abs(sum(self.sys2_split_percentages) - 1.0) > 0.01:
                     raise ValueError(
                         f"sys2_split_percentages must sum to 1.0, got {sum(self.sys2_split_percentages)}"
                     )
@@ -560,37 +635,36 @@ class cluster_matrix:
                 split_sizes = []
                 
                 for i in range(unique_B_shards - 1):
-                    size = int(total_rows * self.sys2_split_percentages[i])
+                    size = int(dim_size * self.sys2_split_percentages[i])
                     split_sizes.append(size)
                 
                 # Last shard gets remaining rows
                 allocated = sum(split_sizes)
-                last_size = total_rows - allocated
+                last_size = dim_size - allocated
                 split_sizes.append(last_size)
                 
                 # Validate sizes
-                if sum(split_sizes) != total_rows:
-                    # Adjust last size to fix rounding errors
-                    split_sizes[-1] = total_rows - sum(split_sizes[:-1])
+                if sum(split_sizes) != dim_size:
+                    split_sizes[-1] = dim_size - sum(split_sizes[:-1])
                 
             else:
                 # Default: equal split
                 print(f"✅ Matrix B: {full_matrix.shape} → splitting into {unique_B_shards} equal shards")
                 
-                base_chunk_size = total_rows // unique_B_shards
-                remainder = total_rows % unique_B_shards
+                base_chunk_size = dim_size // unique_B_shards
+                remainder = dim_size % unique_B_shards
                 
                 split_sizes = [base_chunk_size] * unique_B_shards
                 for i in range(remainder):
                     split_sizes[i] += 1
             
-            print(f"Split sizes for {unique_B_shards} unique shards: {split_sizes}")
-            print(f"Sum check: {sum(split_sizes)} = {total_rows} {'✓' if sum(split_sizes) == total_rows else '✗'}")
+            print(f"Split sizes for {unique_B_shards} unique shards along dim={split_dim}: {split_sizes}")
+            print(f"Sum check: {sum(split_sizes)} = {dim_size} {'✓' if sum(split_sizes) == dim_size else '✗'}")
             
-            # Split B into unique shards
-            B_unique_chunks = torch.split(full_matrix, split_sizes, dim=dim)
+            # Split B into unique shards along the specified dimension
+            B_unique_chunks = torch.split(full_matrix, split_sizes, dim=split_dim)
             
-            # Create base repeating pattern (will be reordered)
+            # Create base repeating pattern
             base_pattern = []
             for i in range(total_nodes):
                 shard_index = i % unique_B_shards
@@ -603,8 +677,6 @@ class cluster_matrix:
                 shard_num = i % unique_B_shards
                 print(f"  Node {i} (original): gets B{shard_num} {chunk.shape}")
         
-        # Apply dynamic reordering
-        #return self._reorder_system2_dynamic(self.node_matrices)
         return self.node_matrices
 
     def convert_to_cluster_matrix_shards(self):
@@ -803,7 +875,7 @@ class cluster_matrix:
         # ---------------------------
         # MATRIX A — ROW SHARDS
         # ---------------------------
-        if self.dim == 2:
+        if self.matrix_labeling == 'a':
             print("\n📤 Distributing Matrix A row shards")
             
             # ---------------------------
@@ -910,115 +982,6 @@ class cluster_matrix:
                 print(f"  Node {i}: {shard_name}")
 
         return self.matrix_file_paths_list
-
-    def create_matrix_depth_shards_bin(self):
-        """
-        Apply hierarchical splits to the matrix.
-        For Matrix A: starts with full matrix (10000, 20000)
-        For Matrix B: starts with 2 shards (7500, 20000) each
-        """
-        print(f"🚀 Creating hierarchical shards for {'Matrix A' if self.dim == 2 else 'Matrix B'}")
-        print(f"   Split depth: {self.split_depth}")
-        
-        # Get current shards from init_cluster_matrix_depth_split()
-        current_shards = self.node_matrices
-        if not isinstance(current_shards, list):
-            current_shards = [current_shards]
-        
-        print(f"📊 Starting with: {len(current_shards)} shard(s)")
-        for i, shard in enumerate(current_shards):
-            print(f"    {'A' if self.dim == 2 else 'B'}[{i}]: {shard.shape}")
-        
-        depth_index = 0
-        
-        while depth_index < self.split_depth:
-            print(f"\n🔧 Depth level {depth_index + 1}/{self.split_depth}")
-            
-            # Determine split type based on depth
-            # System 2 (split by columns): depth=1,3,5...
-            # System 1 (split by rows): depth=2,4,6...
-            
-            if (depth_index + 1) % 2 == 1:  # System 2: Split by columns
-                print("🔄 System 2: Splitting by columns (dim=1)")
-                new_shards = []
-                
-                for shard in current_shards:
-                    # Ensure 2D tensor
-                    if shard.dim() == 1:
-                        shard = shard.unsqueeze(0)
-                    
-                    # Check if we can split columns
-                    if shard.size(1) > 1:
-                        split_point = shard.size(1) // 2
-                        shard1 = shard[:, :split_point]
-                        shard2 = shard[:, split_point:]
-                        new_shards.extend([shard1, shard2])
-                    else:
-                        # Can't split further
-                        new_shards.append(shard)
-            
-            else:  # System 1: Split by rows
-                print("🔄 System 1: Splitting by rows (dim=0)")
-                new_shards = []
-                
-                for shard in current_shards:
-                    # Ensure 2D tensor
-                    if shard.dim() == 1:
-                        shard = shard.unsqueeze(0)
-                    
-                    # Check if we can split rows
-                    if shard.size(0) > 1:
-                        split_point = shard.size(0) // 2
-                        shard1 = shard[:split_point, :]
-                        shard2 = shard[split_point:, :]
-                        new_shards.extend([shard1, shard2])
-                    else:
-                        # Can't split further
-                        new_shards.append(shard)
-            
-            current_shards = new_shards
-            depth_index += 1
-            
-            print(f"📈 After depth {depth_index}: {len(current_shards)} shards")
-            if len(current_shards) <= 10:
-                for i, shard in enumerate(current_shards):
-                    print(f"    {'A' if self.dim == 2 else 'B'}[{i}]: {shard.shape}")
-            else:
-                print(f"    (Showing first 10 of {len(current_shards)} shards)")
-                for i, shard in enumerate(current_shards[:10]):
-                    print(f"    {'A' if self.dim == 2 else 'B'}[{i}]: {shard.shape}")
-        
-
-
-
-        # Set the final shards
-        if self.dim == 2:  # Matrix A
-            # Duplicate for round-robin pairing with B shards
-            self.node_matrices = current_shards + current_shards
-        else:  # Matrix B
-            self.node_matrices = current_shards
-
-
-        print(f"\n✅ Hierarchical shards created for {'Matrix A' if self.dim == 2 else 'Matrix B'}!")
-        print(f"   Total shards: {len(self.node_matrices)}")
-        
-        # Show summary for different depths
-        if self.dim == 2:  # Matrix A
-            if self.split_depth == 1:
-                print(f"   Expected: 2 A shards of (10000, 10000)")
-            elif self.split_depth == 2:
-                print(f"   Expected: 4 A shards of (5000, 10000)")
-            elif self.split_depth == 3:
-                print(f"   Expected: 8 A shards of (5000, 5000)")
-        else:  # Matrix B
-            if self.split_depth == 1:
-                print(f"   Expected: 4 B shards of (7500, 10000)")
-            elif self.split_depth == 2:
-                print(f"   Expected: 8 B shards of (3750, 10000)")
-            elif self.split_depth == 3:
-                print(f"   Expected: 16 B shards of (3750, 5000)")
-        
-        return self.node_matrices
 
     def save_matrix_binary(self, matrix, filename):
         """
@@ -1301,11 +1264,7 @@ class cluster_matrix:
         Load Matrix A shards from disk to RAM for distributed GEMM.
         Simple version: just copy from local_DISK_folder to local_RAM_folder
         """
-        
-        if self.dim != 2:
-            print(f"Error: This function is for Matrix A (dim=2), but got dim={self.dim}")
-            return False
-        
+                
         print(f"\n📥 Loading Matrix A grid shards from disk to RAM")
         
         # Initialize the file paths list
@@ -1487,7 +1446,9 @@ class cluster_matrix:
             # Send total_shards count instead of just true/false
             if send_back_result:
                 send_back_str = len(self.node_IP_list)  # Number of shards to combine
-                if (self.dim==2 or self.dim==3):
+
+
+                if (self.matrix_labeling=='a' or self.matrix_labeling=='b'):
                     send_back_str = send_back_str * -1 # make send back negative to signle system 2 combine
                 print(f"  Send back result: Yes ({send_back_str} shards will be combined)")
 
@@ -1566,7 +1527,7 @@ class cluster_matrix:
 #######################################------MAIN FUNCTION - TESTING-----######################################  
 if __name__ == "__main__":
     
-    # ----------------- CREATE MATRICES -----------------
+    # ----------------- CREATE MATRICES for dim = 0 split test -----------------
     '''
     A = np.random.rand(10000, 20000)
     B = np.random.rand(15000, 20000)
@@ -1587,7 +1548,28 @@ if __name__ == "__main__":
     torch.save(torch.tensor(B3, dtype=torch.float32), 'model_matrixs/small_matrixB.pt')
     '''  
 
-    # ----------------- FILE PATHS -----------------
+    # ----------------- CREATE MATRICES for dim = 1 split test -----------------
+    '''
+    A_T = np.random.rand(20000, 10000)
+    B_T = np.random.rand(20000, 15000)
+
+    A2_T = np.random.rand(7000, 5000)
+    B2_T = np.random.rand(7000, 9000)
+
+    A3_T = np.random.rand(500, 1500)
+    B3_T = np.random.rand(500, 1000)
+
+    torch.save(torch.tensor(A_T, dtype=torch.float32), 'model_matrixs/big_matrixA_T.pt')
+    torch.save(torch.tensor(B_T, dtype=torch.float32), 'model_matrixs/big_matrixB_T.pt')   
+    
+    torch.save(torch.tensor(A2_T, dtype=torch.float32), 'model_matrixs/mid_matrixA_T.pt')
+    torch.save(torch.tensor(B2_T, dtype=torch.float32), 'model_matrixs/mid_matrixB_T.pt')   
+
+    torch.save(torch.tensor(A3_T, dtype=torch.float32), 'model_matrixs/small_matrixA_T.pt')
+    torch.save(torch.tensor(B3_T, dtype=torch.float32), 'model_matrixs/small_matrixB_T.pt')
+    '''
+    
+    # ----------------- FILE PATHS for dim = 0 split test-----------------
     big_test_matrix_pathA = 'model_matrixs/big_matrixA.pt'  
     big_test_matrix_pathB = 'model_matrixs/big_matrixB.pt'  
 
@@ -1597,8 +1579,18 @@ if __name__ == "__main__":
     small_test_matrix_pathA = 'model_matrixs/small_matrixA.pt'  
     small_test_matrix_pathB = 'model_matrixs/small_matrixB.pt'  
 
+    # ----------------- FILE PATHS for dim = 1 split test-----------------
+    big_test_matrix_pathA_T = 'model_matrixs/big_matrixA_T.pt'  
+    big_test_matrix_pathB_T = 'model_matrixs/big_matrixB_T.pt'  
+
+    mid_test_matrix_pathA_T = 'model_matrixs/mid_matrixA_T.pt'  
+    mid_test_matrix_pathB_T = 'model_matrixs/mid_matrixB_T.pt'  
+
+    small_test_matrix_pathA_T = 'model_matrixs/small_matrixA_T.pt'  
+    small_test_matrix_pathB_T = 'model_matrixs/small_matrixB_T.pt'  
+
     
-    # ----------------- REFERENCE RESULTS -----------------
+    # ----------------- REFERENCE RESULTS for dim = 0 split test-----------------
     '''
     big_a = torch.load(big_test_matrix_pathA)
     big_b = torch.load(big_test_matrix_pathB)
@@ -1615,16 +1607,33 @@ if __name__ == "__main__":
     small_c_ref = small_a @ small_b.T
     torch.save(small_c_ref, 'model_matrixs/small_c_ref.pt')
     '''
- 
-    #############################TESTING CLUSTER MATRIX OPERATIONS SYSTEM 1#############################
+
+    # ----------------- REFERENCE RESULTS for dim = 1 split test-----------------
+    '''
+    big_a_T = torch.load(big_test_matrix_pathA_T)
+    big_b_T = torch.load(big_test_matrix_pathB_T)
+    big_c_ref_T = big_a_T.T @ big_b_T  # A @ B.T
+    torch.save(big_c_ref_T, 'model_matrixs/big_c_ref_T.pt')
+
+    mid_a_T = torch.load(mid_test_matrix_pathA)
+    mid_b_T = torch.load(mid_test_matrix_pathB)
+    mid_c_ref_T = mid_a_T @ mid_b_T.T
+    torch.save(mid_c_ref_T, 'model_matrixs/mid_c_ref_T.pt')
+
+    small_a_T = torch.load(small_test_matrix_pathA_T)
+    small_b_T = torch.load(small_test_matrix_pathB_T)
+    small_c_ref_T = small_a_T.T @ small_b_T
+    torch.save(small_c_ref_T, 'model_matrixs/small_c_ref_T.pt')
     '''
     
-    # ----------------- CLUSTER TEST (BIG MATRIX) -----------------
+    #############################TESTING CLUSTER MATRIX OPERATIONS SYSTEM 1#############################
+    
+    # ----------------- CLUSTER TEST (BIG MATRIX) dim = 0 split/join test-----------------
     IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
     percentages = [0.4,0.4,0.1,0.1]  
     CPU_GPU_select_list = [ True, True, True, True ]  
     backend_select_list = ['llama','llama','llama','llama'] 
-
+    '''
     big_new_matrixA = cluster_matrix(big_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
                              percentages, backend_select_list, True, 0)
     big_new_matrixA.convert_to_cluster_matrix_shards()
@@ -1709,6 +1718,28 @@ if __name__ == "__main__":
     check_combined_result_values('model_matrixs/mid_c_ref.pt',node5_big_mid_matrixD)
     '''
 
+    # ----------------- CLUSTER TEST (MID MATRIX) -----------------
+    mid_new_matrixA = cluster_matrix(mid_test_matrix_pathA_T, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list, True, 1)
+    mid_new_matrixA.convert_to_cluster_matrix_shards()
+    mid_new_matrixA.save_distribute_matrix_shards_bin()
+    mid_new_matrixB = cluster_matrix(mid_test_matrix_pathB_T, IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list, False) 
+    mid_new_matrixB.save_distribute_full_matrix_bin()
+    mid_new_matrixC = mid_new_matrixA.cluster_shard_operation(mid_new_matrixB, True, False, False)  
+    #check_combined_result_values('model_matrixs/mid_c_ref.pt',mid_new_matrixC)
+    
+    load_mid_matrixA = cluster_matrix('mid_matrixA_T', IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list)
+    load_mid_matrixA.load_cluster_matrix_shards()
+    load_mid_matrixB = cluster_matrix('mid_matrixB_T', IP_list, CPU_GPU_select_list, 
+                             percentages, backend_select_list) 
+    load_mid_matrixB.load_cluster_matrix()
+    load_mid_matrixD = load_mid_matrixA.cluster_shard_operation(load_mid_matrixB, True, False, False)
+    #check_combined_result_values('model_matrixs/mid_c_ref.pt',load_mid_matrixD)
+
+
+
 
     ############################# TESTING CLUSTER MATRIX OPERATIONS SYSTEM 2 #############################
     '''
@@ -1723,7 +1754,6 @@ if __name__ == "__main__":
     # You already have this variable defined:
     backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama'] 
 
-    
     # Use it instead of empty list:
     big_sys2_matrix_A = cluster_matrix(
         matrix_file_path=big_test_matrix_pathA,
@@ -1732,7 +1762,8 @@ if __name__ == "__main__":
         node_percentages=percentages,
         back_end_select_list=backend_select_list,  # Use the actual variable!
         split_matrix=True,
-        dim=2
+        dim=0,
+        matrix_labeling='a'
     )
     big_sys2_matrix_A.convert_to_cluster_matrix_grid()
     big_sys2_matrix_A.save_distribute_matrixA_grid_bin()
@@ -1744,13 +1775,15 @@ if __name__ == "__main__":
         node_percentages=percentages,
         back_end_select_list=backend_select_list,  # Use the actual variable!
         split_matrix=True,
-        dim=3
+        dim=0,
+        matrix_labeling='b'
     )
     big_sys2_matrix_B.convert_to_cluster_matrix_grid()
     big_sys2_matrix_B.save_distribute_matrix_shards_bin()
-    
-    
 
+    big_result = big_sys2_matrix_A.cluster_shard_operation(big_sys2_matrix_B,False,True,True)
+    check_combined_result_values('model_matrixs/big_c_ref.pt',big_result)
+    
     big_sys2_load_matrix_A = cluster_matrix(
         matrix_file_path='big_matrixA',
         node_IP_list=IP_list,
@@ -1758,7 +1791,8 @@ if __name__ == "__main__":
         node_percentages=percentages,
         back_end_select_list=backend_select_list,  # Use the actual variable!
         split_matrix=True,
-        dim=2
+        dim=0,
+        matrix_labeling='a'
     )
     big_sys2_load_matrix_A.load_cluster_matrixA_grid()
 
@@ -1769,14 +1803,15 @@ if __name__ == "__main__":
         node_percentages=percentages,
         back_end_select_list=backend_select_list,  # Use the actual variable!
         split_matrix=True,
-        dim=3
+        dim=0,
+        matrix_labeling='b'
     )
     big_sys2_load_matrix_B.load_cluster_matrix_shards()
-
+    
     big_sys2_load_result = big_sys2_load_matrix_A.cluster_shard_operation(big_sys2_load_matrix_B,False,True,True)
     check_combined_result_values('model_matrixs/big_c_ref.pt',big_sys2_load_result)
-
     
+
                     ######################MID MATRIX 6 NODE TEST###############
     # Use it instead of empty list:
     mid_sys2_matrix_A = cluster_matrix(
@@ -1786,7 +1821,8 @@ if __name__ == "__main__":
         node_percentages=percentages,
         back_end_select_list=backend_select_list,  # Use the actual variable!
         split_matrix=True,
-        dim=2
+        dim=0,
+        matrix_labeling='a'
     )
     testA = mid_sys2_matrix_A.convert_to_cluster_matrix_grid()
     mid_sys2_matrix_A.save_distribute_matrixA_grid_bin()
@@ -1798,7 +1834,8 @@ if __name__ == "__main__":
         node_percentages=percentages,
         back_end_select_list=backend_select_list,  # Use the actual variable!
         split_matrix=True,
-        dim=3
+        dim=0,
+        matrix_labeling='b'
     )
     mid_sys2_matrix_B.convert_to_cluster_matrix_grid()
     mid_sys2_matrix_B.save_distribute_matrix_shards_bin()
@@ -1810,7 +1847,8 @@ if __name__ == "__main__":
         node_percentages=percentages,
         back_end_select_list=backend_select_list,  # Use the actual variable!
         split_matrix=True,
-        dim=2
+        dim=0,
+        matrix_labeling='a'
     )
     mid_sys2_load_matrix_A.load_cluster_matrixA_grid()
 
@@ -1821,7 +1859,8 @@ if __name__ == "__main__":
         node_percentages=percentages,
         back_end_select_list=backend_select_list,  # Use the actual variable!
         split_matrix=True,
-        dim=3
+        dim=0,
+        matrix_labeling='b'
     )
     mid_sys2_load_matrix_B.load_cluster_matrix_shards()
 
@@ -1846,6 +1885,8 @@ if __name__ == "__main__":
     '''
 
 
+
+    '''
     # ----------------- CLUSTER TEST (BIG MATRIX) -----------------
     IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
     percentages = [0.4,0.4,0.2,0.0]  
@@ -1863,8 +1904,7 @@ if __name__ == "__main__":
         dim=2,
         split_depth=1
     )
-    #big_sys3_matrix_A.init_cluster_matrix_depth_split()
-
+    
     big_sys3_matrix_B = cluster_matrix(
         matrix_file_path=big_test_matrix_pathB,
         node_IP_list=IP_list,
@@ -1875,14 +1915,26 @@ if __name__ == "__main__":
         dim=3,
         split_depth=1
     )
-    #big_sys3_matrix_B.init_cluster_matrix_depth_split()
+
+    big_sys3_matrix_A.init_cluster_matrix_depth_split()
+    testA= big_sys3_matrix_A.create_matrix_depth_shards_bin()
+
+    big_sys3_matrix_B.init_cluster_matrix_depth_split()
+    testB=big_sys3_matrix_B.create_matrix_depth_shards_bin()
+
+    for t in testA:
+        print(t.shape)
+
+    for t in testB:
+        print(t.shape)
 
     #big_sys3_matrix_A.create_matrix_depth_shards_bin()
     #big_sys3_matrix_B.create_matrix_depth_shards_bin()
 
-    big_sys3_matrix_A.load_cluster_matrix_shards()
-    big_sys3_matrix_B.load_cluster_matrix_shards()
+    #big_sys3_matrix_A.load_cluster_matrix_shards()
+    #big_sys3_matrix_B.load_cluster_matrix_shards()
     
     
-    big_sys3_load_result = big_sys3_matrix_A.cluster_shard_operation(big_sys3_matrix_B,False,True,False)
+    #big_sys3_load_result = big_sys3_matrix_A.cluster_shard_operation(big_sys3_matrix_B,False,True,False)
     #check_combined_result_values('model_matrixs/big_c_ref.pt',big_sys3_load_result)
+    '''
