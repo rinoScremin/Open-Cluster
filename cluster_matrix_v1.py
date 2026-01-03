@@ -982,14 +982,12 @@ class cluster_matrix:
             
             # Copy shard 0 to both locations
             shard0_disk_path = os.path.join(disk_folder_path, f'{self.matrix_name}_shard_0.bin')
-            subprocess.run(['cp', matrixA1_file_path, self.local_project_dir], check=True)
             subprocess.run(['cp', matrixA1_file_path, shard0_disk_path], check=True)
             print(f"  Copied shard 0 to: {self.local_project_dir}/{self.matrix_name}_shard_0.bin")
             print(f"  Copied shard 0 to: {shard0_disk_path}")
             
             # Copy shard 1 to both locations
             shard1_disk_path = os.path.join(disk_folder_path, f'{self.matrix_name}_shard_1.bin')
-            subprocess.run(['cp', matrixA2_file_path, self.local_project_dir], check=True)
             subprocess.run(['cp', matrixA2_file_path, shard1_disk_path], check=True)
             print(f"  Copied shard 1 to: {self.local_project_dir}/{self.matrix_name}_shard_1.bin")
             print(f"  Copied shard 1 to: {shard1_disk_path}")
@@ -1536,14 +1534,6 @@ class cluster_matrix:
                 send_back_str = "0"  # 0 means no send back
                 print(f"  Send back result: No (keep distributed)")
             
-            ######################NEW CODE##################################
-            """
-            check if 'hierarchical_split' was used if it was append the 'hierarchical_split_order' to the 'send_back_str' string 
-            in c++ server now need to parse the 'send_back_str' string by splitting by '/' to get 'number_of_shards' and now the 
-            'hierarchical_split_order'
-
-
-            """
             if (self.split_depth != 0):
                 split_dim_string = ''
                 for split_dim in self.hierarchical_split_order:
@@ -1551,7 +1541,6 @@ class cluster_matrix:
                 send_back_str = str(send_back_str) + '/' + str(self.dim) + split_dim_string # added a  '/' as delimiter
              
             print(f'DEBUG TEST: {send_back_str}')
-            ######################NEW CODE##################################
             
             # ===== BUILD COMMAND FOR SPECIFIC BACKEND =====
             command = (
@@ -1603,7 +1592,9 @@ class cluster_matrix:
         if send_back_result:
             path = self.local_RAM_folder + base_result_name + '_combined.bin'
             if os.path.exists(path):
+                time.sleep(1)
                 combined_matrix = convert_bin_matrix_to_pt(path)
+                time.sleep(1)
                 os.remove(path)
             else:
                 self.wait_for_acks(1, "ACK_combined_matrix_saved")
@@ -1621,5 +1612,7 @@ class cluster_matrix:
             )
             return result_cluster_matrix
         return False  # Return the distributed result instance
+
+
 
 
