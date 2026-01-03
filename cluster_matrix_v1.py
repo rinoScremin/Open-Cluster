@@ -458,6 +458,142 @@ class cluster_matrix:
             socket.close()
         self.zmq_context.term()
 
+    def convert_to_hierarchical_matrix_shards(self):
+        """
+        Apply hierarchical splits to the matrix.
+        For Matrix A: starts with full matrix (10000, 20000)
+        For Matrix B: starts with initial split based on node_percentages
+        """
+        matrix_type = 'Matrix A' if self.matrix_labeling == 'a' else 'Matrix B'
+        print(f"🚀 Creating hierarchical shards for {matrix_type}")
+        print(f"   Split order: {self.hierarchical_split_order}")
+        print(f"   Split depth: {self.split_depth}")
+        
+        # ============================================================
+        # INITIALIZE MATRICES
+        # ============================================================
+        if self.matrix_labeling == 'a':  # Matrix A
+            # Load full matrix
+            full_matrix = torch.load(self.matrix_file_path)
+            print(f"📥 Matrix A: Loaded full matrix {full_matrix.shape}")
+            current_shards = [full_matrix]
+            
+        else:  # Matrix B  
+            # Save init values
+            saved_node_IP_list = self.node_IP_list
+            
+            # Set new init values for initial split
+            # Use the first two percentages for the initial split
+            if len(self.node_percentages) >= 2:
+                initial_percentages = [self.node_percentages[0], self.node_percentages[1]]
+            else:
+                # Default to 50/50 if not enough percentages
+                initial_percentages = [0.5, 0.5]
+                
+            self.node_percentages = initial_percentages
+            self.node_IP_list = ['0.0.0.0', '0.0.0.0']
+            
+            # Get initial split (depth 0) based on self.dim
+            self.convert_to_cluster_matrix_shards()
+            
+            # Restore original values
+            self.node_IP_list = saved_node_IP_list
+
+            current_shards = self.node_matrices
+            
+            # Print the shard shapes
+            print(f"🔄 Matrix B: Initial split (dim={self.dim})")
+            for i, shard in enumerate(current_shards):
+                print(f"    B[{i}]: {shard.shape}")
+        
+        # ============================================================
+        # APPLY HIERARCHICAL SPLITS BASED ON hierarchical_split_order
+        # ============================================================
+        print(f"\n📊 Starting hierarchical splits with: {len(current_shards)} shard(s)")
+        for i, shard in enumerate(current_shards):
+            matrix_id = 'A' if self.matrix_labeling == 'a' else 'B'
+            print(f"    {matrix_id}[{i}]: {shard.shape}")
+        
+        depth_index = 0
+        
+        for split_dim in self.hierarchical_split_order:
+            print(f"\n🔧 Depth level {depth_index + 1}/{self.split_depth} (split along dim={split_dim})")
+            
+            if split_dim == 0:  # Split by rows
+                print("🔄 Splitting by rows (dim=0)")
+                new_shards = []
+                
+                for shard in current_shards:
+                    # Ensure 2D tensor
+                    if shard.dim() == 1:
+                        shard = shard.unsqueeze(0)
+                    
+                    # Check if we can split rows
+                    if shard.size(0) > 1:
+                        # Use torch.split() for cleaner code
+                        split_size = shard.size(0) // 2
+                        shard1, shard2 = torch.split(shard, split_size, dim=0)
+                        new_shards.extend([shard1, shard2])
+                    else:
+                        # Can't split further
+                        new_shards.append(shard)
+            
+            elif split_dim == 1:  # Split by columns
+                print("🔄 Splitting by columns (dim=1)")
+                new_shards = []
+                
+                for shard in current_shards:
+                    # Ensure 2D tensor
+                    if shard.dim() == 1:
+                        shard = shard.unsqueeze(0)
+                    
+                    # Check if we can split columns
+                    if shard.size(1) > 1:
+                        # Use torch.split() for cleaner code
+                        split_size = shard.size(1) // 2
+                        shard1, shard2 = torch.split(shard, split_size, dim=1)
+                        new_shards.extend([shard1, shard2])
+                    else:
+                        # Can't split further
+                        new_shards.append(shard)
+            else:
+                print(f"⚠️  Warning: Invalid split dimension {split_dim}, skipping")
+                new_shards = current_shards
+            
+            current_shards = new_shards
+            depth_index += 1
+            
+            print(f"📈 After depth {depth_index}: {len(current_shards)} shards")
+            matrix_id = 'A' if self.matrix_labeling == 'a' else 'B'
+            if len(current_shards) <= 10:
+                for i, shard in enumerate(current_shards):
+                    print(f"    {matrix_id}[{i}]: {shard.shape}")
+            else:
+                print(f"    (Showing first 10 of {len(current_shards)} shards)")
+                for i, shard in enumerate(current_shards[:10]):
+                    print(f"    {matrix_id}[{i}]: {shard.shape}")
+        
+        # ============================================================
+        # FINAL PROCESSING
+        # ============================================================
+        if self.matrix_labeling == 'a':  # Matrix A
+            # Duplicate for round-robin pairing with B shards
+            # Important: Create copies to avoid memory sharing
+            duplicated_shards = [shard.clone() for shard in current_shards]
+            self.node_matrices = current_shards + duplicated_shards
+        else:  # Matrix B
+            self.node_matrices = current_shards
+
+        print(f"\n✅ Hierarchical shards created for {matrix_type}!")
+        print(f"   Total shards: {len(self.node_matrices)}")
+        
+        # Also print individual shard shapes
+        print("📊 Final shard shapes:")
+        matrix_id = 'A' if self.matrix_labeling == 'a' else 'B'
+        for i, shard in enumerate(self.node_matrices):
+            print(f"    {matrix_id}[{i}]: {shard.shape}")
+        
+        return self.node_matrices
 
     def convert_to_cluster_matrix_grid(self):
         """
@@ -1324,28 +1460,32 @@ class cluster_matrix:
             
             # ===== PREPARE SEND_BACK FLAG =====
             # Send total_shards count instead of just true/false
-
-
-            #if (self.split_depth != 0 and send_back_result):
-
-
+            send_back_str=''
             if send_back_result:
                 send_back_str = len(self.node_IP_list)  # Number of shards to combine
-
-
                 if (self.matrix_labeling=='a' or self.matrix_labeling=='b'):
                     send_back_str = send_back_str * -1 # make send back negative to signle system 2 combine
-                
-
-
-
                 print(f"  Send back result: Yes ({send_back_str} shards will be combined)")
-
             else:
                 send_back_str = "0"  # 0 means no send back
                 print(f"  Send back result: No (keep distributed)")
             
-            send_back_str = str(send_back_str)
+            ######################NEW CODE##################################
+            """
+            check if 'hierarchical_split' was used if it was append the 'hierarchical_split_order' to the 'send_back_str' string 
+            in c++ server now need to parse the 'send_back_str' string by splitting by '/' to get 'number_of_shards' and now the 
+            'hierarchical_split_order'
+
+
+            """
+            if (self.split_depth != 0):
+                split_dim_string = ''
+                for split_dim in self.hierarchical_split_order:
+                    split_dim_string+= str(split_dim)
+                send_back_str = str(send_back_str) + '/' + str(self.dim) + split_dim_string # added a  '/' as delimiter
+             
+            print(f'DEBUG TEST: {send_back_str}')
+            ######################NEW CODE##################################
             
             # ===== BUILD COMMAND FOR SPECIFIC BACKEND =====
             command = (
@@ -1393,8 +1533,6 @@ class cluster_matrix:
             base_result_name = f"{cluster_matrixB.matrix_name}x{self.matrix_name}"
             print(f"\n📊 Result base: {base_result_name} (send_back={send_back_result})")
 
-
-
         if send_back_result:
             self.wait_for_acks(1, "ACK_combined_matrix_saved")
             path = self.local_RAM_folder + base_result_name + '_combined.bin'
@@ -1412,354 +1550,4 @@ class cluster_matrix:
             )
             return result_cluster_matrix
         return False  # Return the distributed result instance
-
-#######################################------MAIN FUNCTION - TESTING-----######################################  
-if __name__ == "__main__":
-    
-    # ----------------- CREATE MATRICES for dim = 0 split test -----------------
-    '''
-    A = np.random.rand(10000, 20000)
-    B = np.random.rand(15000, 20000)
-
-    A2 = np.random.rand(5000, 7000)
-    B2 = np.random.rand(9000, 7000)
-
-    A3 = np.random.rand(1500, 500)
-    B3 = np.random.rand(1000, 500)
-
-    torch.save(torch.tensor(A, dtype=torch.float32), 'model_matrixs/big_matrixA.pt')
-    torch.save(torch.tensor(B, dtype=torch.float32), 'model_matrixs/big_matrixB.pt')   
-    
-    torch.save(torch.tensor(A2, dtype=torch.float32), 'model_matrixs/mid_matrixA.pt')
-    torch.save(torch.tensor(B2, dtype=torch.float32), 'model_matrixs/mid_matrixB.pt')   
-
-    torch.save(torch.tensor(A3, dtype=torch.float32), 'model_matrixs/small_matrixA.pt')
-    torch.save(torch.tensor(B3, dtype=torch.float32), 'model_matrixs/small_matrixB.pt')
-    '''  
-
-    # ----------------- CREATE MATRICES for dim = 1 split test -----------------
-    '''
-    A_T = np.random.rand(20000, 10000)
-    B_T = np.random.rand(20000, 15000)
-
-    A2_T = np.random.rand(7000, 5000)
-    B2_T = np.random.rand(7000, 9000)
-
-    A3_T = np.random.rand(500, 1500)
-    B3_T = np.random.rand(500, 1000)
-
-    torch.save(torch.tensor(A_T, dtype=torch.float32), 'model_matrixs/big_matrixA_T.pt')
-    torch.save(torch.tensor(B_T, dtype=torch.float32), 'model_matrixs/big_matrixB_T.pt')   
-    
-    torch.save(torch.tensor(A2_T, dtype=torch.float32), 'model_matrixs/mid_matrixA_T.pt')
-    torch.save(torch.tensor(B2_T, dtype=torch.float32), 'model_matrixs/mid_matrixB_T.pt')   
-
-    torch.save(torch.tensor(A3_T, dtype=torch.float32), 'model_matrixs/small_matrixA_T.pt')
-    torch.save(torch.tensor(B3_T, dtype=torch.float32), 'model_matrixs/small_matrixB_T.pt')
-    '''
-    
-    # ----------------- FILE PATHS for dim = 0 split test-----------------
-    big_test_matrix_pathA = 'model_matrixs/big_matrixA.pt'  
-    big_test_matrix_pathB = 'model_matrixs/big_matrixB.pt'  
-
-    mid_test_matrix_pathA = 'model_matrixs/mid_matrixA.pt'  
-    mid_test_matrix_pathB = 'model_matrixs/mid_matrixB.pt'  
-
-    small_test_matrix_pathA = 'model_matrixs/small_matrixA.pt'  
-    small_test_matrix_pathB = 'model_matrixs/small_matrixB.pt'  
-
-    # ----------------- FILE PATHS for dim = 1 split test-----------------
-    big_test_matrix_pathA_T = 'model_matrixs/big_matrixA_T.pt'  
-    big_test_matrix_pathB_T = 'model_matrixs/big_matrixB_T.pt'  
-
-    mid_test_matrix_pathA_T = 'model_matrixs/mid_matrixA_T.pt'  
-    mid_test_matrix_pathB_T = 'model_matrixs/mid_matrixB_T.pt'  
-
-    small_test_matrix_pathA_T = 'model_matrixs/small_matrixA_T.pt'  
-    small_test_matrix_pathB_T = 'model_matrixs/small_matrixB_T.pt'  
-
-    
-    # ----------------- REFERENCE RESULTS for dim = 0 split test-----------------
-    '''
-    big_a = torch.load(big_test_matrix_pathA)
-    big_b = torch.load(big_test_matrix_pathB)
-    big_c_ref = big_a @ big_b.T  # A @ B.T
-    torch.save(big_c_ref, 'model_matrixs/big_c_ref.pt')
-
-    mid_a = torch.load(mid_test_matrix_pathA)
-    mid_b = torch.load(mid_test_matrix_pathB)
-    mid_c_ref = mid_a @ mid_b.T
-    torch.save(mid_c_ref, 'model_matrixs/mid_c_ref.pt')
-
-    small_a = torch.load(small_test_matrix_pathA)
-    small_b = torch.load(small_test_matrix_pathB)
-    small_c_ref = small_a @ small_b.T
-    torch.save(small_c_ref, 'model_matrixs/small_c_ref.pt')
-    '''
-
-    # ----------------- REFERENCE RESULTS for dim = 1 split test-----------------
-    '''
-    big_a_T = torch.load(big_test_matrix_pathA_T)
-    big_b_T = torch.load(big_test_matrix_pathB_T)
-    big_c_ref_T = big_a_T.T @ big_b_T  # A @ B.T
-    torch.save(big_c_ref_T, 'model_matrixs/big_c_ref_T.pt')
-
-    mid_a_T = torch.load(mid_test_matrix_pathA)
-    mid_b_T = torch.load(mid_test_matrix_pathB)
-    mid_c_ref_T = mid_a_T @ mid_b_T.T
-    torch.save(mid_c_ref_T, 'model_matrixs/mid_c_ref_T.pt')
-
-    small_a_T = torch.load(small_test_matrix_pathA_T)
-    small_b_T = torch.load(small_test_matrix_pathB_T)
-    small_c_ref_T = small_a_T.T @ small_b_T
-    torch.save(small_c_ref_T, 'model_matrixs/small_c_ref_T.pt')
-    '''
-    
-    #############################TESTING CLUSTER MATRIX OPERATIONS SYSTEM 1#############################
-    
-    # ----------------- CLUSTER TEST (BIG MATRIX) dim = 0 split/join test-----------------
-    '''
-    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
-    percentages = [0.4,0.4,0.1,0.1]  
-    CPU_GPU_select_list = [ True, True, True, True ]  
-    backend_select_list = ['llama','llama','llama','llama'] 
-    '''
-
-    '''
-    big_new_matrixA = cluster_matrix(big_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list, True, 0)
-    big_new_matrixA.convert_to_cluster_matrix_shards()
-    big_new_matrixA.save_distribute_matrix_shards_bin()
-    big_new_matrixB = cluster_matrix(big_test_matrix_pathB, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list, False) 
-    big_new_matrixB.save_distribute_full_matrix_bin()
-    big_new_matrixC = big_new_matrixA.cluster_shard_operation(big_new_matrixB, False, True, True)  
-    check_combined_result_values('model_matrixs/big_c_ref.pt',big_new_matrixC)
-    
-    load_matrixA = cluster_matrix('big_matrixA', IP_list, CPU_GPU_select_list, 
-                            percentages, backend_select_list)
-    load_matrixA.load_cluster_matrix_shards()
-    load_matrixB = cluster_matrix('big_matrixB', IP_list, CPU_GPU_select_list, 
-                            percentages, backend_select_list) 
-    load_matrixB.load_cluster_matrix()
-    load_matrixD = load_matrixA.cluster_shard_operation(load_matrixB, False, True, True) 
-    check_combined_result_values('model_matrixs/big_c_ref.pt',load_matrixD)
-
-    # ----------------- CLUSTER TEST (MID MATRIX) -----------------
-    mid_new_matrixA = cluster_matrix(mid_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list, True, 0)
-    mid_new_matrixA.convert_to_cluster_matrix_shards()
-    mid_new_matrixA.save_distribute_matrix_shards_bin()
-    mid_new_matrixB = cluster_matrix(mid_test_matrix_pathB, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list, False) 
-    mid_new_matrixB.save_distribute_full_matrix_bin()
-    mid_new_matrixC = mid_new_matrixA.cluster_shard_operation(mid_new_matrixB, False, True, True)  
-    check_combined_result_values('model_matrixs/mid_c_ref.pt',mid_new_matrixC)
-    
-    load_mid_matrixA = cluster_matrix('mid_matrixA', IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list)
-    load_mid_matrixA.load_cluster_matrix_shards()
-    load_mid_matrixB = cluster_matrix('mid_matrixB', IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list) 
-    load_mid_matrixB.load_cluster_matrix()
-    load_mid_matrixD = load_mid_matrixA.cluster_shard_operation(load_mid_matrixB, False, True, True) 
-    check_combined_result_values('model_matrixs/mid_c_ref.pt',load_mid_matrixD)
-
-    # ----------------- 5 NODE TEST -----------------
-    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.101','192.168.2.104']   
-    percentages = [0.4,0.4,0.05,0.05,0.1]  
-    CPU_GPU_select_list = [ True, True, True, True, True ]  
-    backend_select_list = ['llama','llama','llama','llama', 'llama'] 
-
-    node5_big_matrixA = cluster_matrix(big_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list, True, 0)
-    node5_big_matrixA.convert_to_cluster_matrix_shards()
-    node5_big_matrixA.save_distribute_matrix_shards_bin()
-    node5_big_matrixB = cluster_matrix(big_test_matrix_pathB, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list) 
-    node5_big_matrixB.save_distribute_full_matrix_bin()
-    node5_big_matrixC = node5_big_matrixA.cluster_shard_operation(node5_big_matrixB, False, True, True)  
-    check_combined_result_values('model_matrixs/big_c_ref.pt',node5_big_matrixC)
-
-    node5_big_mid_matrixA = cluster_matrix('big_matrixA', IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list)    
-    node5_big_mid_matrixA.load_cluster_matrix_shards()
-    node5_big_mid_matrixB = cluster_matrix('big_matrixB', IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list) 
-    node5_big_mid_matrixB.load_cluster_matrix()
-    node5_big_mid_matrixD = node5_big_mid_matrixA.cluster_shard_operation(node5_big_mid_matrixB, False, True, True) 
-    check_combined_result_values('model_matrixs/big_c_ref.pt',node5_big_mid_matrixD)
-
-    node5_mid_matrixA = cluster_matrix(mid_test_matrix_pathA, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list, True, 0)
-    node5_mid_matrixA.convert_to_cluster_matrix_shards()
-    node5_mid_matrixA.save_distribute_matrix_shards_bin()
-    node5_mid_matrixB = cluster_matrix(mid_test_matrix_pathB, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list) 
-    node5_mid_matrixB.save_distribute_full_matrix_bin()
-    node5_mid_matrixC = node5_mid_matrixA.cluster_shard_operation(node5_mid_matrixB, False, True, True)  
-    check_combined_result_values('model_matrixs/mid_c_ref.pt',node5_mid_matrixC)
-
-    node5_big_mid_matrixA = cluster_matrix('mid_matrixA', IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list)    
-    node5_big_mid_matrixA.load_cluster_matrix_shards()
-    node5_big_mid_matrixB = cluster_matrix('mid_matrixB', IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list) 
-    node5_big_mid_matrixB.load_cluster_matrix()
-    node5_big_mid_matrixD = node5_big_mid_matrixA.cluster_shard_operation(node5_big_mid_matrixB, False, True, True) 
-    check_combined_result_values('model_matrixs/mid_c_ref.pt',node5_big_mid_matrixD)
-    '''
-
-    '''
-    # ----------------- CLUSTER TEST (MID MATRIX) -----------------
-    mid_new_matrixA = cluster_matrix(mid_test_matrix_pathA_T, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list, True, 1)
-    mid_new_matrixA.convert_to_cluster_matrix_shards()
-    mid_new_matrixA.save_distribute_matrix_shards_bin()
-    mid_new_matrixB = cluster_matrix(mid_test_matrix_pathB_T, IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list, False) 
-    mid_new_matrixB.save_distribute_full_matrix_bin()
-    mid_new_matrixC = mid_new_matrixA.cluster_shard_operation(mid_new_matrixB, True, False, False)  
-    #check_combined_result_values('model_matrixs/mid_c_ref.pt',mid_new_matrixC)
-    
-    load_mid_matrixA = cluster_matrix('mid_matrixA_T', IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list)
-    load_mid_matrixA.load_cluster_matrix_shards()
-    load_mid_matrixB = cluster_matrix('mid_matrixB_T', IP_list, CPU_GPU_select_list, 
-                             percentages, backend_select_list) 
-    load_mid_matrixB.load_cluster_matrix()
-    load_mid_matrixD = load_mid_matrixA.cluster_shard_operation(load_mid_matrixB, True, False, False)
-    #check_combined_result_values('model_matrixs/mid_c_ref.pt',load_mid_matrixD)
-    '''
-
-
-
-    ############################# TESTING CLUSTER MATRIX OPERATIONS SYSTEM 2 #############################
-    '''
-
-    IP_list = [
-        '192.168.2.100','192.168.2.100','192.168.2.100',
-        '192.168.2.101','192.168.2.104','192.168.2.101'
-    ]
-
-    percentages =  [0.40,0.40,0.20, 0, 0, 0]
-    CPU_GPU_select_list = [True, True, True, True, True, True]
-    # You already have this variable defined:
-    backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama'] 
-
-    # Use it instead of empty list:
-    big_sys2_matrix_A = cluster_matrix(
-        matrix_file_path=big_test_matrix_pathA,
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=0,
-        matrix_labeling='a'
-    )
-    big_sys2_matrix_A.convert_to_cluster_matrix_grid()
-    big_sys2_matrix_A.save_distribute_matrixA_grid_bin()
-
-    big_sys2_matrix_B = cluster_matrix(
-        matrix_file_path=big_test_matrix_pathB,
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=0,
-        matrix_labeling='b'
-    )
-    big_sys2_matrix_B.convert_to_cluster_matrix_grid()
-    big_sys2_matrix_B.save_distribute_matrix_shards_bin()
-
-    big_result = big_sys2_matrix_A.cluster_shard_operation(big_sys2_matrix_B,False,True,True)
-    check_combined_result_values('model_matrixs/big_c_ref.pt',big_result)
-    
-    big_sys2_load_matrix_A = cluster_matrix(
-        matrix_file_path='big_matrixA',
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=0,
-        matrix_labeling='a'
-    )
-    big_sys2_load_matrix_A.load_cluster_matrixA_grid()
-
-    big_sys2_load_matrix_B = cluster_matrix(
-        matrix_file_path='big_matrixB',
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=0,
-        matrix_labeling='b'
-    )
-    big_sys2_load_matrix_B.load_cluster_matrix_shards()
-    
-    big_sys2_load_result = big_sys2_load_matrix_A.cluster_shard_operation(big_sys2_load_matrix_B,False,True,True)
-    check_combined_result_values('model_matrixs/big_c_ref.pt',big_sys2_load_result)
-    
-
-                    ######################MID MATRIX 6 NODE TEST###############
-    # Use it instead of empty list:
-    mid_sys2_matrix_A = cluster_matrix(
-        matrix_file_path=mid_test_matrix_pathA,
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=0,
-        matrix_labeling='a'
-    )
-    testA = mid_sys2_matrix_A.convert_to_cluster_matrix_grid()
-    mid_sys2_matrix_A.save_distribute_matrixA_grid_bin()
-
-    mid_sys2_matrix_B = cluster_matrix(
-        matrix_file_path=mid_test_matrix_pathB,
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=0,
-        matrix_labeling='b'
-    )
-    mid_sys2_matrix_B.convert_to_cluster_matrix_grid()
-    mid_sys2_matrix_B.save_distribute_matrix_shards_bin()
-    
-    mid_sys2_load_matrix_A = cluster_matrix(
-        matrix_file_path='mid_matrixA',
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=0,
-        matrix_labeling='a'
-    )
-    mid_sys2_load_matrix_A.load_cluster_matrixA_grid()
-
-    mid_sys2_load_matrix_B = cluster_matrix(
-        matrix_file_path='mid_matrixB',
-        node_IP_list=IP_list,
-        CPU_GPU_select_list=CPU_GPU_select_list,
-        node_percentages=percentages,
-        back_end_select_list=backend_select_list,  # Use the actual variable!
-        split_matrix=True,
-        dim=0,
-        matrix_labeling='b'
-    )
-    mid_sys2_load_matrix_B.load_cluster_matrix_shards()
-
-    mid_result = mid_sys2_load_matrix_A.cluster_shard_operation(mid_sys2_load_matrix_B,False,True,True)
-    check_combined_result_values('model_matrixs/mid_c_ref.pt',mid_result)
-    '''
-
-
 
