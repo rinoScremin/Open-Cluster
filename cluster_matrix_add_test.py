@@ -174,6 +174,11 @@ if __name__ == "__main__":
     small_test_matrix_pathB_T = 'model_matrixs/small_matrixB_T.pt'  
 
     
+    # Create reference result for validation  
+    big_matrixA = torch.load(big_test_matrix_pathA)  
+    big_c_ref = torch.add(big_matrixA, big_matrixA)  # or big_matrixA + big_matrixA  
+    torch.save(big_c_ref, 'model_matrixs/big_c_ref.pt')  
+
     #############################TESTING CLUSTER MATRIX OPERATIONS SYSTEM 1#############################
     
     # ----------------- CLUSTER TEST (BIG MATRIX) dim = 0 split/join test-----------------
@@ -203,3 +208,6 @@ if __name__ == "__main__":
     #check_combined_result_values('model_matrixs/big_c_ref.pt',big_new_matrixC)
     
 
+    
+    # Now you can check the distributed result  
+    check_combined_result_values('model_matrixs/big_c_ref.pt', big_new_matrixC)
