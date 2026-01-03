@@ -338,57 +338,84 @@ class cluster_matrix:
             except Exception as e:
                 print(f"   ❌ Failed to send command to {node_ip}: {e}")
 
-    
-        # =============== MATRIX DISTRIBUTION LOGIC ===============
         '''
-        
+        # =============== MATRIX DISTRIBUTION LOGIC ===============
         print("\n" + "=" * 70)
         print("🧮 MATRIX DISTRIBUTION PHASE")
         print("=" * 70)
-        
+
         # Initialize with a default value
         matrix_shards_found = True  # Default to True
         matrix_exists = os.path.exists(matrix_file_path)
-        
+
+        # Check for shard file (this is what was working!)
+        matrix_shard_file_path = self.local_project_dir + self.local_DISK_folder + self.matrix_name + '_shard_0.bin'
+        matrix_shard_exists = os.path.exists(matrix_shard_file_path)
+
         print(f"   Matrix file exists: {matrix_exists}")
         print(f"   Split matrix mode: {split_matrix}")
-        
+
         # Decision tree for matrix handling
-        if matrix_exists and split_matrix:
-            # Case 1: New matrix, needs splitting and distribution
-            print("\n📝 CASE 1: NEW MATRIX - CONVERT, DISTRIBUTE, AND LOAD")
-            print("   Processing steps:")
-            print("   1. Convert to cluster matrix shards")
-            print("   2. Distribute shards to nodes")
-            print("   3. Load distributed shards")
+        if matrix_exists and self.matrix_labeling == '' and split_matrix:
+            print("NEW MATRIX SYSTEM 1 SPLIT")
             self.convert_to_cluster_matrix_shards()
             self.save_distribute_matrix_shards_bin()
-            
-        elif not matrix_exists and split_matrix:
-            # Case 2: Matrix doesn't exist but split mode requested
-            print("\n🔍 CASE 2: LOADING EXISTING DISTRIBUTED MATRIX SHARDS")
-            print("   Attempting to load pre-existing shards...")
-            matrix_shards_found = self.load_cluster_matrix_shards()
-            
-        elif matrix_exists and not split_matrix:
-            # Case 3: Matrix exists, distribute as whole (no splitting)
-            print("\n📦 CASE 3: DISTRIBUTING FULL MATRIX (NO SPLITTING)")
-            print("   Processing steps:")
-            print("   1. Save full matrix in binary format")
-            print("   2. Distribute to all nodes")
+            matrix_shards_found = True
+
+        elif matrix_exists and self.matrix_labeling == '' and split_matrix == False:
+            print("NEW MATRIX SYSTEM 1 FULL")
             self.save_distribute_full_matrix_bin()
-            
-        elif not matrix_exists and not split_matrix:
-            # Case 4: Load existing full matrix distribution
-            print("\n🔍 CASE 4: LOADING EXISTING FULL MATRIX DISTRIBUTION")
-            print("   Attempting to load pre-distributed full matrix...")
-            matrix_shards_found = self.load_cluster_matrix()
+            matrix_shards_found = True
+
+        elif matrix_exists and self.matrix_labeling == 'a':
+            print("NEW MATRIX A - SYSTEM 2 GRID")
+            self.convert_to_cluster_matrix_grid()
+            self.save_distribute_matrixA_grid_bin()
+            matrix_shards_found = True
+
+        elif matrix_exists and self.matrix_labeling == 'b':
+            print("NEW MATRIX B - SYSTEM 2 GRID")
+            self.convert_to_cluster_matrix_grid()
+            self.save_distribute_matrix_shards_bin()
+            matrix_shards_found = True
+
+        # Loading existing data - USE SHARD CHECK!
+        elif matrix_shard_exists and self.matrix_labeling == '' and split_matrix:
+            print("LOADING EXISTING SHARDS - SYSTEM 1")
+            self.load_cluster_matrix_shards()
+            matrix_shards_found = True
+
+        elif matrix_exists == False and self.matrix_labeling == '' and split_matrix == False:
+            # For full matrix, check if .bin exists
+            full_matrix_path = self.local_project_dir + self.local_DISK_folder + self.matrix_name + '.bin'
+            if os.path.exists(full_matrix_path):
+                print("LOADING EXISTING FULL MATRIX")
+                self.load_cluster_matrix()
+                matrix_shards_found = True
+            else:
+                print(f"ERROR: Full matrix file not found: {full_matrix_path}")
+                matrix_shards_found = False
+
+        elif matrix_shard_exists and self.matrix_labeling == 'a':
+            print("LOADING EXISTING MATRIX A GRID")
+            self.load_cluster_matrixA_grid()
+            matrix_shards_found = True
+
+        elif matrix_shard_exists and self.matrix_labeling == 'b':
+            print("LOADING EXISTING MATRIX B SHARDS")
+            self.load_cluster_matrix_shards()
+            matrix_shards_found = True
+
+        elif matrix_shards_found == False:
+            print('FILE NOT FOUND!! Checking both matrix and shard files...')
+            print(f'  Matrix path: {matrix_file_path}')
+            print(f'  Shard 0 path: {matrix_shard_file_path}')
 
         # =============== FINAL VALIDATION ===============
         print("\n" + "=" * 70)
         print("🏁 INITIALIZATION COMPLETE")
         print("=" * 70)
-        
+
         if not matrix_shards_found:
             print("❌ ERROR: MATRIX SHARDS/FILES NOT FOUND!")
             print("   Possible causes:")
@@ -401,15 +428,48 @@ class cluster_matrix:
             print(f"   - Matrix handling mode: {'Split' if split_matrix else 'Full'}")
             print(f"   - Backends: {self.back_end_select_list}")
             print(f"   - CPU/GPU selections: {self.CPU_GPU_select_list}")
-        
         '''
         
-    def wait_for_acks(self, expected_count, expected_msg="ACK"):
+    def send_ack_confirmation(self, ack_msg="ACK"):    
+        """    
+        Send ACK confirmation back to C++ backend    
+        """    
+        try:    
+            # Create a separate socket for sending confirmations    
+            if not hasattr(self, 'ack_confirmation_socket'):    
+                self.ack_confirmation_socket = self.zmq_context.socket(zmq.PUSH)    
+                # Use self.IP for the head node IP and define confirmation port  
+                confirmation_port = os.environ.get("PYTHON_ACK_CONFIRMATION_PORT", "7791")  
+                self.ack_confirmation_socket.connect(f"tcp://{self.IP}:{confirmation_port}")    
+            
+            # Send the confirmation message    
+            self.ack_confirmation_socket.send_string(ack_msg)    
+            print(f"✅ Sent confirmation: {ack_msg}")    
+            
+        except Exception as e:    
+            print(f"❌ Failed to send confirmation: {e}")
+
+    def wait_for_acks(self, expected_count, expected_msg="ACK", time_out=120):
         """
         Wait for ACKs from all expected nodes on the Python front end cluster port.
+        
+        Args:
+            expected_count: Number of ACKs to wait for
+            expected_msg: The expected message string (default: "ACK")
+            time_out: Timeout in seconds (default: 120 seconds)
+        
+        Returns:
+            Number of ACKs actually received (may be less than expected if timeout occurs)
         """
         acks = 0
+        start_time = time.time()
+        
         while acks < expected_count:
+            # Check if timeout has been reached
+            if time.time() - start_time > time_out:
+                print(f"⏰ TIMEOUT: Only received {acks}/{expected_count} ACKs after {time_out} seconds")
+                return acks
+                
             try:
                 msg = self.ack_receiver_socket.recv_string(flags=zmq.NOBLOCK)
                 if msg == expected_msg:
@@ -418,6 +478,7 @@ class cluster_matrix:
             except zmq.Again:
                 # No message yet, sleep briefly to avoid 100% CPU
                 time.sleep(0.01)
+        
         print("✅ All ACKs received!")
         return acks
 
@@ -791,10 +852,13 @@ class cluster_matrix:
                 print(f"  Step 1: Saving locally to {save_file_path_DISK}")
                 self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_DISK)
                 
+
+                print(f'DEBUG::: {save_name}')
+
                 # Step 2: Send file to remote node via ZeroMQ
                 print(f"  Step 2: Sending file to remote node {node_IP}")
                 self.zmq_send_file(node_IP, save_file_path_DISK)
-                self.wait_for_acks(1)
+                self.wait_for_acks(1,save_name)
                 # Step 3: Tell remote node to copy from RAM to DISK
                 remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, save_name)
                 remote_disk_dir_full = os.path.join(self.remote_project_dir, self.remote_DISK_folder)
@@ -872,12 +936,14 @@ class cluster_matrix:
                 # Step 1: Send the file to remote node's RAM
                 self.zmq_send_file(node_ip, save_file_path_DISK)
                 
+                # Wait for acknowledgments from remote nodes
+                self.wait_for_acks(1,save_name)
+
                 # Step 2: Tell remote node to copy from RAM to DISK for persistence
                 copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
                 self.zmq_send_command(node_ip, copy_command)
         
-        # Wait for acknowledgments from remote nodes
-        self.wait_for_acks(len(unique_node_IP_list)-1)
+
         
         print(f"Full matrix distribution completed")
         print(f"Total file paths tracked: {len(self.matrix_file_paths_list)}")
@@ -956,25 +1022,25 @@ class cluster_matrix:
                     if shard_type == 0 and node_IP not in shard0_sent_to_ips:
                         # Send the file to remote RAM
                         self.zmq_send_file(node_IP, matrixA1_file_path)
-                        self.wait_for_acks(1)
+                        
                         
                         # Send command to copy from RAM to disk
                         remote_filename = os.path.basename(matrixA1_file_path)
+
+                        
                         remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, remote_filename)
                         remote_save_file_path_DISK = os.path.join(self.remote_project_dir, self.remote_DISK_folder, remote_filename)
                         copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
                         self.zmq_send_command(node_IP, copy_command)
-                        
                         shard0_sent_to_ips.add(node_IP)
                         print(f'Sent shard 0 to IP: {node_IP}')
                     
                     elif shard_type == 1 and node_IP not in shard1_sent_to_ips:
                         # Send the file to remote RAM
                         self.zmq_send_file(node_IP, matrixA2_file_path)
-                        self.wait_for_acks(1)
-                        
                         # Send command to copy from RAM to disk
                         remote_filename = os.path.basename(matrixA2_file_path)
+                        self.wait_for_acks(1,remote_filename)
                         remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, remote_filename)
                         remote_save_file_path_DISK = os.path.join(self.remote_project_dir, self.remote_DISK_folder, remote_filename)
                         copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
@@ -1513,7 +1579,7 @@ class cluster_matrix:
         expected_acks = len(self.node_IP_list)  # one ACK per shard/operation
         print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
         self.wait_for_acks(expected_acks, "ACK_matrixOp_complete")
-        
+        #self.send_ack_confirmation("ACK_can_receive")
         # ===== OPERATION COMPLETE =====
         print(f"\n{'='*60}")
         print(f"✅ CLUSTER OPERATION COMPLETE")
@@ -1525,6 +1591,7 @@ class cluster_matrix:
         # Result names match the operand order we send to the server:
         # self (matrix A) first, then cluster_matrixB (matrix B)
 
+
         base_result_name=''
         if back_end_select == 'torch':
             base_result_name = f"{self.matrix_name}x{cluster_matrixB.matrix_name}"
@@ -1534,10 +1601,14 @@ class cluster_matrix:
             print(f"\n📊 Result base: {base_result_name} (send_back={send_back_result})")
 
         if send_back_result:
-            self.wait_for_acks(1, "ACK_combined_matrix_saved")
             path = self.local_RAM_folder + base_result_name + '_combined.bin'
-            combined_matrix = convert_bin_matrix_to_pt(path)
-            os.remove(path)  # Clean up any existing combined file
+            if os.path.exists(path):
+                combined_matrix = convert_bin_matrix_to_pt(path)
+                os.remove(path)
+            else:
+                self.wait_for_acks(1, "ACK_combined_matrix_saved")
+                combined_matrix = convert_bin_matrix_to_pt(path)
+                os.remove(path)  # Clean up any existing combined file
             return combined_matrix
         else:
             result_cluster_matrix = cluster_matrix(
@@ -1550,4 +1621,5 @@ class cluster_matrix:
             )
             return result_cluster_matrix
         return False  # Return the distributed result instance
+
 
