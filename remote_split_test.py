@@ -81,6 +81,8 @@ if __name__ == "__main__":
     big_new_matrixB.remote_save_distribute_matrix_shards_bin()
     big_new_matrixC = big_new_matrixA.cluster_shard_operation(big_new_matrixB, False, True, True)  
 
+
+    ######################################### STILL UNDER DEVELOPMENT ###################################### 
     percentages = [0.2,0.2,0.2,0.2,0.1,0.1]  
     big_new_matrixA = cluster_matrix(
         matrix_file_path=big_test_matrix_pathA,
