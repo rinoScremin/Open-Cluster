@@ -128,444 +128,6 @@ class cluster_llm_transformer:
         self.tokens = self.tokenizer(text, return_tensors="pt")
         return self.tokens.input_ids
 
-    def save_all_model_layers(self, start_layer=0, end_layer=None):
-        """
-        Save all model layers sequentially
-        """
-        if end_layer is None:
-            # Get total number of layers from model config
-            end_layer = getattr(self.config, 'num_hidden_layers', 32) - 1
-        
-        print(f"💾 SAVING ALL MODEL LAYERS {start_layer} to {end_layer}")
-        print("=" * 60)
-        
-        total_saved = 0
-        for layer_idx in range(start_layer, end_layer + 1):
-            print(f"\n📁 Processing layer {layer_idx}...")
-            layer_saved = 0
-            
-            # Save this layer's matrices
-            for name, param in self.model.named_parameters():
-                name_split = name.split(".")
-                try:
-                    layer_index = int(name_split[1])
-                    if len(param.shape) == 2 and layer_index == layer_idx:
-                        safe_name = name.replace('.', '_')
-                        path = self.model_matrix_fold_dir + safe_name + '.pt'
-                        torch.save(param.float(), path)
-                        print(f"   ✅ {safe_name}.pt - Shape: {param.shape}")
-                        layer_saved += 1
-                        total_saved += 1
-                except (ValueError, IndexError):
-                    continue
-            
-            print(f"   📊 Layer {layer_idx}: Saved {layer_saved} matrices")
-        
-        # Save special layers (norm, lm_head)
-        print(f"\n📁 Saving special layers...")
-        special_saved = 0
-        for name, param in self.model.named_parameters():
-            # Save normalization layers
-            if 'norm' in name.lower() and 'weight' in name and len(param.shape) == 1:
-                safe_name = name.replace('.', '_')
-                path = self.model_matrix_fold_dir + safe_name + '.pt'
-                torch.save(param.float(), path)
-                print(f"   ✅ {safe_name}.pt - Shape: {param.shape}")
-                special_saved += 1
-                total_saved += 1
-            
-            # Save LM head
-            elif 'lm_head' in name.lower() and len(param.shape) == 2:
-                safe_name = name.replace('.', '_')
-                path = self.model_matrix_fold_dir + safe_name + '.pt'
-                torch.save(param.float(), path)
-                print(f"   ✅ {safe_name}.pt - Shape: {param.shape}")
-                special_saved += 1
-                total_saved += 1
-            
-            # Save embedding layer
-            elif 'embed' in name.lower() and len(param.shape) == 2:
-                safe_name = name.replace('.', '_')
-                path = self.model_matrix_fold_dir + safe_name + '.pt'
-                torch.save(param.float(), path)
-                print(f"   ✅ {safe_name}.pt - Shape: {param.shape}")
-                special_saved += 1
-                total_saved += 1
-        
-        print(f"\n🎉 COMPLETE: Saved {total_saved} matrices total")
-        print(f"   • Transformer layers: {end_layer - start_layer + 1}")
-        print(f"   • Special layers: {special_saved}")
-        print(f"   • Total matrices: {total_saved}")
-        
-        return total_saved
-
-    def save_llm_layer(self, layer=0):
-        print(f"💾 Saving weight matrices for layer {layer}...")
-        saved_count = 0
-        for name, param in self.model.named_parameters():
-            name_split = name.split(".")
-            try:
-                layer_index = int(name_split[1])
-                if len(param.shape) == 2 and layer_index == layer:  # Only 2D matrices
-                    safe_name = name.replace('.', '_')
-                    path = self.model_matrix_fold_dir + safe_name + '.pt'
-                    torch.save(param.float(), path)
-                    print(f"✅ Saved: {safe_name}.pt - Shape: {param.shape}")
-                    saved_count += 1
-            except (ValueError, IndexError):
-                # This parameter doesn't have a layer number, skip it
-                continue
-        
-        print(f"🎯 Saved {saved_count} matrices for layer {layer}")
-
-    def get_save_distribute_token_embeddings(self):
-        """Get embeddings for the tokenized input using the full model"""
-        if self.tokens is None:
-            print("❌ No tokens found. Call tokenize_text() first.")
-            return None
-        print("🔍 Getting token embeddings from full model...")
-        
-        # Use the FULL model's embedding matrix, not the distributed one
-        if hasattr(self.model, 'embed_tokens'):
-            embedding_matrix = self.model.embed_tokens.weight
-            print(f"📊 Using full embedding matrix: {embedding_matrix.shape}")
-            self.full_token_embedding_matrix = embedding_matrix
-            # Get embeddings for each token ID
-            token_embeddings = []
-            for token_id in self.tokens.input_ids[0]:
-                # Look up the embedding in the full matrix
-                embedding = embedding_matrix[token_id]  # Shape: [hidden_size]
-                token_text = self.tokenizer.decode(token_id)
-                print(f"🔤 Token {token_id}: '{token_text}' -> embedding shape: {embedding.shape}")
-                token_embeddings.append(embedding)
-            # Stack all embeddings
-            all_embeddings = torch.stack(token_embeddings)  # Shape: [seq_len, hidden_size]
-            self.seq_len = all_embeddings.shape[0]
-            print(f"📦 Combined embeddings shape: {all_embeddings.shape}")
-            self.token_embedding_matrix = all_embeddings
-            path = self.model_matrix_fold_dir + 'input_token_embedding_matrix'
-            torch.save(self.token_embedding_matrix.float(), path)
-            
-            # CORRECT: Token embeddings should be split by rows (sequence dimension)
-            self.cluster_token_embedding_matrix = cluster_matrix(matrix_file_path=path,
-                                                node_IP_list=IP_list,
-                                                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                                                node_percentages=percentages,
-                                                back_end_select_list=self.backend_select_list,  # Use the actual variable!
-                                                split_matrix=True,
-                                                dim=0,
-                                                matrix_labeling='a'
-                                            )
-            self.cluster_token_embedding_matrix.convert_to_cluster_matrix_grid()
-            self.cluster_token_embedding_matrix.save_distribute_matrixA_grid_bin()
-
-            return all_embeddings
-        else:
-            print("❌ No embedding layer found in model")
-            return None
-
-    def run_GQA_transformer_layer(self, layer=0, text="fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!"):
-        """
-        Complete GQA transformer layer with automatic tokenization
-        Uses CLUSTER for heavy matrix multiplications, TORCH for lightweight additions
-        """
-        print(f"🧩 STEP 0: Tokenizing and distributing embeddings...")
-        # 1. Tokenize if not already done
-        if self.tokens is None:
-            self.tokenize_text(text)
-        # 2. Distribute embeddings if not already done
-        if self.cluster_token_embedding_matrix is None:
-            self.get_save_distribute_token_embeddings()
-        if self.cluster_token_embedding_matrix is None:
-            print("❌ Failed to distribute token embeddings!")
-            return None
-        
-        print(f"\n🔧 STEP 1: Loading Q, K, V projection weights for layer {layer}")
-        
-        # Load Q, K, V projection weights
-        attn_q_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_self_attn_q_proj_weight.pt'
-        attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_self_attn_k_proj_weight.pt'
-        attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_self_attn_v_proj_weight.pt'
-        
-        # Load torch references for comparison
-        print("📊 Loading torch references for verification...")
-        attn_q_proj_torch_ref = torch.load(attn_q_proj_path)
-        attn_k_proj_torch_ref = torch.load(attn_k_proj_path)
-        attn_v_proj_torch_ref = torch.load(attn_v_proj_path)
-        torch_embedding_ref = torch.load(self.model_matrix_fold_dir + 'input_token_embedding_matrix.pt')
-        
-        # Create torch references for Q, K, V projections
-        torch_q_ref = torch_embedding_ref @ attn_q_proj_torch_ref.T
-        torch_k_ref = torch_embedding_ref @ attn_k_proj_torch_ref.T
-        torch_v_ref = torch_embedding_ref @ attn_v_proj_torch_ref.T
-        
-        torch.save(torch_q_ref, 'torch_q_ref.pt')
-        torch.save(torch_k_ref, 'torch_k_ref.pt')
-        torch.save(torch_v_ref, 'torch_v_ref.pt')
-        
-        print(f"✅ Created torch references:")
-        print(f"   Q shape: {torch_q_ref.shape}")
-        print(f"   K shape: {torch_k_ref.shape}")
-        print(f"   V shape: {torch_v_ref.shape}")
-        
-        # ============================================================
-        # ATTENTION MECHANISM WITH CLUSTER MULTIPLICATIONS
-        # ============================================================
-        
-        print(f"\n🎯 STEP 2: DISTRIBUTED ATTENTION WITH CLUSTER")
-        print(f"   Using CLUSTER for heavy matrix multiplications")
-        print(f"   Using TORCH for reshape, softmax, and additions")
-        
-        # Create and distribute Q projection matrix
-        print(f"\n📦 STEP 2.1: Distributing Q projection matrix...")
-        attn_q_proj = cluster_matrix(
-            matrix_file_path=attn_q_proj_path,
-            node_IP_list=self.IP_list,
-            CPU_GPU_select_list=self.CPU_GPU_select_list,
-            node_percentages=self.percentages,
-            back_end_select_list=self.backend_select_list,
-            split_matrix=True,
-            dim=0,
-            matrix_labeling='b'
-        )
-        attn_q_proj.convert_to_cluster_matrix_grid()
-        attn_q_proj.save_distribute_matrix_shards_bin()
-        
-        # Run Q projection operation with CLUSTER
-        print(f"\n🚀 STEP 2.2: Running Q projection with CLUSTER...")
-        cluster_q_result = self.cluster_token_embedding_matrix.cluster_shard_operation(
-            attn_q_proj, False, True, True
-        )
-        print("✅ Q projection complete!")
-        check_combined_result_values('torch_q_ref.pt', cluster_q_result)
-        
-        # Create and distribute K projection matrix
-        print(f"\n📦 STEP 2.3: Distributing K projection matrix...")
-        attn_k_proj = cluster_matrix(
-            matrix_file_path=attn_k_proj_path,
-            node_IP_list=self.IP_list,
-            CPU_GPU_select_list=self.CPU_GPU_select_list,
-            node_percentages=self.percentages,
-            back_end_select_list=self.backend_select_list,
-            split_matrix=True,
-            dim=0,
-            matrix_labeling='b'
-        )
-        attn_k_proj.convert_to_cluster_matrix_grid()
-        attn_k_proj.save_distribute_matrix_shards_bin()
-        
-        # Run K projection operation with CLUSTER
-        print(f"\n🚀 STEP 2.4: Running K projection with CLUSTER...")
-        cluster_k_result = self.cluster_token_embedding_matrix.cluster_shard_operation(
-            attn_k_proj, False, True, True
-        )
-        print("✅ K projection complete!")
-        check_combined_result_values('torch_k_ref.pt', cluster_k_result)
-        
-        # Create and distribute V projection matrix
-        print(f"\n📦 STEP 2.5: Distributing V projection matrix...")
-        attn_v_proj = cluster_matrix(
-            matrix_file_path=attn_v_proj_path,
-            node_IP_list=self.IP_list,
-            CPU_GPU_select_list=self.CPU_GPU_select_list,
-            node_percentages=self.percentages,
-            back_end_select_list=self.backend_select_list,
-            split_matrix=True,
-            dim=0,
-            matrix_labeling='b'
-        )
-        attn_v_proj.convert_to_cluster_matrix_grid()
-        attn_v_proj.save_distribute_matrix_shards_bin()
-        
-        # Run V projection operation with CLUSTER
-        print(f"\n🚀 STEP 2.6: Running V projection with CLUSTER...")
-        cluster_v_result = self.cluster_token_embedding_matrix.cluster_shard_operation(
-            attn_v_proj, False, True, True
-        )
-        print("✅ V projection complete!")
-        check_combined_result_values('torch_v_ref.pt', cluster_v_result)
-        
-        # ============================================================
-        # GQA ATTENTION WITH TORCH (reshape, softmax, matmul)
-        # ============================================================
-        
-        print(f"\n🔀 STEP 3: GQA ATTENTION COMPUTATION WITH TORCH")
-        print(f"   Using torch for reshape, softmax, and batch matmul")
-        
-        # Use the distributed results from cluster
-        cluster_q_tensor = cluster_q_result
-        cluster_k_tensor = cluster_k_result
-        cluster_v_tensor = cluster_v_result
-        
-        # Reshape for GQA attention with TORCH
-        seq_len = cluster_q_tensor.shape[0]
-        
-        q_reshaped = cluster_q_tensor.view(seq_len, self.num_q_heads, self.head_dim)
-        k_reshaped = cluster_k_tensor.view(seq_len, self.num_kv_heads, self.head_dim)
-        v_reshaped = cluster_v_tensor.view(seq_len, self.num_kv_heads, self.head_dim)
-        
-        # Repeat KV heads for GQA
-        if self.num_kv_heads < self.num_q_heads:
-            repeat_factor = self.num_q_heads // self.num_kv_heads
-            k_reshaped = k_reshaped.repeat_interleave(repeat_factor, dim=1)
-            v_reshaped = v_reshaped.repeat_interleave(repeat_factor, dim=1)
-        
-        # Transpose for batch matmul with TORCH
-        q_transposed = q_reshaped.transpose(0, 1)
-        k_transposed = k_reshaped.transpose(0, 1)
-        v_transposed = v_reshaped.transpose(0, 1)
-        
-        # Compute attention with TORCH
-        attention_scores = torch.matmul(q_transposed, k_transposed.transpose(-1, -2))
-        scaling_factor = 1.0 / (self.head_dim ** 0.5)
-        attention_scores = attention_scores * scaling_factor
-        attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
-        attention_output = torch.matmul(attention_probs, v_transposed)
-        
-        # Reshape back with TORCH
-        attention_output = attention_output.transpose(0, 1)
-        attention_output_flat = attention_output.reshape(seq_len, -1)
-        
-        print(f"   GQA attention output shape: {attention_output_flat.shape}")
-        
-        # Save torch reference
-        torch.save(attention_output_flat, 'torch_attention_output.pt')
-        
-        # ============================================================
-        # ATTENTION OUTPUT PROJECTION WITH CLUSTER
-        # ============================================================
-        
-        print(f"\n🎯 STEP 4: ATTENTION OUTPUT PROJECTION WITH CLUSTER")
-        
-        # Load attention output projection
-        attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_self_attn_o_proj_weight.pt'
-        attn_o_proj_torch_ref = torch.load(attn_o_proj_path)
-        
-        print(f"📊 Output projection shape: {attn_o_proj_torch_ref.shape}")
-        
-        # Compute torch reference for verification
-        torch_attn_final = attention_output_flat @ attn_o_proj_torch_ref.T
-        torch.save(torch_attn_final, 'torch_attn_final.pt')
-        print(f"   Torch reference shape: {torch_attn_final.shape}")
-        
-        # Load and distribute output projection matrix
-        attn_o_proj = cluster_matrix(
-            matrix_file_path=attn_o_proj_path,
-            node_IP_list=self.IP_list,
-            CPU_GPU_select_list=self.CPU_GPU_select_list,
-            node_percentages=self.percentages,
-            back_end_select_list=self.backend_select_list,
-            split_matrix=True,
-            dim=0,
-            matrix_labeling='b'
-        )
-        attn_o_proj.convert_to_cluster_matrix_grid()
-        attn_o_proj.save_distribute_matrix_shards_bin()
-        
-        # Convert attention output to cluster matrix for CLUSTER multiplication
-        print(f"\n📦 Preparing attention output for CLUSTER multiplication...")
-        torch.save(attention_output_flat, 'attention_output.pt')
-        cluster_attention_output = cluster_matrix(
-            matrix_file_path='attention_output.pt',
-            node_IP_list=self.IP_list,
-            CPU_GPU_select_list=self.CPU_GPU_select_list,
-            node_percentages=self.percentages,
-            back_end_select_list=self.backend_select_list,
-            split_matrix=True,
-            dim=0,
-            matrix_labeling='a'
-        )
-        cluster_attention_output.convert_to_cluster_matrix_grid()
-        cluster_attention_output.save_distribute_matrixA_grid_bin()
-        
-        # Run output projection with CLUSTER
-        print(f"\n🚀 STEP 4.1: Running output projection with CLUSTER...")
-        attn_final_result = cluster_attention_output.cluster_shard_operation(
-            attn_o_proj, False, True, True
-        )
-        print("✅ Output projection complete!")
-        check_combined_result_values('torch_attn_final.pt', attn_final_result)
-        
-        # ============================================================
-        # RESIDUAL CONNECTION WITH TORCH (CHEAP OPERATION)
-        # ============================================================
-        
-        print(f"\n➕ STEP 5: RESIDUAL CONNECTION WITH TORCH")
-        print(f"   Using torch for addition (lightweight operation)")
-        
-        # Add input embeddings to attention output with TORCH
-        residual_result = torch_embedding_ref + attn_final_result
-        torch.save(residual_result, 'torch_residual.pt')
-        print(f"   Residual shape: {residual_result.shape}")
-        
-        # ============================================================
-        # MLP FORWARD PASS (Hybrid: some torch, some cluster)
-        # ============================================================
-        
-        print(f"\n🧠 STEP 6: MLP FORWARD PASS")
-        
-        # Load MLP weights
-        mlp_up_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_mlp_up_proj_weight.pt'
-        mlp_gate_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_mlp_gate_proj_weight.pt'
-        mlp_down_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_mlp_down_proj_weight.pt'
-        
-        mlp_up_proj_torch_ref = torch.load(mlp_up_proj_path)
-        mlp_gate_proj_torch_ref = torch.load(mlp_gate_proj_path)
-        mlp_down_proj_torch_ref = torch.load(mlp_down_proj_path)
-        
-        print(f"📊 MLP weights loaded:")
-        print(f"   Up projection shape: {mlp_up_proj_torch_ref.shape}")
-        print(f"   Gate projection shape: {mlp_gate_proj_torch_ref.shape}")
-        print(f"   Down projection shape: {mlp_down_proj_torch_ref.shape}")
-        
-        # Compute MLP with TORCH (all operations can be done locally)
-        print(f"\n🔍 Computing MLP with TORCH...")
-        
-        # Step 1: Apply gate projection + SiLU activation
-        gate_output = residual_result @ mlp_gate_proj_torch_ref.T
-        gate_activated = torch.nn.functional.silu(gate_output)
-        
-        # Step 2: Apply up projection
-        up_output = residual_result @ mlp_up_proj_torch_ref.T
-        
-        # Step 3: Element-wise multiply with TORCH
-        mlp_intermediate = gate_activated * up_output
-        
-        # Step 4: Apply down projection
-        mlp_output = mlp_intermediate @ mlp_down_proj_torch_ref.T
-        
-        torch.save(mlp_output, 'torch_mlp_output.pt')
-        print(f"   MLP output shape: {mlp_output.shape}")
-        
-        # ============================================================
-        # FINAL RESIDUAL CONNECTION WITH TORCH
-        # ============================================================
-        
-        print(f"\n➕ STEP 7: FINAL RESIDUAL CONNECTION WITH TORCH")
-        
-        # Add MLP output back to residual with TORCH
-        layer_output = residual_result + mlp_output
-        torch.save(layer_output, 'torch_layer_output.pt')
-        print(f"   Final layer output shape: {layer_output.shape}")
-        
-        print(f"\n🎉🎉🎉 LAYER {layer} COMPLETE! 🎉🎉🎉")
-        print(f"\n📊 OPERATION SUMMARY:")
-        print(f"   ✅ CLUSTER operations (heavy matrix multiplications):")
-        print(f"      • Q projection (TokenEmbeddings × Q_weights)")
-        print(f"      • K projection (TokenEmbeddings × K_weights)")
-        print(f"      • V projection (TokenEmbeddings × V_weights)")
-        print(f"      • Output projection (AttentionOutput × O_weights)")
-        print(f"   ✅ TORCH operations (lightweight/non-distributable):")
-        print(f"      • GQA reshape and attention computation")
-        print(f"      • Softmax activation")
-        print(f"      • Residual connections (additions)")
-        print(f"      • MLP forward pass")
-        print(f"      • SiLU activation")
-        print(f"\n💡 Strategy: Heavy O(n³) operations → CLUSTER, Light O(n²) operations → TORCH")
-        
-        # Return the final output
-        return layer_output
-
     def run_full_model_forward(self, text="fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!"):
         """
         Run the full transformer model through all layers
@@ -1062,6 +624,218 @@ class cluster_llm_transformer:
             }
         }
 
+        def save_model_layers_safely(self, start_layer=0, end_layer=None, batch_size=4):
+            """
+            Save model layers in batches to avoid memory crashes
+            """
+            if end_layer is None:
+                end_layer = getattr(self.config, 'num_hidden_layers', 32) - 1
+            
+            print(f"💾 SAVING MODEL LAYERS SAFELY {start_layer} to {end_layer}")
+            print(f"📊 Batch size: {batch_size} layers at a time")
+            print("=" * 60)
+            
+            total_saved = 0
+            
+            # Process in batches
+            for batch_start in range(start_layer, end_layer + 1, batch_size):
+                batch_end = min(batch_start + batch_size - 1, end_layer)
+                
+                print(f"\n🔧 Processing layers {batch_start} to {batch_end}...")
+                
+                for layer_idx in range(batch_start, batch_end + 1):
+                    print(f"  📁 Layer {layer_idx}...")
+                    layer_saved = 0
+                    
+                    # Save this layer's matrices
+                    for name, param in self.model.named_parameters():
+                        name_split = name.split(".")
+                        try:
+                            layer_index = int(name_split[1])
+                            if len(param.shape) == 2 and layer_index == layer_idx:
+                                safe_name = name.replace('.', '_')
+                                path = self.model_matrix_fold_dir + safe_name + '.pt'
+                                torch.save(param.float(), path)
+                                print(f"    ✅ {safe_name}.pt")
+                                layer_saved += 1
+                                total_saved += 1
+                        except (ValueError, IndexError):
+                            continue
+                    
+                    print(f"    📊 Saved {layer_saved} matrices")
+                
+                # Clear memory after each batch
+                if hasattr(torch, 'cuda'):
+                    torch.cuda.empty_cache()
+                
+                # Small delay to let system breathe
+                import time
+                time.sleep(1)
+                print(f"  💤 Batch complete, pausing...")
+            
+            # Save special layers separately
+            print(f"\n📁 Saving special layers...")
+            special_saved = 0
+            special_layers = []
+            
+            # First collect all special layer names
+            for name, param in self.model.named_parameters():
+                if ('norm' in name.lower() and 'weight' in name) or \
+                ('lm_head' in name.lower()) or \
+                ('embed' in name.lower() and len(param.shape) == 2):
+                    special_layers.append((name, param))
+            
+            # Save them one by one
+            for name, param in special_layers:
+                safe_name = name.replace('.', '_')
+                path = self.model_matrix_fold_dir + safe_name + '.pt'
+                torch.save(param.float(), path)
+                print(f"  ✅ {safe_name}.pt - Shape: {param.shape}")
+                special_saved += 1
+                total_saved += 1
+            
+            print(f"\n🎉 SAFELY SAVED {total_saved} matrices")
+            print(f"   • Layers: {end_layer - start_layer + 1}")
+            print(f"   • Special layers: {special_saved}")
+            
+            return total_saved
+
+    def save_all_model_layers(self, start_layer=0, end_layer=None, batch_size=4):
+        """
+        Save model layers in batches to avoid memory crashes
+        """
+        if end_layer is None:
+            end_layer = getattr(self.config, 'num_hidden_layers', 32) - 1
+        
+        print(f"💾 SAVING MODEL LAYERS SAFELY {start_layer} to {end_layer}")
+        print(f"📊 Batch size: {batch_size} layers at a time")
+        print("=" * 60)
+        
+        total_saved = 0
+        
+        # Process in batches
+        for batch_start in range(start_layer, end_layer + 1, batch_size):
+            batch_end = min(batch_start + batch_size - 1, end_layer)
+            
+            print(f"\n🔧 Processing layers {batch_start} to {batch_end}...")
+            
+            for layer_idx in range(batch_start, batch_end + 1):
+                print(f"  📁 Layer {layer_idx}...")
+                layer_saved = 0
+                
+                # Save this layer's matrices
+                for name, param in self.model.named_parameters():
+                    name_split = name.split(".")
+                    try:
+                        layer_index = int(name_split[1])
+                        if len(param.shape) == 2 and layer_index == layer_idx:
+                            safe_name = name.replace('.', '_')
+                            path = self.model_matrix_fold_dir + safe_name + '.pt'
+                            torch.save(param.float(), path)
+                            print(f"    ✅ {safe_name}.pt")
+                            layer_saved += 1
+                            total_saved += 1
+                    except (ValueError, IndexError):
+                        continue
+                
+                print(f"    📊 Saved {layer_saved} matrices")
+            
+            # Clear memory after each batch
+            if hasattr(torch, 'cuda'):
+                torch.cuda.empty_cache()
+            
+            # Small delay to let system breathe
+            import time
+            time.sleep(1)
+            print(f"  💤 Batch complete, pausing...")
+        
+        # Save special layers separately
+        print(f"\n📁 Saving special layers...")
+        special_saved = 0
+        special_layers = []
+        
+        # First collect all special layer names
+        for name, param in self.model.named_parameters():
+            if ('norm' in name.lower() and 'weight' in name) or \
+            ('lm_head' in name.lower()) or \
+            ('embed' in name.lower() and len(param.shape) == 2):
+                special_layers.append((name, param))
+        
+        # Save them one by one
+        for name, param in special_layers:
+            safe_name = name.replace('.', '_')
+            path = self.model_matrix_fold_dir + safe_name + '.pt'
+            torch.save(param.float(), path)
+            print(f"  ✅ {safe_name}.pt - Shape: {param.shape}")
+            special_saved += 1
+            total_saved += 1
+        
+        print(f"\n🎉 SAFELY SAVED {total_saved} matrices")
+        print(f"   • Layers: {end_layer - start_layer + 1}")
+        print(f"   • Special layers: {special_saved}")
+        
+        return total_saved
+
+    def get_save_distribute_token_embeddings(self):
+        """Get embeddings for the tokenized input using the full model"""
+        if self.tokens is None:
+            print("❌ No tokens found. Call tokenize_text() first.")
+            return None
+        
+        print("🔍 Getting token embeddings from full model...")
+        
+        # Check if we already have saved embeddings
+        embedding_path = self.model_matrix_fold_dir + 'embed_tokens_weight.pt'
+        if not os.path.exists(embedding_path):
+            print("❌ Embedding weights not found. Run save_all_model_layers() first.")
+            return None
+        
+        # Load embedding matrix
+        embedding_matrix = torch.load(embedding_path)
+        print(f"📊 Using embedding matrix: {embedding_matrix.shape}")
+        
+        # Get embeddings for each token ID
+        token_embeddings = []
+        for token_id in self.tokens.input_ids[0]:
+            # Look up the embedding in the full matrix
+            embedding = embedding_matrix[token_id]  # Shape: [hidden_size]
+            token_text = self.tokenizer.decode(token_id)
+            print(f"🔤 Token {token_id}: '{token_text}' -> embedding shape: {embedding.shape}")
+            token_embeddings.append(embedding)
+        
+        # Stack all embeddings
+        all_embeddings = torch.stack(token_embeddings)  # Shape: [seq_len, hidden_size]
+        self.seq_len = all_embeddings.shape[0]
+        print(f"📦 Combined embeddings shape: {all_embeddings.shape}")
+        
+        # Save to disk
+        path = self.model_matrix_fold_dir + 'input_token_embedding_matrix.pt'
+        torch.save(all_embeddings.float(), path)
+        self.token_embedding_matrix = all_embeddings
+        
+        # Create and distribute cluster matrix for token embeddings
+        print("🔀 Distributing token embeddings across cluster...")
+        
+        # Create cluster matrix object for token embeddings
+        # Based on your working example above, use the correct parameters
+        self.cluster_token_embedding_matrix = cluster_matrix(
+            matrix_file_path=path,
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=True,
+            dim=0,  # Split by rows (sequence dimension)
+            matrix_labeling='a'  # Token embeddings are matrix A
+        )
+        
+        # Convert and distribute
+        self.cluster_token_embedding_matrix.convert_to_cluster_matrix_grid()
+        self.cluster_token_embedding_matrix.save_distribute_matrixA_grid_bin()
+        
+        print("✅ Token embeddings distributed successfully!")
+        return all_embeddings
+
 
 IP_list = [
     '192.168.2.100','192.168.2.100',
@@ -1087,7 +861,7 @@ num_layers = getattr(test.config, 'num_hidden_layers', 32)
 print(f"📊 Model has {num_layers} layers")
 
 # Save ALL layers (0 through num_layers-1)
-test.save_all_model_layers(0, num_layers - 1)
+#test.save_all_model_layers(0, 4)
 
 print("\n" + "=" * 70)
 print("✅ ALL MODEL LAYERS SAVED!")
