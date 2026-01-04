@@ -29,7 +29,6 @@
 #include <algorithm>
 #include <torch/torch.h>
 
-
 struct combined_matrix_shards
 {
     int total_shards_reserved = 0;        // Number of shards currently received
@@ -44,6 +43,10 @@ struct combined_matrix_shards
     int join_dim = 0; // << for now you only will join dim=0 but join based off this 
     // Note: Using std::list for received data allows efficient insertion
     //       as shards arrive in potentially non-sequential order from workers
+
+    std::vector<int> hierarchical_split_order;
+
+
 };
 
 // Function to execute a shell command and capture its output
@@ -149,7 +152,9 @@ class llama_zmq_server
         zmq::socket_t head_node_sender_wifi;
         zmq::socket_t ack_sender;  // For sending ACKs to Python front-end
         zmq::socket_t worker_peer_receiver; // Worker ↔ Worker peer communication
-
+        // Add this to your class member variables  
+        zmq::socket_t ack_receiver;  // For receiving ACK confirmations from Python  
+        
         // Unified reserved file structure to hold incoming files from any interface
         struct ReservedFiles {
             std::vector<std::string> save_parallel_file_name; // Filename(s) for parallel or single-file saves (use [0] for single)
@@ -257,6 +262,11 @@ class llama_zmq_server
                 wifi_push_port = "tcp://" + local_IP_wifi + ":" + worker_node_PUSH_port;
             }
             
+            
+            // In constructor (after ack_sender setup)  
+            ack_receiver = zmq::socket_t(zmq_context, zmq::socket_type::pull);  
+            ack_receiver.bind("tcp://0.0.0.0:7791");  // Different port than ack_sender
+
             // Bind file transfer sockets
             file_receiver_eth.bind(eth_pull_port);
             file_sender_eth.bind(eth_push_port);
@@ -273,16 +283,6 @@ class llama_zmq_server
             
             ack_sender = zmq::socket_t(zmq_context, zmq::socket_type::push);
             ack_sender.connect("tcp://" + python_frontend_ip + ":" + python_frontend_port);
-            
-            // Worker-to-worker peer communication setup
-            // TODO: Load worker IPs from environment or configuration file
-            worker_ip_list = {
-                "192.168.2.100",
-                "192.168.2.100",  // Experimental: Multiple workers on same machine
-                "192.168.2.100",  // Experimental: For load distribution testing
-                "192.168.2.102",
-                "192.168.2.103"
-            };
             
             // Experimental feature - work distribution percentages for heterogeneous nodes
             // This enables adaptive load balancing based on worker capabilities
@@ -321,6 +321,49 @@ class llama_zmq_server
         {
             zmq::message_t ack(ack_msg.data(), ack_msg.size());
             ack_sender.send(ack, zmq::send_flags::none);
+        }
+
+        int wait_for_acks(int expected_count, const std::string& expected_msg = "ACK", int timeout_ms = 30000)   
+        {  
+            int acks = 0;  
+            auto start_time = std::chrono::steady_clock::now();  
+            
+            while (acks < expected_count) {  
+                try {  
+                    zmq::message_t msg;  
+                    auto result = ack_receiver.recv(msg, zmq::recv_flags::dontwait);  
+                    
+                    if (result) {  
+                        std::string received_msg(static_cast<char*>(msg.data()), msg.size());  
+                        if (received_msg == expected_msg) {  
+                            acks++;  
+                            std::cout << "✅ Received " << expected_msg << " " << acks << "/" << expected_count << std::endl;  
+                        }  
+                    }  
+                } catch (const zmq::error_t& e) {  
+                    if (e.num() != EAGAIN) {  
+                        std::cerr << "❌ ZMQ error receiving ACK: " << e.what() << std::endl;  
+                        break;  
+                    }  
+                }  
+                
+                // Check timeout  
+                auto elapsed = std::chrono::steady_clock::now() - start_time;  
+                if (std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() > timeout_ms) {  
+                    std::cout << "⚠️ Timeout waiting for " << expected_msg << " after " << timeout_ms << "ms" << std::endl;  
+                    std::cout << "   Received " << acks << "/" << expected_count << " messages" << std::endl;  
+                    break;  
+                }  
+                
+                // Brief sleep to avoid 100% CPU  
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));  
+            }  
+            
+            if (acks == expected_count) {  
+                std::cout << "✅ All ACKs received!" << std::endl;  
+            }  
+            
+            return acks;  
         }
 
         void run_server() 
@@ -427,7 +470,8 @@ class llama_zmq_server
                         }
                     }
 
-                    if (parts.empty()) continue;
+                    if (parts.empty())
+                        continue;
 
                     // Single-part: commands
                     if (parts.size() == 1)
@@ -466,9 +510,10 @@ class llama_zmq_server
                             std::lock_guard<std::mutex> lock(file_data_mutex);
 
                             bool found = false;
-                            for (auto &rf : reserved_files_list)
+                            for (auto& rf : reserved_files_list)
                             {
-                                if (!rf.save_parallel_file_name.empty() && rf.save_parallel_file_name[0] == actual_filename)
+                                if (!rf.save_parallel_file_name.empty() &&
+                                    rf.save_parallel_file_name[0] == actual_filename)
                                 {
                                     if (interface_name == "Ethernet")
                                         rf.received_data_eth_file.assign(data_ptr, data_ptr + data_size);
@@ -477,7 +522,9 @@ class llama_zmq_server
 
                                     rf.is_parallel = true;
                                     found = true;
-                                    std::cout << "📂 " << interface_name << ": Added to parallel file '" << actual_filename << "'" << std::endl;
+                                    std::cout << "📂 " << interface_name
+                                            << ": Added to parallel file '"
+                                            << actual_filename << "'" << std::endl;
                                     break;
                                 }
                             }
@@ -486,6 +533,7 @@ class llama_zmq_server
                             {
                                 ReservedFiles rf;
                                 rf.save_parallel_file_name.push_back(actual_filename);
+
                                 if (interface_name == "Ethernet")
                                     rf.received_data_eth_file.assign(data_ptr, data_ptr + data_size);
                                 else
@@ -494,7 +542,10 @@ class llama_zmq_server
                                 rf.is_parallel = true;
                                 reserved_files_list.push_back(std::move(rf));
 
-                                std::cout << "📂 " << interface_name << ": Started parallel file '" << actual_filename << "' (" << interface_name << " half)" << std::endl;
+                                std::cout << "📂 " << interface_name
+                                        << ": Started parallel file '"
+                                        << actual_filename << "' ("
+                                        << interface_name << " half)" << std::endl;
                             }
                         }
                         else
@@ -508,12 +559,17 @@ class llama_zmq_server
                             {
                                 std::lock_guard<std::mutex> lock(file_data_mutex);
                                 bool found = false;
-                                for (auto &rf : reserved_files_list)
+
+                                for (auto& rf : reserved_files_list)
                                 {
-                                    if (!rf.save_parallel_file_name.empty() && rf.save_parallel_file_name[0] == filename)
+                                    if (!rf.save_parallel_file_name.empty() &&
+                                        rf.save_parallel_file_name[0] == filename)
                                     {
-                                        if (interface_name == "Ethernet") rf.received_data_eth_file = std::move(file_data);
-                                        else rf.received_data_wifi_file = std::move(file_data);
+                                        if (interface_name == "Ethernet")
+                                            rf.received_data_eth_file = std::move(file_data);
+                                        else
+                                            rf.received_data_wifi_file = std::move(file_data);
+
                                         found = true;
                                         break;
                                     }
@@ -523,13 +579,19 @@ class llama_zmq_server
                                 {
                                     ReservedFiles rf;
                                     rf.save_parallel_file_name.push_back(filename);
-                                    if (interface_name == "Ethernet") rf.received_data_eth_file = std::move(file_data);
-                                    else rf.received_data_wifi_file = std::move(file_data);
+
+                                    if (interface_name == "Ethernet")
+                                        rf.received_data_eth_file = std::move(file_data);
+                                    else
+                                        rf.received_data_wifi_file = std::move(file_data);
+
                                     reserved_files_list.push_back(std::move(rf));
                                 }
                             }
 
-                            std::cout << "📁 " << interface_name << ": Received file '" << filename << "' (" << data_size << " bytes)" << std::endl;
+                            std::cout << "📁 " << interface_name
+                                    << ": Received file '" << filename
+                                    << "' (" << data_size << " bytes)" << std::endl;
                         }
 
                         // Attempt to process saved files
@@ -537,12 +599,15 @@ class llama_zmq_server
                     }
                     else
                     {
-                        std::cout << "⚠️ " << interface_name << ": Unexpected message format - " << parts.size() << " parts received" << std::endl;
+                        std::cout << "⚠️ " << interface_name
+                                << ": Unexpected message format - "
+                                << parts.size() << " parts received" << std::endl;
                     }
                 }
                 catch (const std::exception& e)
                 {
-                    std::cerr << "❌ " << interface_name << " listener error: " << e.what() << std::endl;
+                    std::cerr << "❌ " << interface_name
+                            << " listener error: " << e.what() << std::endl;
                     std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
             }
@@ -633,8 +698,6 @@ class llama_zmq_server
                                 << " command thread(s) launched" << std::endl;
                     }
                     
-                    // Small delay to prevent CPU spinning when no commands are pending
-                    // This also allows other threads to acquire locks
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                     
                 } 
@@ -688,22 +751,62 @@ class llama_zmq_server
                     bool transposeB = (command_args[4] == "true");
                     bool use_gpu    = (command_args[5] == "true");
                     int gpu_id      = std::stoi(command_args[6]);
-                    int send_back   = std::stoi(command_args[7]);  // Number of result shards to return
+                    std::string send_back_str = command_args[7];  // Get as string for parsing
                     std::string operation_type = command_args[8];  // e.g., "matmul", "add", etc.
                     int n_dims      = std::stoi(command_args[9]);  // Matrix dimensions
+                    
+                    // Parse shard_index_override from the command string
                     int shard_index_override = -1;
                     if (command_args.size() > 10) {
                         shard_index_override = std::stoi(command_args[10]);
                     }
+
+                    // ============================================================
+                    // PARSE SEND_BACK STRING FOR HIERARCHICAL SPLIT INFORMATION
+                    // ============================================================
+                    int send_back_number = 0;
+                    std::vector<int> hierarchical_split_order;
+                    
+                    // Check if format contains '/' (new hierarchical format: "4/011" or "-4/011")
+                    size_t slash_pos = send_back_str.find('/');
+                    if (slash_pos != std::string::npos) {
+                        // New format: "4/011" or "-4/011"
+                        std::string total_shards_str = send_back_str.substr(0, slash_pos);
+                        std::string split_info_str = send_back_str.substr(slash_pos + 1);
+                        
+                        // Parse total number of shards
+                        send_back_number = std::stoi(total_shards_str);
+                        
+                        // Parse hierarchical split order from split_info_str
+                        if (!split_info_str.empty()) {
+                            // String format: first char is initial split dim, rest are hierarchical order
+                            // Example: "011" means initial dim=0, then splits: [1, 1]
+                            for (size_t i = 0; i < split_info_str.size(); i++) {
+                                if (split_info_str[i] == '0' || split_info_str[i] == '1') {
+                                    hierarchical_split_order.push_back(split_info_str[i] - '0');
+                                }
+                            }
+                            
+                            std::cout << "DEBUG: Parsed hierarchical info - total_shards=" << send_back_number 
+                                    << ", split_order=[";
+                            for (size_t i = 0; i < hierarchical_split_order.size(); i++) {
+                                if (i > 0) std::cout << ",";
+                                std::cout << hierarchical_split_order[i];
+                            }
+                            std::cout << "]" << std::endl;
+                        }
+                    } else {
+                        // Old format: just number (no hierarchical splits)
+                        send_back_number = std::stoi(send_back_str);
+                    }
                     
                     // Store for later use in result distribution
-                    send_back_number_of_shards = send_back;
+                    send_back_number_of_shards = send_back_number;
                     
                     bool operation_success = false;
                     std::string backend_name;
 
                     // Dispatch to unified matrix operation function
-                    
                     if (command_type == "llama")
                     {
                         operation_success = matrix_operation(
@@ -714,10 +817,11 @@ class llama_zmq_server
                             transposeA,
                             use_gpu,
                             gpu_id,
-                            send_back,
+                            send_back_str,  // Pass the full string (e.g., "4/011")
                             operation_type,
                             n_dims,
-                            shard_index_override
+                            shard_index_override,
+                            hierarchical_split_order  // Pass parsed hierarchical split order
                         );
                     }
                     else
@@ -730,14 +834,13 @@ class llama_zmq_server
                             transposeB,
                             use_gpu,
                             gpu_id,
-                            send_back,
+                            send_back_str,  // Pass the full string (e.g., "4/011")
                             operation_type,
                             n_dims,
-                            shard_index_override
+                            shard_index_override,
+                            hierarchical_split_order  // Pass parsed hierarchical split order
                         );
                     }
-
-
                     
                     if (command_type == "llama")
                         backend_name = "LLaMA/Vulkan";
@@ -751,7 +854,10 @@ class llama_zmq_server
                         std::cout << "✅ " << backend_name << " operation completed successfully" << std::endl;
                         std::cout << "   • Operation: " << operation_type << std::endl;
                         std::cout << "   • GPU: " << (use_gpu ? "Yes (ID: " + std::to_string(gpu_id) + ")" : "No") << std::endl;
-                        std::cout << "   • Result shards: " << send_back << std::endl;
+                        std::cout << "   • Result shards: " << send_back_number << std::endl;
+                        if (!hierarchical_split_order.empty()) {
+                            std::cout << "   • Hierarchical splits: " << hierarchical_split_order.size() << " levels" << std::endl;
+                        }
                         return 0;
                     } else {
                         std::cerr << "❌ " << backend_name << " operation failed: " << operation_type << std::endl;
@@ -833,7 +939,6 @@ class llama_zmq_server
             return {filename, -1};
         }
 
-
         void save_file_handler()
         {
             // Move reserved files to local copy under lock for processing
@@ -858,11 +963,12 @@ class llama_zmq_server
             // - parallel (ETH + WiFi halves)
             // - single-interface ETH
             // - single-interface WiFi
+            std::string tmp_file_name = "";
             for (auto &rf : local_reserved_files)
             {
                 std::string filename = rf.save_parallel_file_name.empty() ? std::string("unknown") : rf.save_parallel_file_name[0];
-                //send_ack(filename);
                 // Helper lambda to write raw bytes to path
+                tmp_file_name = filename;
                 auto write_raw = [&](const std::filesystem::path &path, const std::vector<uint8_t> &bytes) -> bool {
                     std::filesystem::create_directories(path.parent_path());
                     std::ofstream file(path, std::ios::binary);
@@ -908,7 +1014,8 @@ class llama_zmq_server
                                 auto shard_data = std::make_unique<float[]>(total_elements);
                                 std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
 
-                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0);
+                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0, {}); 
+                                // move this call to 'run_server_command' function 
                             }
                         }
                     }
@@ -958,9 +1065,13 @@ class llama_zmq_server
                         std::string actual_filename = filename.substr(sent_back_pos + 10);
                         std::filesystem::path save_path = std::filesystem::path(matrix_results_folder) / actual_filename;
                         if (write_raw(save_path, data))
+                        {
                             std::cout << "ETH sent_back saved to RESULTS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
+                        }
                         else
+                        {
                             std::cerr << "Failed to save ETH sent_back: " << save_path << std::endl;
+                        }
 
                         // Head node-specific processing for shard combination
                         if (local_IP_eth == head_node_ip_eth)
@@ -980,7 +1091,7 @@ class llama_zmq_server
                                 auto shard_data = std::make_unique<float[]>(total_elements);
                                 std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
 
-                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0);
+                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0, {});
                             }
                         }
                     }
@@ -1054,7 +1165,8 @@ class llama_zmq_server
             // Send acknowledgment if this is not the head node
             if (local_IP_eth != head_node_ip_eth)
             {
-                send_ack();
+                //std::cout << tmp_file_name;
+                send_ack(tmp_file_name);
             }
 
             std::cout << "Save file handler completed" << std::endl;
@@ -1064,6 +1176,7 @@ class llama_zmq_server
                             const std::string& filename,
                             MatrixResult& save_result,
                             int total_shards,
+                            const std::vector<int>& hierarchical_split_order,  // NEW parameter
                             const std::string& selected_backend)
         {
             std::cout << "SENDING BACK FILE" << std::endl;
@@ -1157,17 +1270,28 @@ class llama_zmq_server
                             save_result.data.get(),
                             data_size);
 
-                // Process shard through combination handler
+                // Process shard through combination handler WITH hierarchical split order
                 bool result = handle_combine_matrix_shard_list(
                     filename,
                     std::move(shard_data),
                     shard_rows,
                     shard_cols,
-                    total_shards
+                    total_shards,
+                    hierarchical_split_order  // PASS hierarchical split order
                 );
 
                 std::cout << "Head node processed shard: " << filename 
-                        << " (" << data_size << " bytes)" << std::endl;
+                        << " (" << data_size << " bytes)";
+                
+                if (!hierarchical_split_order.empty()) {
+                    std::cout << " with hierarchical splits [";
+                    for (size_t i = 0; i < hierarchical_split_order.size(); i++) {
+                        if (i > 0) std::cout << ",";
+                        std::cout << hierarchical_split_order[i];
+                    }
+                    std::cout << "]";
+                }
+                std::cout << std::endl;
 
                 return result;
             }
@@ -1175,14 +1299,13 @@ class llama_zmq_server
             return false;
         }
 
-
-
         bool handle_combine_matrix_shard_list(  
             const std::string& filename,  
             std::unique_ptr<float[]> data,  
             int shard_rows,  
             int shard_cols,  
-            int total_shards  
+            int total_shards,
+            const std::vector<int>& hierarchical_split_order = {}  // NEW parameter
         )  
         {  
             // ============================================================
@@ -1192,6 +1315,17 @@ class llama_zmq_server
             std::cout << "DEBUG: filename='" << filename << "'" << std::endl;
             std::cout << "DEBUG: shard_rows=" << shard_rows << ", shard_cols=" << shard_cols << std::endl;
             std::cout << "DEBUG: total_shards=" << total_shards << std::endl;
+            std::cout << "DEBUG: hierarchical_split_order size=" << hierarchical_split_order.size() << std::endl;
+            
+            // Print the actual values of hierarchical_split_order
+            if (!hierarchical_split_order.empty()) {
+                std::cout << "DEBUG: hierarchical_split_order values: [";
+                for (size_t i = 0; i < hierarchical_split_order.size(); i++) {
+                    if (i > 0) std::cout << ", ";
+                    std::cout << hierarchical_split_order[i];
+                }
+                std::cout << "]" << std::endl;
+            }
             
             // ============================================================
             // EXTRACT MATRIX NAME AND SHARD NUMBER
@@ -1276,31 +1410,62 @@ class llama_zmq_server
                     {  
                         // Determine system from the SIGN of number_of_shards_needed
                         bool is_system2 = (combined.number_of_shards_needed < 0);
+                        bool is_system3 = (!combined.hierarchical_split_order.empty());  // NEW: Check for hierarchical splits
                         
                         std::cout << "DEBUG: ALL SHARDS RECEIVED! Triggering combine..." << std::endl;
                         std::cout << "All " << needed_shards_absolute 
                                 << " shards received. Combining matrix: " << matrix_name 
-                                << " (System " << (is_system2 ? "2" : "1") << ")" << std::endl;  
+                                << " (System " << (is_system2 ? "2" : "1") << ")" 
+                                << (is_system3 ? " with hierarchical splits" : "") << std::endl;  
 
                         MatrixResult full;  
                         
-                        if (is_system2)  
-                        {  
+                        // ============================================================
+                        // DETERMINE WHICH COMBINATION METHOD TO USE
+                        // ============================================================
+                        // System 3 (hierarchical) takes priority if present
+                        // Then System 2 (grid assembly for A @ B.T)
+                        // Finally System 1 (standard concatenation)
+                        // ============================================================
+                        
+                        /*
+                        if (is_system3)
+                        {
+                            // System 3: Hierarchical combination
+                            std::cout << "DEBUG: Calling System 3 hierarchical combination" << std::endl;
+                            std::cout << "DEBUG: Split order: [";
+                            for (size_t i = 0; i < combined.hierarchical_split_order.size(); i++) {
+                                if (i > 0) std::cout << ", ";
+                                std::cout << combined.hierarchical_split_order[i];
+                            }
+                            std::cout << "]" << std::endl;
+                            
+                            // FIXED: Pass combined.hierarchical_split_order, not the parameter
+                            full = combine_hierarchical_results(combined, combined.hierarchical_split_order);
+                            
+                            // If hierarchical combination fails, fall back to appropriate system
+                            if (!full.data) {
+                                std::cout << "WARNING: System 3 hierarchical combination failed, falling back..." << std::endl;
+                                if (is_system2) {
+                                    std::cout << "DEBUG: Falling back to System 2 grid assembly" << std::endl;
+                                    full = combine_matrix_shards_grid_2d(combined);  
+                                } else {
+                                    std::cout << "DEBUG: Falling back to System 1 concatenation" << std::endl;
+                                    full = combine_matrix_shards_2d(combined);  
+                                }
+                            }
+                        }
+                        */
+                        if (is_system2) {
                             // System 2: Grid assembly (GEMM results)
                             std::cout << "DEBUG: Calling System 2 grid assembly" << std::endl;
-                            // TODO: Implement combine_matrix_shards_grid_2d()
-                            // full = combine_matrix_shards_grid_2d(combined);
-                            
-                            // For now, just use System 1 as fallback
-                            std::cout << "WARNING: System 2 not implemented, using System 1 fallback" << std::endl;
                             full = combine_matrix_shards_grid_2d(combined);  
-                        }  
-                        else  
-                        {  
-                            // System 1: Vertical concatenation  
-                            std::cout << "DEBUG: Calling System 1 vertical concatenation" << std::endl;
+                        } 
+                        else {
+                            // System 1: Standard concatenation  
+                            std::cout << "DEBUG: Calling System 1 concatenation" << std::endl;
                             full = combine_matrix_shards_2d(combined);  
-                        }  
+                        }
 
                         if (!full.data)  
                         {  
@@ -1314,8 +1479,12 @@ class llama_zmq_server
                                 (combined_name + "_combined.bin");  
 
                             std::cout << "DEBUG: Saving combined matrix to: " << final_path << std::endl;
-                            save_matrix_bin(final_path.c_str(), full);  
+                            save_matrix_bin(final_path.c_str(), full);
+
+                            //wait_for_acks(1, "ACK_matrixOp_complete_CONFIRM");
                             send_ack("ACK_combined_matrix_saved");
+                              
+
                             std::cout << "Combined matrix saved: " << final_path << std::endl;  
                         }  
 
@@ -1333,7 +1502,7 @@ class llama_zmq_server
                             combined_matrix_shards_list.end()  
                         );  
                     }  
-
+                    send_ack("ACK_combined_matrix_saved");
                     return true;  
                 }  
             }  
@@ -1353,6 +1522,9 @@ class llama_zmq_server
             // Store dimensions for the first shard  
             std::vector<int> shard_dims = {1, 1, shard_rows, shard_cols};  
             combined.dims_list.push_back(shard_dims);  
+            
+            // Store hierarchical split order if provided
+            combined.hierarchical_split_order = hierarchical_split_order;
 
             // Add new entry to tracking list
             combined_matrix_shards_list.push_back(std::move(combined));  
@@ -1363,15 +1535,21 @@ class llama_zmq_server
             
             std::cout << "Started tracking new matrix: " << matrix_name 
                     << " (shard " << shard_num << " of " << absolute_shard_count 
-                    << ", System " << (is_system2 ? "2" : "1") << ")" << std::endl;
+                    << ", System " << (is_system2 ? "2" : "1") << ")";
+            
+            if (!hierarchical_split_order.empty()) {
+                std::cout << " with hierarchical splits: [";
+                for (size_t i = 0; i < hierarchical_split_order.size(); i++) {
+                    if (i > 0) std::cout << ", ";
+                    std::cout << hierarchical_split_order[i];
+                }
+                std::cout << "]";
+            }
+            std::cout << std::endl;
             
             return true;  
         }
 
-
-
-
-        
         MatrixResult combine_matrix_shards_2d(const combined_matrix_shards& combined)
         {
             MatrixResult result;
@@ -1384,59 +1562,68 @@ class llama_zmq_server
             // ============================================================
             // STEP 1: SORT SHARDS BY SHARD NUMBER
             // ============================================================
-            // Create vector of (shard_number, shard_data_pointer) pairs
-            std::vector<std::pair<int, const std::vector<uint8_t>*>> sorted_shards;
+            // Create vector of (shard_number, shard_data_pointer, dims) pairs
+            struct ShardInfo {
+                int number;
+                const std::vector<uint8_t>* data;
+                std::vector<int> dims;
+            };
+            
+            std::vector<ShardInfo> sorted_shards;
             
             auto shard_num_it = combined.shard_numbers.begin();
             auto data_it      = combined.received_matrix_data.begin();
+            auto dims_it      = combined.dims_list.begin();
 
-            // Pair each shard number with its corresponding data
+            // Pair each shard number with its corresponding data and dimensions
             for (; shard_num_it != combined.shard_numbers.end() &&
-                data_it      != combined.received_matrix_data.end();
-                ++shard_num_it, ++data_it)
+                data_it      != combined.received_matrix_data.end() &&
+                dims_it      != combined.dims_list.end();
+                ++shard_num_it, ++data_it, ++dims_it)
             {
-                sorted_shards.emplace_back(*shard_num_it, &(*data_it));
+                sorted_shards.push_back({*shard_num_it, &(*data_it), *dims_it});
             }
 
             // Sort by shard number to ensure correct concatenation order
             std::sort(sorted_shards.begin(), sorted_shards.end(),
-                    [](auto& a, auto& b){ return a.first < b.first; });
+                    [](auto& a, auto& b){ return a.number < b.number; });
 
             // ============================================================
-            // STEP 2: COMPUTE TOTAL DIMENSIONS
+            // STEP 2: COMPUTE TOTAL DIMENSIONS BASED ON JOIN DIMENSION
             // ============================================================
-            // Calculate total rows (sum of all shard rows) 
-            // and total cols (maximum shard columns)
             int total_rows = 0;
             int total_cols = 0;
+            int join_dim = combined.join_dim; // 0 for rows, 1 for columns
 
-            for (const auto& [shard_num, shard_bytes] : sorted_shards) {
-                const uint8_t* p = shard_bytes->data();
-
-                // Read metadata from shard
-                int ndim = *reinterpret_cast<const int*>(p);
-                p += sizeof(int);
-
-                std::vector<int> dims(ndim);
-                for (int i = 0; i < ndim; ++i) {
-                    dims[i] = *reinterpret_cast<const int*>(p);
-                    p += sizeof(int);
+            if (join_dim == 0) {
+                // Concatenate along rows (vertical stacking)
+                for (const auto& shard : sorted_shards) {
+                    int rows = shard.dims[2];  // rows dimension
+                    int cols = shard.dims[3];  // cols dimension
+                    total_rows += rows;
+                    total_cols = std::max(total_cols, cols);
                 }
-
-                int rows = dims[2];  // rows dimension
-                int cols = dims[3];  // cols dimension
-
-                total_rows += rows;
-                total_cols = std::max(total_cols, cols);
+                std::cout << "Combining " << sorted_shards.size() << " shards along rows into "
+                        << total_rows << "x" << total_cols << " matrix" << std::endl;
+            } else if (join_dim == 1) {
+                // Concatenate along columns (horizontal stacking)
+                for (const auto& shard : sorted_shards) {
+                    int rows = shard.dims[2];  // rows dimension
+                    int cols = shard.dims[3];  // cols dimension
+                    total_rows = std::max(total_rows, rows);
+                    total_cols += cols;
+                }
+                std::cout << "Combining " << sorted_shards.size() << " shards along columns into "
+                        << total_rows << "x" << total_cols << " matrix" << std::endl;
+            } else {
+                std::cerr << "Error: Invalid join_dim " << join_dim 
+                        << ". Must be 0 (rows) or 1 (columns)" << std::endl;
+                return result;
             }
-
-            std::cout << "Combining " << sorted_shards.size() << " shards into "
-                    << total_rows << "x" << total_cols << " matrix" << std::endl;
 
             // ============================================================
             // STEP 3: ALLOCATE OUTPUT MATRIX
             // ============================================================
-            // Set dimensions: single batch and depth, combined rows and cols
             result.dims[0] = 1;  // batch
             result.dims[1] = 1;  // depth
             result.dims[2] = total_rows;
@@ -1447,132 +1634,165 @@ class llama_zmq_server
                 static_cast<size_t>(total_rows) * total_cols
             );
 
+            // Initialize with zeros
+            std::fill(result.data.get(), 
+                    result.data.get() + total_rows * total_cols, 
+                    0.0f);
+
             // ============================================================
-            // STEP 4: COPY SHARDS (ROW-MAJOR CONCATENATION)
+            // STEP 4: COPY SHARDS BASED ON JOIN DIMENSION
             // ============================================================
-            int row_offset = 0;  // Track where to place next shard
-
-            for (const auto& [shard_num, shard_bytes] : sorted_shards) {
-                const uint8_t* p = shard_bytes->data();
-
-                // Read shard metadata
-                int ndim = *reinterpret_cast<const int*>(p);
-                p += sizeof(int);
-
-                std::vector<int> dims(ndim);
-                for (int i = 0; i < ndim; ++i) {
-                    dims[i] = *reinterpret_cast<const int*>(p);
-                    p += sizeof(int);
-                }
-
-                int rows = dims[2];
-                int cols = dims[3];
+            if (join_dim == 0) {
+                // Concatenate along rows (vertical stacking)
+                int row_offset = 0;  // Track where to place next shard vertically
                 
-                const float* shard_data = reinterpret_cast<const float*>(p);
-
-                std::cout << "  Copying shard " << shard_num << ": " 
-                        << rows << "x" << cols << std::endl;
-
-                // Row-major copy: concatenate shards vertically
-                for (int r = 0; r < rows; ++r) {
-                    std::memcpy(
-                        result.data.get() + (row_offset + r) * total_cols,
-                        shard_data + r * cols,
-                        sizeof(float) * cols
-                    );
+                for (const auto& shard : sorted_shards) {
+                    // Get shard data pointer (skip metadata)
+                    const uint8_t* p = shard.data->data();
+                    p += sizeof(int);  // skip ndim
+                    p += sizeof(int) * shard.dims.size();  // skip dims
+                    
+                    int rows = shard.dims[2];
+                    int cols = shard.dims[3];
+                    const float* shard_data = reinterpret_cast<const float*>(p);
+                    
+                    std::cout << "  Copying shard " << shard.number << ": " 
+                            << rows << "x" << cols << " at row offset " << row_offset << std::endl;
+                    
+                    // Row-major copy: concatenate vertically
+                    for (int r = 0; r < rows; ++r) {
+                        std::memcpy(
+                            result.data.get() + (row_offset + r) * total_cols,
+                            shard_data + r * cols,
+                            sizeof(float) * cols
+                        );
+                    }
+                    
+                    row_offset += rows;
                 }
-
-                row_offset += rows;
+            } else {
+                // Concatenate along columns (horizontal stacking)
+                int col_offset = 0;  // Track where to place next shard horizontally
+                
+                for (const auto& shard : sorted_shards) {
+                    // Get shard data pointer (skip metadata)
+                    const uint8_t* p = shard.data->data();
+                    p += sizeof(int);  // skip ndim
+                    p += sizeof(int) * shard.dims.size();  // skip dims
+                    
+                    int rows = shard.dims[2];
+                    int cols = shard.dims[3];
+                    const float* shard_data = reinterpret_cast<const float*>(p);
+                    
+                    std::cout << "  Copying shard " << shard.number << ": " 
+                            << rows << "x" << cols << " at column offset " << col_offset << std::endl;
+                    
+                    // Row-major copy: concatenate horizontally
+                    for (int r = 0; r < rows; ++r) {
+                        std::memcpy(
+                            result.data.get() + r * total_cols + col_offset,
+                            shard_data + r * cols,
+                            sizeof(float) * cols
+                        );
+                    }
+                    
+                    col_offset += cols;
+                }
             }
 
-            std::cout << "Matrix combination complete" << std::endl;
+            std::cout << "Matrix combination complete (joined along dim=" << join_dim << ")" << std::endl;
             
             return result;
         }
 
-
         MatrixResult combine_matrix_shards_grid_2d(const combined_matrix_shards& combined)
         {
             MatrixResult result;
-            
+
             if (combined.received_matrix_data.empty()) {
                 return result;
             }
-            
+
             std::cout << "DEBUG: Starting System 2 grid combine" << std::endl;
             std::cout << "DEBUG: Total shards: " << combined.received_matrix_data.size() << std::endl;
-            
+
             // ============================================================
-            // STEP 1: SORT SHARDS BY SHARD NUMBER
+            // STEP 1: PAIR SHARD NUMBERS WITH DATA AND SORT
             // ============================================================
-            std::vector<std::tuple<int, const std::vector<uint8_t>*, std::vector<int>>> sorted_shards;
-            
+            std::vector<std::pair<int, const std::vector<uint8_t>*>> sorted_shards;
+
             auto shard_num_it = combined.shard_numbers.begin();
             auto data_it      = combined.received_matrix_data.begin();
-            auto dims_it      = combined.dims_list.begin();
-            
+
             for (; shard_num_it != combined.shard_numbers.end() &&
-                data_it      != combined.received_matrix_data.end() &&
-                dims_it      != combined.dims_list.end();
-                ++shard_num_it, ++data_it, ++dims_it)
+                data_it      != combined.received_matrix_data.end();
+                ++shard_num_it, ++data_it)
             {
-                sorted_shards.emplace_back(*shard_num_it, &(*data_it), *dims_it);
+                sorted_shards.emplace_back(*shard_num_it, &(*data_it));
             }
-            
+
             std::sort(sorted_shards.begin(), sorted_shards.end(),
-                    [](auto& a, auto& b){ return std::get<0>(a) < std::get<0>(b); });
-            
+                    [](auto& a, auto& b){ return a.first < b.first; });
+
             int total_shards = sorted_shards.size();
-            std::cout << "DEBUG: Sorted " << total_shards << " shards" << std::endl;
-            
+
             // ============================================================
-            // STEP 2: DETERMINE GRID DIMENSIONS
+            // STEP 2: SYSTEM-2 GRID GEOMETRY
             // ============================================================
-            // For GEMM: A is split into 2 shards, B into (total_shards/2) shards
-            const int grid_rows = 2;
-            const int grid_cols = total_shards / grid_rows;  // Should be 3 for 6 shards
-            
-            std::cout << "DEBUG: Grid layout: " << grid_rows << "×" << grid_cols 
-                    << " (A split into " << grid_rows << ", B split into " << grid_cols << ")" << std::endl;
-            
+            if (total_shards % 2 != 0) {
+                std::cout << "ERROR: System 2 requires even shard count\n";
+                return combine_matrix_shards_2d(combined);
+            }
+
+            int grid_rows = 2;                 // A is always split into 2
+            int grid_cols = total_shards / 2;  // B shards
+
+            std::cout << "DEBUG: Grid " << grid_rows << " × " << grid_cols << std::endl;
+
             // ============================================================
-            // STEP 3: VERIFY SHARD DIMENSIONS
+            // STEP 3: READ FIRST SHARD DIMENSIONS
             // ============================================================
-            int shard_rows = 0;
-            int shard_cols = 0;
-            
-            for (int i = 0; i < total_shards; i++) {
-                auto& [shard_num, shard_data, dims] = sorted_shards[i];
-                int current_rows = dims[2];
-                int current_cols = dims[3];
-                
-                std::cout << "DEBUG: Shard " << shard_num << ": " 
-                        << current_rows << "×" << current_cols << std::endl;
-                
-                if (shard_rows == 0) shard_rows = current_rows;
-                if (shard_cols == 0) shard_cols = current_cols;
-                
-                // All shards should have same dimensions in GEMM
-                if (current_rows != shard_rows || current_cols != shard_cols) {
-                    std::cout << "WARNING: Shard " << shard_num << " has different dimensions: "
-                            << current_rows << "×" << current_cols 
-                            << " (expected " << shard_rows << "×" << shard_cols << ")" << std::endl;
+            const uint8_t* p = sorted_shards[0].second->data();
+            int ndim = *reinterpret_cast<const int*>(p);
+            p += sizeof(int);
+
+            std::vector<int> first_dims(ndim);
+            for (int i = 0; i < ndim; ++i) {
+                first_dims[i] = *reinterpret_cast<const int*>(p);
+                p += sizeof(int);
+            }
+
+            int shard_rows = first_dims[2];
+
+            // ============================================================
+            // STEP 4: DETERMINE COLUMN WIDTHS (SUPPORT UNEVEN B SPLITS)
+            // ============================================================
+            std::vector<int> col_dims(grid_cols, 0);
+
+            for (const auto& [shard_num, shard_bytes] : sorted_shards) {
+
+                int col_idx = shard_num % grid_cols;
+
+                const uint8_t* p2 = shard_bytes->data();
+                p2 += sizeof(int); // ndim
+
+                std::vector<int> dims(ndim);
+                for (int i = 0; i < ndim; ++i) {
+                    dims[i] = *reinterpret_cast<const int*>(p2);
+                    p2 += sizeof(int);
+                }
+
+                if (col_dims[col_idx] == 0) {
+                    col_dims[col_idx] = dims[3];
                 }
             }
-            
-            // ============================================================
-            // STEP 4: CALCULATE FINAL DIMENSIONS
-            // ============================================================
-            // With 6 shards of 5000×5000 in 2×3 grid:
-            // Total rows: 2 × 5000 = 10000
-            // Total cols: 3 × 5000 = 15000
+
             int total_rows = grid_rows * shard_rows;
-            int total_cols = grid_cols * shard_cols;
-            
-            std::cout << "DEBUG: Each shard: " << shard_rows << "×" << shard_cols << std::endl;
-            std::cout << "DEBUG: Final matrix: " << total_rows << "×" << total_cols 
-                    << " (should be 10000×15000)" << std::endl;
-            
+            int total_cols = 0;
+            for (int w : col_dims) total_cols += w;
+
+            std::cout << "DEBUG: Final matrix " << total_rows << " × " << total_cols << std::endl;
+
             // ============================================================
             // STEP 5: ALLOCATE OUTPUT MATRIX
             // ============================================================
@@ -1580,62 +1800,69 @@ class llama_zmq_server
             result.dims[1] = 1;
             result.dims[2] = total_rows;
             result.dims[3] = total_cols;
-            
-            result.data = std::make_unique<float[]>(
-                static_cast<size_t>(total_rows) * total_cols
-            );
-            
-            std::fill_n(result.data.get(), total_rows * total_cols, 0.0f);
-            
+
+            size_t total_elements = static_cast<size_t>(total_rows) * total_cols;
+            result.data = std::make_unique<float[]>(total_elements);
+            std::fill_n(result.data.get(), total_elements, 0.0f);
+
             // ============================================================
-            // STEP 6: ASSEMBLE THE GRID
+            // STEP 6: COLUMN START OFFSETS
             // ============================================================
-            // Each column in the grid corresponds to one B shard
-            // Shards 0,1,2: Row 0 (A1 × B0.T, A1 × B1.T, A1 × B2.T)
-            // Shards 3,4,5: Row 1 (A2 × B0.T, A2 × B1.T, A2 × B2.T)
-            
-            for (int i = 0; i < total_shards; i++) {
-                auto& [shard_num, shard_data, dims] = sorted_shards[i];
-                
-                int shard_rows = dims[2];
-                int shard_cols = dims[3];
-                
-                // Calculate grid position
-                int grid_row = i / grid_cols;      // 0 or 1
-                int grid_col = i % grid_cols;      // 0, 1, or 2
-                
-                // Calculate destination position
-                int dest_row_start = grid_row * shard_rows;      // 0 or 5000
-                int dest_col_start = grid_col * shard_cols;      // 0, 5000, or 10000
-                
-                // Get shard data
-                const uint8_t* p = shard_data->data();
-                p += sizeof(int) + 4 * sizeof(int);
-                const float* shard_float_data = reinterpret_cast<const float*>(p);
-                
-                std::cout << "DEBUG: Placing shard " << shard_num 
-                        << " (" << shard_rows << "×" << shard_cols << ")"
-                        << " at grid[" << grid_row << "][" << grid_col << "]"
-                        << " → dest[" << dest_row_start << ":" << dest_row_start + shard_rows
-                        << ", " << dest_col_start << ":" << dest_col_start + shard_cols << "]" << std::endl;
-                
-                // Copy data
-                for (int r = 0; r < shard_rows; r++) {
-                    int dest_row = dest_row_start + r;
+            std::vector<int> col_starts(grid_cols + 1, 0);
+            for (int i = 0; i < grid_cols; ++i) {
+                col_starts[i + 1] = col_starts[i] + col_dims[i];
+            }
+
+            // ============================================================
+            // STEP 7: PLACE SHARDS USING SHARD NUMBER (NOT LOOP INDEX)
+            // ============================================================
+            for (const auto& [shard_num, shard_bytes] : sorted_shards) {
+
+                int row_idx = shard_num / grid_cols;   // A shard (0 or 1)
+                int col_idx = shard_num % grid_cols;   // B shard
+
+                const uint8_t* p2 = shard_bytes->data();
+                p2 += sizeof(int); // ndim
+
+                std::vector<int> dims(ndim);
+                for (int i = 0; i < ndim; ++i) {
+                    dims[i] = *reinterpret_cast<const int*>(p2);
+                    p2 += sizeof(int);
+                }
+
+                int shard_rows_i = dims[2];
+                int shard_cols_i = dims[3];
+                const float* shard_data = reinterpret_cast<const float*>(p2);
+
+                int dest_row = row_idx * shard_rows;
+                int dest_col = col_starts[col_idx];
+
+                std::cout << "DEBUG: Placing shard " << shard_num
+                        << " → grid[" << row_idx << "][" << col_idx << "] "
+                        << "(" << shard_rows_i << "×" << shard_cols_i << ")\n";
+
+                for (int r = 0; r < shard_rows_i; ++r) {
                     std::memcpy(
-                        result.data.get() + dest_row * total_cols + dest_col_start,
-                        shard_float_data + r * shard_cols,
-                        sizeof(float) * shard_cols
+                        result.data.get() + (dest_row + r) * total_cols + dest_col,
+                        shard_data + r * shard_cols_i,
+                        sizeof(float) * shard_cols_i
                     );
                 }
             }
-            
-            std::cout << "DEBUG: Grid assembly complete: " 
-                    << total_rows << "×" << total_cols << std::endl;
-            
+
+            std::cout << "DEBUG: System 2 grid assembly complete" << std::endl;
             return result;
         }
 
+        MatrixResult combine_hierarchical_results(
+            const combined_matrix_shards& combined,
+            const std::vector<int>& split_order
+        ) 
+        {
+            MatrixResult result;
+
+            return result;
+        }
 
         bool matrix_operation(
             const std::string& backend_type,
@@ -1645,15 +1872,35 @@ class llama_zmq_server
             bool transposeB,
             bool use_gpu,
             int gpu_id,
-            int send_back,
+            const std::string& send_back_str,  // CHANGED: Now a string for hierarchical info
             const std::string& operation_type,
             int dim,
-            int shard_index_override
+            int shard_index_override,
+            const std::vector<int>& hierarchical_split_order  // NEW parameter
         )
         {
             bool op_success = false;
             try {
                 std::cout << "🚀 UNIFIED MATRIX OPERATION - Backend: " << backend_type << std::endl;
+
+                // ============================================================
+                // PARSE SEND_BACK INFORMATION
+                // ============================================================
+                int total_shards = 0;
+                
+                // Check if format contains '/' (new hierarchical format: "4/011" or "-4/011")
+                size_t slash_pos = send_back_str.find('/');
+                if (slash_pos != std::string::npos) {
+                    // New format: "4/011" or "-4/011"
+                    std::string total_shards_str = send_back_str.substr(0, slash_pos);
+                    total_shards = std::stoi(total_shards_str);
+                } else {
+                    // Old format: just number
+                    total_shards = std::stoi(send_back_str);
+                }
+                
+                std::cout << "DEBUG: Parsed total_shards=" << total_shards 
+                        << ", hierarchical_split_order size=" << hierarchical_split_order.size() << std::endl;
 
                 // Common setup (all backends)
                 std::string output_filename = get_matrix_output_filename(matrix_pathA, matrix_pathB);
@@ -1743,9 +1990,11 @@ class llama_zmq_server
                             std::cerr << "❌ Failed to save result" << std::endl;
                             op_success = false;
                         } else {
-                            if (send_back > 0 || send_back < 0)
+                            if (total_shards != 0)  // Changed: check total_shards instead of send_back
                             {
-                                send_back_file(output_path, output_filename, result, send_back, "llama");
+                                // Pass hierarchical_split_order to send_back_file
+                                send_back_file(output_path, output_filename, result, total_shards, 
+                                            hierarchical_split_order, "llama");
                             }
                             
                             op_success = true;
@@ -1838,8 +2087,12 @@ class llama_zmq_server
                         std::cerr << "❌ Failed to save result" << std::endl;
                         op_success = false;
                     } else {
-                        if (send_back > 0)
-                            send_back_file(output_path, output_filename, result, send_back, "torch");
+                        if (total_shards != 0)  // Changed: check total_shards instead of send_back
+                        {
+                            // Pass hierarchical_split_order to send_back_file
+                            send_back_file(output_path, output_filename, result, total_shards, 
+                                        hierarchical_split_order, "torch");
+                        }
                         op_success = true;
                     }
                 }
@@ -1886,9 +2139,9 @@ class llama_zmq_server
                     cl::CommandQueue queue(context, device);
                     
                     cl::Buffer bufA(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 
-                                   sizeof(float) * tensorA.numel(), A_ptr);
+                                sizeof(float) * tensorA.numel(), A_ptr);
                     cl::Buffer bufB(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 
-                                   sizeof(float) * tensorB.numel(), B_ptr);
+                                sizeof(float) * tensorB.numel(), B_ptr);
                     cl::Buffer bufC(context, CL_MEM_WRITE_ONLY, sizeof(float) * M * N);
                     
                     cl::Program program(context, openCL_kernel_matmul);
@@ -1919,8 +2172,12 @@ class llama_zmq_server
                         std::cerr << "❌ Failed to save result" << std::endl;
                         op_success = false;
                     } else {
-                        if (send_back > 0)
-                            send_back_file(output_path, output_filename, result, send_back, "opencl");
+                        if (total_shards != 0)  // Changed: check total_shards instead of send_back
+                        {
+                            // Pass hierarchical_split_order to send_back_file
+                            send_back_file(output_path, output_filename, result, total_shards, 
+                                        hierarchical_split_order, "opencl");
+                        }
                         op_success = true;
                     }
                 }
@@ -1935,7 +2192,13 @@ class llama_zmq_server
                 op_success = false;
             }
 
-            try { send_ack("ACK_matrixOp_complete"); } catch (...) {}
+            try 
+            {
+                
+                send_ack("ACK_matrixOp_complete"); 
+            } 
+            catch (...) 
+            {}
             return op_success;
         }
 
@@ -2013,7 +2276,6 @@ class llama_zmq_server
 
             return output_filename;
         }
-
 };
 
 int main()
