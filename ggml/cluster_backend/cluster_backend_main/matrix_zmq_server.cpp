@@ -642,12 +642,41 @@ class llama_zmq_server
                         {
                             // Security note: system() calls should be validated in production
                             std::cout << "   • Executing: " << command << std::endl;
-                            
-                            int result = system(command.c_str());
+                            int result = system(command.c_str()); 
+
+                            // Check if this is a conda/python command and send ACK
+                            bool is_conda_python_command = false;
+                            if (command.find("conda run") != std::string::npos || 
+                                command.find("python") != std::string::npos ||
+                                command.find("cluster_matrix_v1.py") != std::string::npos) {
+                                is_conda_python_command = true;
+                                std::cout << "   ⏳ Detected conda/python command, will send ACK" << std::endl;
+                            }
                             if (result == 0) {
                                 std::cout << "     ✅ Command completed successfully" << std::endl;
+                                // Send ACK for conda/python commands
+                                if (is_conda_python_command) {
+                                    try {
+                                        std::string ack_msg = "MATRIX_SPLIT_COMPLETE_";
+                                        send_ack(ack_msg);
+                                        std::cout << "     📤 Sent ACK for matrix split completion" << std::endl;
+                                    } catch (const std::exception& e) {
+                                        std::cerr << "     ❌ Failed to send ACK: " << e.what() << std::endl;
+                                    }
+                                }
                             } else {
                                 std::cout << "     ⚠️ Command returned exit code: " << result << std::endl;
+                                
+                                // Optionally send error ACK for conda/python commands
+                                if (is_conda_python_command) {
+                                    try {
+                                        std::string error_ack = "MATRIX_SPLIT_ERROR_";
+                                        send_ack(error_ack);
+                                        std::cout << "     📤 Sent error ACK" << std::endl;
+                                    } catch (const std::exception& e) {
+                                        std::cerr << "     ❌ Failed to send error ACK: " << e.what() << std::endl;
+                                    }
+                                }
                             }
                         }
                     }
