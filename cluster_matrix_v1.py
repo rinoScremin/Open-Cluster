@@ -70,57 +70,6 @@ def print_matrix_sections(matrix, name, n_elements=100):
     print(f"\n{name} — first {n_elements} elements of second half:")
     print(flat[mid:mid + n_elements])
 
-def convert_bin_matrix_to_pt(filename, force_2d=True):  
-    """  
-    Load a binary matrix saved in the format:  
-    [num_dims(int), dim1(int), dim2(int), ..., data(float32)]  
-      
-    Args:  
-        filename: path to binary file  
-        force_2d: if True, flatten batch*depth*rows into 2D (rows x cols)  
-          
-    Returns:  
-        PyTorch tensor  
-    """  
-    with open(filename, 'rb') as f:  
-        # Read number of dimensions  
-        ndim_bytes = f.read(4)  
-        if len(ndim_bytes) < 4:  
-            raise ValueError("File too short to read ndim")  
-        ndim = struct.unpack('i', ndim_bytes)[0]  
-  
-        # Read dimensions  
-        dims_bytes = f.read(ndim * 4)  
-        if len(dims_bytes) < ndim * 4:  
-            raise ValueError("File too short to read dimensions")  
-        dims = list(struct.unpack('i' * ndim, dims_bytes))  
-  
-        # Read data  
-        num_elements = np.prod(dims)  
-        data_bytes = f.read(num_elements * 4)  
-        if len(data_bytes) < num_elements * 4:  
-            raise ValueError(f"File too short to read {num_elements} floats")  
-        data_np = np.frombuffer(data_bytes, dtype=np.float32).copy()  # ensure writable  
-  
-    # Reshape  
-    tensor_np = data_np.reshape(dims)  
-  
-    # Optionally flatten batch*depth*rows -> 2D for LLAMA-like 4D tensors  
-    if force_2d and ndim == 4:  
-        batch, depth, rows, cols = dims  
-        tensor_np = tensor_np.reshape(batch * depth * rows, cols)  
-  
-    # Convert to PyTorch tensor  
-    tensor_pt = torch.from_numpy(tensor_np).float()  
-  
-    # Info  
-    print(f"✅ Loaded {filename}")  
-    print(f"  Original dims: {dims}")  
-    print(f"  Result tensor shape: {tensor_pt.shape}, size: {tensor_pt.numel()*4:,} bytes")  
-    print(f"  Data range: [{tensor_pt.min().item():.6f}, {tensor_pt.max().item():.6f}]")  
-  
-    return tensor_pt
-
 class cluster_matrix:
     def __init__(self, matrix_file_path,
                 node_IP_list, CPU_GPU_select_list, node_percentages=[], back_end_select_list=[],
@@ -1177,6 +1126,57 @@ class cluster_matrix:
         print(f"  Save completed: {filename}")
         return file_size
 
+    def convert_bin_matrix_to_pt(self, filename, force_2d=True):  
+        """  
+        Load a binary matrix saved in the format:  
+        [num_dims(int), dim1(int), dim2(int), ..., data(float32)]  
+        
+        Args:  
+            filename: path to binary file  
+            force_2d: if True, flatten batch*depth*rows into 2D (rows x cols)  
+            
+        Returns:  
+            PyTorch tensor  
+        """  
+        with open(filename, 'rb') as f:  
+            # Read number of dimensions  
+            ndim_bytes = f.read(4)  
+            if len(ndim_bytes) < 4:  
+                raise ValueError("File too short to read ndim")  
+            ndim = struct.unpack('i', ndim_bytes)[0]  
+    
+            # Read dimensions  
+            dims_bytes = f.read(ndim * 4)  
+            if len(dims_bytes) < ndim * 4:  
+                raise ValueError("File too short to read dimensions")  
+            dims = list(struct.unpack('i' * ndim, dims_bytes))  
+    
+            # Read data  
+            num_elements = np.prod(dims)  
+            data_bytes = f.read(num_elements * 4)  
+            if len(data_bytes) < num_elements * 4:  
+                raise ValueError(f"File too short to read {num_elements} floats")  
+            data_np = np.frombuffer(data_bytes, dtype=np.float32).copy()  # ensure writable  
+    
+        # Reshape  
+        tensor_np = data_np.reshape(dims)  
+    
+        # Optionally flatten batch*depth*rows -> 2D for LLAMA-like 4D tensors  
+        if force_2d and ndim == 4:  
+            batch, depth, rows, cols = dims  
+            tensor_np = tensor_np.reshape(batch * depth * rows, cols)  
+    
+        # Convert to PyTorch tensor  
+        tensor_pt = torch.from_numpy(tensor_np).float()  
+    
+        # Info  
+        print(f"✅ Loaded {filename}")  
+        print(f"  Original dims: {dims}")  
+        print(f"  Result tensor shape: {tensor_pt.shape}, size: {tensor_pt.numel()*4:,} bytes")  
+        print(f"  Data range: [{tensor_pt.min().item():.6f}, {tensor_pt.max().item():.6f}]")  
+    
+        return tensor_pt
+
     def load_cluster_matrix(self):
         """
         Load a full matrix (not split) from disk and distribute to all nodes.
@@ -1589,30 +1589,32 @@ class cluster_matrix:
             base_result_name = f"{cluster_matrixB.matrix_name}x{self.matrix_name}"
             print(f"\n📊 Result base: {base_result_name} (send_back={send_back_result})")
 
-        if send_back_result:
-            path = self.local_RAM_folder + base_result_name + '_combined.bin'
-            if os.path.exists(path):
-                time.sleep(1)
-                combined_matrix = convert_bin_matrix_to_pt(path)
-                time.sleep(1)
-                os.remove(path)
-            else:
-                self.wait_for_acks(1, "ACK_combined_matrix_saved")
-                combined_matrix = convert_bin_matrix_to_pt(path)
-                os.remove(path)  # Clean up any existing combined file
-            return combined_matrix
-        else:
-            result_cluster_matrix = cluster_matrix(
-                base_result_name,
-                self.node_IP_list,
-                self.CPU_GPU_select_list,
-                self.node_percentages,
-                self.back_end_select_list,
-                True
-            )
+        if send_back_result:  
+            path = self.local_RAM_folder + base_result_name + '_combined.bin'  
+            if os.path.exists(path):  
+                time.sleep(0.5)  
+                combined_matrix = self.convert_bin_matrix_to_pt(path)  
+                time.sleep(0.5)  
+                os.remove(path)  
+            else:  
+                self.wait_for_acks(1, "ACK_combined_matrix_saved")  
+                # Add this check - file might not exist yet  
+                if not os.path.exists(path):  
+                    time.sleep(0.5)  # Brief wait for file system  
+                combined_matrix = self.convert_bin_matrix_to_pt(path)  
+                os.remove(path)  # Clean up any existing combined file  
+            return combined_matrix  
+        else:  
+            result_cluster_matrix = cluster_matrix(  
+                base_result_name,  
+                self.node_IP_list,  
+                self.CPU_GPU_select_list,  
+                self.node_percentages,  
+                self.back_end_select_list,  
+                True  
+            )  
             return result_cluster_matrix
         return False  # Return the distributed result instance
-
 
 
 
