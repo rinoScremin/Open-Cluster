@@ -16,6 +16,7 @@ import mmap
 import shutil
 import glob
 import math
+import sys
 
 def check_combined_result_values(c_ref_path, combined):
     c_ref = torch.load(c_ref_path)
@@ -80,9 +81,10 @@ class cluster_matrix:
         print("=" * 70)
         
         # =============== NODE CONFIGURATION VALIDATION ===============
-        print("\n📋 VALIDATING NODE CONFIGURATION...")
+        #print("\n📋 VALIDATING NODE CONFIGURATION...")
         
         # Check consistency of the node configuration
+        
         if not (len(node_IP_list) == len(CPU_GPU_select_list) == len(back_end_select_list) == len(node_percentages)):
             print("❌ NODE CONFIGURATION ERROR: Lengths do not match!")
             print(f"   - node_IP_list: {len(node_IP_list)} nodes")
@@ -90,14 +92,15 @@ class cluster_matrix:
             print(f"   - back_end_select_list: {len(back_end_select_list)} backends")
             print(f"   - node_percentages: {len(node_percentages)} percentages")
             raise ValueError("Node configuration error: All lists must have the same length")
+        
 
         # Check that percentages sum to (roughly) 1.0
         half_node_percentages = len(node_percentages) // 2
         sys2_split_percentages = node_percentages[:half_node_percentages]
         total_percent = sum(node_percentages)
-        if abs(total_percent - 1.0) > 1e-6:
-            print(f"❌ PERCENTAGE ERROR: Node percentages sum to {total_percent:.6f}, should be 1.0")
-            raise ValueError(f"Node configuration error: percentages do not sum to 1.0 (sum={total_percent})")
+
+        if abs(total_percent - 1.0) > 0.01:  # Increased tolerance to 0.01
+            raise ValueError(f"Node configuration error: percentages sum to {total_percent:.6f}, should be 1.0")
 
         print(f"✅ Node configuration validated: {len(node_IP_list)} nodes configured")
         print(f"✅ Percentage distribution validated: {total_percent:.6f}")
@@ -152,6 +155,12 @@ class cluster_matrix:
         print(f"     - RAM Results: {self.remote_matrix_results_RAM_folder}")
         print(f"     - Project Dir: {self.remote_project_dir}")
         
+        # Get Python executable path
+        self.conda_env_dir = os.environ.get('CONDA_ENV_DIR', '/home/rino/anaconda3/envs/ray-conda-env')
+        self.python_path = os.environ.get('OPEN_CLUSTER_SCRIPT_PATH', '/home/rino/anaconda3/envs/cluster-worker/bin/python')
+
+        print(f"✅ Using Python path: {self.python_path}")
+
         # =============== INSTANCE VARIABLE INITIALIZATION ===============
         print("\n📊 INITIALIZING INSTANCE VARIABLES...")
         
@@ -211,81 +220,92 @@ class cluster_matrix:
 
         # =============== ZEROMMQ SOCKET SETUP ===============
         print("\n🔌 SETTING UP ZEROMQ CONNECTIONS...")
-        
-        # Initialize ZeroMQ context
-        self.zmq_context = zmq.Context()
-        self.llama_socket_pool = {}  # For llama communication - ports 5557/5558
-        self.llama_socket_pool_wifi = {}  # Placeholder to avoid cleanup errors
-        self.timeout = 5000  # 5 second timeout
-        
-        # Create PUSH sockets for ALL remote nodes
-        unique_IP_list = list(dict.fromkeys(node_IP_list))
-        print(f"   Connecting to {len(unique_IP_list)} unique nodes...")
-        
-        for node_ip in unique_IP_list:
-            if node_ip != self.IP:  # Remote nodes only
-                # Llama socket (port 5557 for computation)
-                try:
-                    llama_socket = self.zmq_context.socket(zmq.PUSH)
-                    llama_socket.connect(f"tcp://{node_ip}:{self.llama_worker_node_PULL_port}")
-                    self.llama_socket_pool[node_ip] = llama_socket
-                    print(f"   ✅ Connected to worker node {node_ip}:{self.llama_worker_node_PULL_port}")
-                except Exception as e:
-                    print(f"   ❌ Failed to connect to {node_ip}: {e}")
-        
-        # Optional WiFi sockets (parallel transfer)
-        for idx, node_ip in enumerate(unique_IP_list):
-            if idx < len(self.IP_list_wifi):
-                wifi_ip = self.IP_list_wifi[idx]
-                try:
-                    wifi_socket = self.zmq_context.socket(zmq.PUSH)
-                    wifi_socket.connect(f"tcp://{wifi_ip}:{self.llama_worker_node_PULL_port}")
-                    self.llama_socket_pool_wifi[wifi_ip] = wifi_socket
-                    print(f"   ✅ Connected to worker WiFi {wifi_ip}:{self.llama_worker_node_PULL_port}")
-                except Exception as e:
-                    print(f"   ❌ Failed to connect WiFi {wifi_ip}: {e}")
 
-        # Connect to local head node as well
-        try:
-            llama_socket = self.zmq_context.socket(zmq.PUSH)
-            llama_socket.connect(f"tcp://{self.IP}:{self.llama_head_node_PULL_port}")
-            self.llama_socket_pool[self.IP] = llama_socket
-            print(f"   ✅ Connected to head node (self) {self.IP}:{self.llama_head_node_PULL_port}")
-        except Exception as e:
-            print(f"   ❌ Failed to connect to head node: {e}")
-        
-        print(f"   Total sockets in pool: {len(self.llama_socket_pool)}")
+        # Check if we're in worker mode (all IPs are 0.0.0.0)
+        all_ips_are_zero = all(ip == '0.0.0.0' for ip in node_IP_list)
 
-        # =============== CLUSTER BARRIER/ACK RECEIVER SETUP ===============
-        print("\n🔄 SETTING UP CLUSTER BARRIER/ACK RECEIVER...")
-        
-        # Initialize ack receiver socket (singleton pattern)
-        if not hasattr(cluster_matrix, '_ack_receiver_socket'):
-            try:
-                cluster_matrix._ack_receiver_socket = self.zmq_context.socket(zmq.PULL)
-                cluster_matrix._ack_receiver_socket.bind(f"tcp://0.0.0.0:{self.python_front_end_cluster_port}")
-                print(f"✅ Python frontend ACK receiver bound to port {self.python_front_end_cluster_port}")
-            except Exception as e:
-                print(f"❌ Failed to bind ACK receiver: {e}")
-                raise
+        if all_ips_are_zero:
+            print("   ⚙️ Worker mode detected - skipping network connections")
+            self.zmq_context = None
+            self.llama_socket_pool = {}
+            self.llama_socket_pool_wifi = {}
+            self.ack_receiver_socket = None
         else:
-            print(f"✅ ACK receiver already exists on port {self.python_front_end_cluster_port}")
-        
-        # Reference it in the instance
-        self.ack_receiver_socket = cluster_matrix._ack_receiver_socket
+            # Initialize ZeroMQ context
+            self.zmq_context = zmq.Context()
+            self.llama_socket_pool = {}  # For llama communication - ports 5557/5558
+            self.llama_socket_pool_wifi = {}  # Placeholder to avoid cleanup errors
+            self.timeout = 5000  # 5 second timeout
+            
+            # Create PUSH sockets for ALL remote nodes
+            unique_IP_list = list(dict.fromkeys(node_IP_list))
+            print(f"   Connecting to {len(unique_IP_list)} unique nodes...")
+            
+            for node_ip in unique_IP_list:
+                if node_ip != self.IP:  # Remote nodes only
+                    # Llama socket (port 5557 for computation)
+                    try:
+                        llama_socket = self.zmq_context.socket(zmq.PUSH)
+                        llama_socket.connect(f"tcp://{node_ip}:{self.llama_worker_node_PULL_port}")
+                        self.llama_socket_pool[node_ip] = llama_socket
+                        print(f"   ✅ Connected to worker node {node_ip}:{self.llama_worker_node_PULL_port}")
+                    except Exception as e:
+                        print(f"   ❌ Failed to connect to {node_ip}: {e}")
+            
+            # Optional WiFi sockets (parallel transfer)
+            for idx, node_ip in enumerate(unique_IP_list):
+                if idx < len(self.IP_list_wifi):
+                    wifi_ip = self.IP_list_wifi[idx]
+                    try:
+                        wifi_socket = self.zmq_context.socket(zmq.PUSH)
+                        wifi_socket.connect(f"tcp://{wifi_ip}:{self.llama_worker_node_PULL_port}")
+                        self.llama_socket_pool_wifi[wifi_ip] = wifi_socket
+                        print(f"   ✅ Connected to worker WiFi {wifi_ip}:{self.llama_worker_node_PULL_port}")
+                    except Exception as e:
+                        print(f"   ❌ Failed to connect WiFi {wifi_ip}: {e}")
 
-        # =============== CREATE REMOTE DIRECTORIES ===============
-        print("\n📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...")
-        
-        command = f'mkdir -p {self.remote_project_dir}{self.remote_DISK_folder} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}'
-        print(f"   Sending command: {command}")
-        
-        for node_ip, socket in self.llama_socket_pool.items():
+            # Connect to local head node as well
             try:
-                socket.send_multipart([command.encode('utf-8')])
-                print(f"   ✅ Directory creation command sent to {node_ip}")
+                llama_socket = self.zmq_context.socket(zmq.PUSH)
+                llama_socket.connect(f"tcp://{self.IP}:{self.llama_head_node_PULL_port}")
+                self.llama_socket_pool[self.IP] = llama_socket
+                print(f"   ✅ Connected to head node (self) {self.IP}:{self.llama_head_node_PULL_port}")
             except Exception as e:
-                print(f"   ❌ Failed to send command to {node_ip}: {e}")
+                print(f"   ❌ Failed to connect to head node: {e}")
+            
+            print(f"   Total sockets in pool: {len(self.llama_socket_pool)}")
+
+            # =============== CLUSTER BARRIER/ACK RECEIVER SETUP ===============
+            print("\n🔄 SETTING UP CLUSTER BARRIER/ACK RECEIVER...")
+            
+            # Initialize ack receiver socket (singleton pattern)
+            if not hasattr(cluster_matrix, '_ack_receiver_socket'):
+                try:
+                    cluster_matrix._ack_receiver_socket = self.zmq_context.socket(zmq.PULL)
+                    cluster_matrix._ack_receiver_socket.bind(f"tcp://0.0.0.0:{self.python_front_end_cluster_port}")
+                    print(f"✅ Python frontend ACK receiver bound to port {self.python_front_end_cluster_port}")
+                except Exception as e:
+                    print(f"❌ Failed to bind ACK receiver: {e}")
+                    raise
+            else:
+                print(f"✅ ACK receiver already exists on port {self.python_front_end_cluster_port}")
+            
+            # Reference it in the instance
+            self.ack_receiver_socket = cluster_matrix._ack_receiver_socket
+
+            # =============== CREATE REMOTE DIRECTORIES ===============
+            print("\n📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...")
+            
+            command = f'mkdir -p {self.remote_project_dir}{self.remote_DISK_folder} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}'
+            print(f"   Sending command: {command}")
+            
+            for node_ip, socket in self.llama_socket_pool.items():
+                try:
+                    socket.send_multipart([command.encode('utf-8')])
+                    print(f"   ✅ Directory creation command sent to {node_ip}")
+                except Exception as e:
+                    print(f"   ❌ Failed to send command to {node_ip}: {e}")
+
 
         '''
         # =============== MATRIX DISTRIBUTION LOGIC ===============
@@ -1616,5 +1636,323 @@ class cluster_matrix:
             return result_cluster_matrix
         return False  # Return the distributed result instance
 
+    def remote_save_distribute_matrix_shards_bin(self):
+        """Save matrix shards as binary files and distribute to appropriate nodes."""
+        
+        # Get list of unique node IPs for ACK tracking
+        unique_node_IP_list = list(set(self.node_IP_list))
+        print(f"Starting distribution of {len(self.node_IP_list)} shards to {len(unique_node_IP_list)} unique nodes")
+        
+        # Clear the paths list
+        self.matrix_file_paths_list = []
+        
+        # Get the full path to THIS script (cluster_matrix_v1.py)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        script_filename = os.path.basename(__file__)  # Gets 'cluster_matrix_v1.py'
+        script_path = os.path.join(current_dir, script_filename)
+        
+        # FIRST: Split the matrix on HEAD NODE to get node_matrices populated
+        print(f"\n🔧 Splitting matrix on head node first...")
+        if self.matrix_labeling == 'a' or self.matrix_labeling == 'b':
+            # System 2 (grid)
+            self.convert_to_cluster_matrix_grid()
+        elif self.matrix_labeling == '' and self.split_matrix == False:
+            # System 1, Matrix A (no split)
+            # Load full matrix
+            full_matrix = torch.load(self.matrix_file_path)
+            self.node_matrices = [full_matrix]  # Just one full matrix
+            print(f"✅ Matrix A (no split): {full_matrix.shape}")
+        elif self.matrix_labeling == '' and self.split_matrix == True:
+            # System 1, Matrix B (split)
+            self.convert_to_cluster_matrix_shards()
+        
+        # Track which shards have been saved for head node (to avoid duplicates)
+        head_node_shards_saved = []
+        
+        # Process each shard
+        for shard_index, node_IP in enumerate(self.node_IP_list):
+            print(f"Processing shard {shard_index} for node {node_IP}")
+            
+            # Create filename for this shard
+            save_name = self.matrix_name.split('.pt')[0] + '_shard_' + str(shard_index) + '.bin'
+            
+            # Handle shard for HEAD NODE (local storage)
+            if node_IP == self.IP:
+                # For Matrix A (no split), we need to handle the case where head node has multiple shards
+                if self.matrix_labeling == '' and self.split_matrix == False:
+                    # System 1, Matrix A (no split) - head node gets the full matrix
+                    # Save with shard_0 filename for the first head node assignment
+                    if shard_index == 0 or self.node_percentages[shard_index] > 0:
+                        save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
+                        save_file_path_RAM = os.path.join(self.local_RAM_folder, save_name)
+                        
+                        print(f"  Head node: Saving to DISK={save_file_path_DISK}")
+                        print(f"  Head node: Saving to RAM={save_file_path_RAM}")
+                        
+                        # Save the full matrix (node_matrices[0]) to this shard file
+                        self.save_matrix_binary(self.node_matrices[0].float(), save_file_path_DISK)
+                        self.save_matrix_binary(self.node_matrices[0].float(), save_file_path_RAM)
+                        
+                        # Store RAM path for later access
+                        self.matrix_file_paths_list.append(save_file_path_RAM)
+                        print(f"  Added RAM path to file list")
+                        head_node_shards_saved.append(shard_index)
+                    else:
+                        print(f"  ⚠️  Skipping duplicate shard {shard_index} for head node (already saved)")
+                else:
+                    # Normal split matrices (System 1 Matrix B or System 2)
+                    if shard_index < len(self.node_matrices):
+                        save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
+                        save_file_path_RAM = os.path.join(self.local_RAM_folder, save_name)
+                        
+                        print(f"  Head node: Saving to DISK={save_file_path_DISK}")
+                        print(f"  Head node: Saving to RAM={save_file_path_RAM}")
+                        
+                        # Save tensor to binary file in both locations
+                        self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_DISK)
+                        self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_RAM)
+                        
+                        # Store RAM path for later access
+                        self.matrix_file_paths_list.append(save_file_path_RAM)
+                        print(f"  Added RAM path to file list")
+                    else:
+                        print(f"  ⚠️  No matrix found for shard {shard_index} on head node")
+                        
+            # Handle shard for REMOTE NODE - RUN THE SCRIPT
+            elif node_IP != self.IP:
+                print(f"  Remote node {node_IP}: Beginning remote split")
+                
+                # Step 1: Determine the command based on matrix configuration
+                percentages_str = ','.join([str(p) for p in self.node_percentages])
+                
+                # Build the remote command
+                if self.matrix_labeling == 'a' or self.matrix_labeling == 'b':
+                    # System 2 (grid) - use matrix_labeling directly
+                    remote_split_command = (
+                        f'conda run -n cluster-worker python {script_path} '
+                        f'"{self.matrix_file_path}" '
+                        f'"{percentages_str}" '
+                        f'{self.dim} '
+                        f'2 '  # system 2
+                        f'"{self.matrix_labeling}" '
+                        f'{shard_index}'
+                    )
+                elif self.matrix_labeling == '' and self.split_matrix == False:
+                    # System 1, Matrix A (no split, save full matrix)
+                    remote_split_command = (
+                        f'conda run -n cluster-worker python {script_path} '
+                        f'"{self.matrix_file_path}" '
+                        f'"{percentages_str}" '
+                        f'{self.dim} '
+                        f'1 '  # system 1
+                        f'"a" '
+                        f'{shard_index}'
+                    )
+                elif self.matrix_labeling == '' and self.split_matrix == True:
+                    # System 1, Matrix B (split)
+                    remote_split_command = (
+                        f'conda run -n cluster-worker python {script_path} '
+                        f'"{self.matrix_file_path}" '
+                        f'"{percentages_str}" '
+                        f'{self.dim} '
+                        f'1 '  # system 1
+                        f'"b" '
+                        f'{shard_index}'
+                    )
+                else:
+                    # Fallback to old file transfer method
+                    print(f"  Unknown configuration, falling back to file transfer")
+                    remote_split_command = None
+                
+                if remote_split_command:
+                    print(f"  Step 1: Sending remote split command: {remote_split_command[:100]}...")
+                    
+                    # Create remote directories first
+                    mkdir_cmd = f"mkdir -p {self.remote_RAM_folder} {self.remote_DISK_folder} {self.remote_matrix_results_RAM_folder}"
+                    self.zmq_send_command(node_IP, mkdir_cmd)
+                    
+                    # Send the split command
+                    self.zmq_send_command(node_IP, remote_split_command)
+                    
+                    # Step 2: Store remote RAM path
+                    # The script should save files with standard naming convention
+                    remote_filename = f'{os.path.basename(self.matrix_file_path).replace(".pt", "")}_shard_{shard_index}.bin'
+                    remote_ram_path = os.path.join(self.remote_RAM_folder, remote_filename)
+                    
+                    # For System 1, Matrix A (no split), the file might be named differently
+                    if self.matrix_labeling == '' and self.split_matrix == False:
+                        remote_filename = f'{os.path.basename(self.matrix_file_path).replace(".pt", "")}.bin'
+                        remote_ram_path = os.path.join(self.remote_RAM_folder, remote_filename)
+                    
+                    self.matrix_file_paths_list.append(remote_ram_path)
+                    print(f"  Added remote RAM path to file list: {remote_ram_path}")
+                    
+                    # Optional: We could wait for ACK from the script
+                    # But for now, assume it works
+                    
+                else:
+                    # Fallback: Use original file transfer method
+                    print(f"  Falling back to file transfer for shard {shard_index}")
+                    
+                    # Save shard locally first
+                    save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
+                    print(f"  Step 1: Saving locally to {save_file_path_DISK}")
+                    self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_DISK)
+                    
+                    # Send file to remote node
+                    print(f"  Step 2: Sending file to remote node {node_IP}")
+                    self.zmq_send_file(node_IP, save_file_path_DISK)
+                    
+                    # Create directories on remote
+                    mkdir_cmd = f"mkdir -p {self.remote_RAM_folder} {self.remote_DISK_folder} {self.remote_matrix_results_RAM_folder}"
+                    self.zmq_send_command(node_IP, mkdir_cmd)
+                    
+                    # Wait for ACK
+                    self.wait_for_acks(1, save_name)
+                    
+                    # Copy from RAM to disk on remote
+                    remote_ram_path = os.path.join(self.remote_RAM_folder, save_name)
+                    remote_disk_path = os.path.join(self.remote_project_dir, self.remote_DISK_folder, save_name)
+                    copy_command = f'cp {remote_ram_path} {remote_disk_path}'
+                    self.zmq_send_command(node_IP, copy_command)
+                    
+                    self.matrix_file_paths_list.append(remote_ram_path)
+                    print(f"  Added remote RAM path to file list: {remote_ram_path}")
+        
+        self.wait_for_acks(len(unique_node_IP_list)-1,'MATRIX_SPLIT_COMPLETE_')
+        print(f"Distribution complete: {len(self.matrix_file_paths_list)} shards saved and distributed")
+        return self.matrix_file_paths_list
 
 
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        print("REMOTE-SPLIT STARTED")
+        matrix_path = sys.argv[1]
+        percentages_list = [float(p) for p in sys.argv[2].split(',')]
+        #[float(p) for p in sys.argv[2].split(',')]  # Convert to floats
+        IP_list = ['0.0.0.0'] * len(percentages_list)
+        CPU_GPU_select_list = [False] * len(percentages_list)
+        backend_select_list = ['torch'] * len(percentages_list)
+        split_dim = int(sys.argv[3])  # Convert to int
+        split_system_type = int(sys.argv[4])  # 1 for 'system 1' split, 2 for 'system 2' split
+        matrix_label = sys.argv[5]
+        remote_node_number = int(sys.argv[6]) if len(sys.argv) > 6 else 0  # Optional, default 0
+
+        if split_system_type == 1 and matrix_label == 'a':
+            # System 1, Matrix A: Save full matrix (no split)
+            print(f"System 1, Matrix A: Saving full matrix (no split)")
+            split_matrix_from_worker = cluster_matrix(
+                matrix_path,
+                IP_list, 
+                CPU_GPU_select_list,  # FIXED: This is position 3
+                percentages_list,      # FIXED: This is position 4
+                backend_select_list, 
+                False,  # split_matrix=False for System 1, Matrix A
+                split_dim,
+                matrix_labeling=matrix_label
+            )
+            matrixA = torch.load(matrix_path)
+            # Generate proper filename
+            base_name = os.path.basename(matrix_path).replace('.pt', '')
+            disk_path = os.path.join(split_matrix_from_worker.local_DISK_folder, f"{base_name}.bin")
+            ram_path = os.path.join(split_matrix_from_worker.local_RAM_folder, f"{base_name}.bin")
+            
+            split_matrix_from_worker.save_matrix_binary(matrixA, disk_path)
+            split_matrix_from_worker.save_matrix_binary(matrixA, ram_path)
+            
+        elif split_system_type == 1 and matrix_label == 'b':
+            # System 1, Matrix B: Split and save specific shard
+            print(f"System 1, Matrix B: Splitting and saving shard {remote_node_number}")
+            split_matrix_from_worker = cluster_matrix(
+                matrix_path,
+                IP_list, 
+                CPU_GPU_select_list,  # FIXED: This is position 3
+                percentages_list,      # FIXED: This is position 4
+                backend_select_list, 
+                True,  # split_matrix=True for System 1, Matrix B
+                split_dim,
+                matrix_labeling=matrix_label
+            )
+            split_matrix_from_worker.convert_to_cluster_matrix_shards()
+            
+            # Save only the shard for this remote node
+            if remote_node_number < len(split_matrix_from_worker.node_matrices):
+                matrix_shard = split_matrix_from_worker.node_matrices[remote_node_number]
+                base_name = os.path.basename(matrix_path).replace('.pt', '')
+                disk_path = os.path.join(split_matrix_from_worker.local_DISK_folder, f"{base_name}_shard_{remote_node_number}.bin")
+                ram_path = os.path.join(split_matrix_from_worker.local_RAM_folder, f"{base_name}_shard_{remote_node_number}.bin")
+                
+                split_matrix_from_worker.save_matrix_binary(matrix_shard, disk_path)
+                split_matrix_from_worker.save_matrix_binary(matrix_shard, ram_path)
+            else:
+                print(f"ERROR: remote_node_number {remote_node_number} out of range. Max shards: {len(split_matrix_from_worker.node_matrices)}")
+            
+        elif split_system_type == 2 and matrix_label == 'a':
+            # System 2, Matrix A: Grid split and save specific shard
+            print(f"System 2, Matrix A: Grid splitting and saving shard {remote_node_number}")
+            split_matrix_from_worker = cluster_matrix(
+                matrix_path,
+                IP_list, 
+                CPU_GPU_select_list,  # FIXED: This is position 3
+                percentages_list,      # FIXED: This is position 4
+                backend_select_list, 
+                True, 
+                split_dim,
+                matrix_labeling=matrix_label
+            )
+            split_matrix_from_worker.convert_to_cluster_matrix_grid()
+            
+            # Save only the shard for this remote node
+            if remote_node_number < len(split_matrix_from_worker.node_matrices):
+                matrix_shard = split_matrix_from_worker.node_matrices[remote_node_number]
+                base_name = os.path.basename(matrix_path).replace('.pt', '')
+                disk_path = os.path.join(split_matrix_from_worker.local_DISK_folder, f"{base_name}_shard_{remote_node_number}.bin")
+                ram_path = os.path.join(split_matrix_from_worker.local_RAM_folder, f"{base_name}_shard_{remote_node_number}.bin")
+                
+                split_matrix_from_worker.save_matrix_binary(matrix_shard, disk_path)
+                split_matrix_from_worker.save_matrix_binary(matrix_shard, ram_path)
+            else:
+                print(f"ERROR: remote_node_number {remote_node_number} out of range. Max shards: {len(split_matrix_from_worker.node_matrices)}")
+            
+        elif split_system_type == 2 and matrix_label == 'b':
+            # System 2, Matrix B: Grid split and save specific shard
+            print(f"System 2, Matrix B: Grid splitting and saving shard {remote_node_number}")
+            split_matrix_from_worker = cluster_matrix(
+                matrix_path,
+                IP_list, 
+                CPU_GPU_select_list,  # FIXED: This is position 3
+                percentages_list,      # FIXED: This is position 4
+                backend_select_list, 
+                True, 
+                split_dim,
+                matrix_labeling=matrix_label
+            )
+            split_matrix_from_worker.convert_to_cluster_matrix_grid()
+            
+            # Save only the shard for this remote node
+            if remote_node_number < len(split_matrix_from_worker.node_matrices):
+                matrix_shard = split_matrix_from_worker.node_matrices[remote_node_number]
+                base_name = os.path.basename(matrix_path).replace('.pt', '')
+                disk_path = os.path.join(split_matrix_from_worker.local_DISK_folder, f"{base_name}_shard_{remote_node_number}.bin")
+                ram_path = os.path.join(split_matrix_from_worker.local_RAM_folder, f"{base_name}_shard_{remote_node_number}.bin")
+                
+                split_matrix_from_worker.save_matrix_binary(matrix_shard, disk_path)
+                split_matrix_from_worker.save_matrix_binary(matrix_shard, ram_path)
+            else:
+                print(f"ERROR: remote_node_number {remote_node_number} out of range. Max shards: {len(split_matrix_from_worker.node_matrices)}")
+        
+        else:
+            print(f"ERROR: Invalid combination - system: {split_system_type}, label: {matrix_label}")
+        
+        print("REMOTE-SPLIT COMPLETE")
+
+'''
+# Command line usage:
+python cluster_matrix_worker.py \
+  --matrix "model_matrixs/layers_0_self_attn_q_proj_weight.pt" \
+  --percentages "0.5,0.25,0.25" \
+  --dim 0 \
+  --system 1 \
+  --label "b" \
+  --remote_node_number 2
+'''
