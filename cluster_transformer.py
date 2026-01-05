@@ -1812,6 +1812,496 @@ class cluster_llm_transformer:
         # Return the final output
         return layer_output
 
+    def run_full_model_forward(self, text="fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!"):
+        """
+        Run the full transformer model through all layers
+        Combines cluster operations for heavy matrix math with torch for lightweight ops
+        """
+        print("=" * 70)
+        print("🚀 STARTING FULL MODEL FORWARD PASS")
+        print("=" * 70)
+
+        # Get model configuration
+        num_layers = getattr(self.config, 'num_hidden_layers', 32)
+        print(f"📊 Model: {self.config.model_type}")
+        print(f"📊 Total layers: {num_layers}")
+        print(f"📊 Attention type: {self.Model_Attention}")
+        print(f"📊 Heads: Q={self.attention_Heads[0]}, KV={self.attention_Heads[1]}")
+        print(f"📊 Hidden size: {self.Hidden_size}")
+        print(f"📊 Text: {text[:50]}...")
+        print("-" * 70)
+
+        # ============================================================
+        # STEP 1: INITIAL TOKENIZATION AND EMBEDDINGS
+        # ============================================================
+        print("\n🔤 STEP 1: TOKENIZATION AND EMBEDDINGS")
+        print("-" * 50)
+
+        # Tokenize text
+        self.tokenize_text(text)
+        print(f"   Token IDs: {self.tokens.input_ids[0].tolist()}")
+        print(f"   Sequence length: {self.tokens.input_ids.shape[1]}")
+
+        # Get and distribute initial embeddings
+        initial_embeddings = self.get_save_distribute_token_embeddings()
+        print(f"   Initial embeddings shape: {initial_embeddings.shape}")
+
+        # Store for residual connections
+        current_hidden_state = initial_embeddings
+        self.seq_len = current_hidden_state.shape[0]
+        print(f"   Sequence length after embedding: {self.seq_len}")
+
+        # ============================================================
+        # STEP 2: RUN THROUGH ALL TRANSFORMER LAYERS
+        # ============================================================
+        print(f"\n🏗️  STEP 2: PROCESSING {num_layers} TRANSFORMER LAYERS")
+        print("-" * 50)
+
+        layer_outputs = {}
+        total_cluster_time = 0
+        total_torch_time = 0
+
+        for layer_idx in range(num_layers):
+            print(f"\n{'='*50}")
+            print(f"🏗️  PROCESSING LAYER {layer_idx}/{num_layers-1}")
+            print(f"{'='*50}")
+
+            # ============================================================
+            # PRE-LAYER NORMALIZATION (RMSNorm)
+            # ============================================================
+            layer_start_time = time.time()
+
+            print(f"\n📏 PRE-LAYER {layer_idx}: INPUT NORMALIZATION")
+
+            # Check if layer normalization exists for this layer
+            input_layernorm_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_input_layernorm_weight.pt'
+            if os.path.exists(input_layernorm_path):
+                print(f"   Applying RMSNorm from {input_layernorm_path}")
+                # Load normalization weights
+                norm_weights = torch.load(input_layernorm_path)
+
+                # Apply RMSNorm: x * weight / sqrt(mean(x²) + eps)
+                eps = getattr(self.config, 'rms_norm_eps', 1e-5)
+                variance = current_hidden_state.pow(2).mean(-1, keepdim=True)
+                normalized = current_hidden_state * torch.rsqrt(variance + eps)
+                current_hidden_state = normalized * norm_weights
+
+                print(f"   Normalized shape: {current_hidden_state.shape}")
+            else:
+                print(f"   No input normalization found for layer {layer_idx}, skipping...")
+
+            # ============================================================
+            # ATTENTION MECHANISM
+            # ============================================================
+            print(f"\n🎯 LAYER {layer_idx}: ATTENTION MECHANISM")
+
+            # Update the cluster token embedding matrix with current hidden state
+            print("   Updating cluster matrix with current hidden state...")
+            torch.save(current_hidden_state, f'temp_layer{layer_idx}_hidden.pt')
+
+            # Create new cluster matrix with current hidden state
+            self.cluster_token_embedding_matrix = cluster_matrix(
+                matrix_file_path=f'temp_layer{layer_idx}_hidden.pt',
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+                matrix_labeling='a'
+            )
+            self.cluster_token_embedding_matrix.convert_to_cluster_matrix_grid()
+            self.cluster_token_embedding_matrix.save_distribute_matrixA_grid_bin()
+
+            # ============================================================
+            # LOAD ATTENTION WEIGHTS FOR THIS LAYER
+            # ============================================================
+            print(f"   Loading attention weights for layer {layer_idx}...")
+
+            attn_q_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_q_proj_weight.pt'
+            attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_k_proj_weight.pt'
+            attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt'
+            attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt'
+
+            # Verify all weight files exist
+            missing_files = []
+            for path in [attn_q_proj_path, attn_k_proj_path, attn_v_proj_path, attn_o_proj_path]:
+                if not os.path.exists(path):
+                    missing_files.append(path)
+
+            if missing_files:
+                print(f"❌ Missing weight files for layer {layer_idx}: {missing_files}")
+                print(f"   Skipping layer {layer_idx}...")
+                continue
+
+            # ============================================================
+            # Q, K, V PROJECTIONS WITH CLUSTER
+            # ============================================================
+            print(f"   Running Q/K/V projections with CLUSTER...")
+            cluster_start = time.time()
+
+            # Load and distribute Q projection
+            attn_q_proj = cluster_matrix(
+                matrix_file_path=attn_q_proj_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+                matrix_labeling='b'
+            )
+            attn_q_proj.convert_to_cluster_matrix_grid()
+            attn_q_proj.save_distribute_matrix_shards_bin()
+
+            # Q projection with CLUSTER
+            cluster_q_result = self.cluster_token_embedding_matrix.cluster_shard_operation(
+                attn_q_proj, False, True, True
+            )
+
+            # K projection with CLUSTER
+            attn_k_proj = cluster_matrix(
+                matrix_file_path=attn_k_proj_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+                matrix_labeling='b'
+            )
+            attn_k_proj.convert_to_cluster_matrix_grid()
+            attn_k_proj.save_distribute_matrix_shards_bin()
+
+            cluster_k_result = self.cluster_token_embedding_matrix.cluster_shard_operation(
+                attn_k_proj, False, True, True
+            )
+
+            # V projection with CLUSTER
+            attn_v_proj = cluster_matrix(
+                matrix_file_path=attn_v_proj_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+                matrix_labeling='b'
+            )
+            attn_v_proj.convert_to_cluster_matrix_grid()
+            attn_v_proj.save_distribute_matrix_shards_bin()
+
+            cluster_v_result = self.cluster_token_embedding_matrix.cluster_shard_operation(
+                attn_v_proj, False, True, True
+            )
+
+            cluster_time = time.time() - cluster_start
+            total_cluster_time += cluster_time
+
+            # ============================================================
+            # GQA ATTENTION WITH TORCH
+            # ============================================================
+            print(f"   Computing GQA attention with TORCH...")
+            torch_start = time.time()
+
+            # Reshape for GQA attention
+            seq_len = cluster_q_result.shape[0]
+
+            q_reshaped = cluster_q_result.view(seq_len, self.num_q_heads, self.head_dim)
+            k_reshaped = cluster_k_result.view(seq_len, self.num_kv_heads, self.head_dim)
+            v_reshaped = cluster_v_result.view(seq_len, self.num_kv_heads, self.head_dim)
+
+            # Repeat KV heads for GQA
+            if self.num_kv_heads < self.num_q_heads:
+                repeat_factor = self.num_q_heads // self.num_kv_heads
+                k_reshaped = k_reshaped.repeat_interleave(repeat_factor, dim=1)
+                v_reshaped = v_reshaped.repeat_interleave(repeat_factor, dim=1)
+
+            # Compute attention
+            q_transposed = q_reshaped.transpose(0, 1)
+            k_transposed = k_reshaped.transpose(0, 1)
+            v_transposed = v_reshaped.transpose(0, 1)
+
+            attention_scores = torch.matmul(q_transposed, k_transposed.transpose(-1, -2))
+            scaling_factor = 1.0 / (self.head_dim ** 0.5)
+            attention_scores = attention_scores * scaling_factor
+            attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
+            attention_output = torch.matmul(attention_probs, v_transposed)
+
+            # Reshape back
+            attention_output = attention_output.transpose(0, 1)
+            attention_output_flat = attention_output.reshape(seq_len, -1)
+
+            torch_time = time.time() - torch_start
+            total_torch_time += torch_time
+
+            # ============================================================
+            # OUTPUT PROJECTION WITH CLUSTER
+            # ============================================================
+            print(f"   Output projection with CLUSTER...")
+            cluster_start = time.time()
+
+            # Load output projection
+            attn_o_proj = cluster_matrix(
+                matrix_file_path=attn_o_proj_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+                matrix_labeling='b'
+            )
+            attn_o_proj.convert_to_cluster_matrix_grid()
+            attn_o_proj.save_distribute_matrix_shards_bin()
+
+            # Convert attention output to cluster matrix
+            torch.save(attention_output_flat, f'temp_layer{layer_idx}_attn_out.pt')
+            cluster_attention_output = cluster_matrix(
+                matrix_file_path=f'temp_layer{layer_idx}_attn_out.pt',
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+                matrix_labeling='a'
+            )
+            cluster_attention_output.convert_to_cluster_matrix_grid()
+            cluster_attention_output.save_distribute_matrixA_grid_bin()
+
+            # Apply output projection
+            attn_final_result = cluster_attention_output.cluster_shard_operation(
+                attn_o_proj, False, True, True
+            )
+
+            cluster_time += time.time() - cluster_start
+            total_cluster_time += cluster_time
+
+            # ============================================================
+            # ATTENTION RESIDUAL CONNECTION
+            # ============================================================
+            print(f"   Attention residual connection...")
+            torch_start = time.time()
+
+            # Add input to attention output (first residual)
+            attention_with_residual = current_hidden_state + attn_final_result
+
+            torch_time += time.time() - torch_start
+            total_torch_time += torch_time
+
+            # ============================================================
+            # POST-ATTENTION NORMALIZATION
+            # ============================================================
+            print(f"   Post-attention normalization...")
+
+            # Check if post-attention normalization exists
+            post_attention_layernorm_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_post_attention_layernorm_weight.pt'
+            if os.path.exists(post_attention_layernorm_path):
+                norm_weights = torch.load(post_attention_layernorm_path)
+                eps = getattr(self.config, 'rms_norm_eps', 1e-5)
+                variance = attention_with_residual.pow(2).mean(-1, keepdim=True)
+                normalized = attention_with_residual * torch.rsqrt(variance + eps)
+                attention_with_residual = normalized * norm_weights
+
+            # ============================================================
+            # MLP FORWARD PASS
+            # ============================================================
+            print(f"   MLP forward pass...")
+
+            # Load MLP weights
+            mlp_up_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt'
+            mlp_gate_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt'
+            mlp_down_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt'
+
+            if os.path.exists(mlp_up_proj_path) and os.path.exists(mlp_gate_proj_path) and os.path.exists(mlp_down_proj_path):
+                mlp_up_proj = torch.load(mlp_up_proj_path)
+                mlp_gate_proj = torch.load(mlp_gate_proj_path)
+                mlp_down_proj = torch.load(mlp_down_proj_path)
+
+                # MLP computation with TORCH
+                torch_start = time.time()
+
+                # Apply MLP: SiLU(gate(x)) * up(x) then down projection
+                gate_output = attention_with_residual @ mlp_gate_proj.T
+                gate_activated = torch.nn.functional.silu(gate_output)
+
+                up_output = attention_with_residual @ mlp_up_proj.T
+
+                mlp_intermediate = gate_activated * up_output
+                mlp_output = mlp_intermediate @ mlp_down_proj.T
+
+                torch_time += time.time() - torch_start
+                total_torch_time += torch_time
+            else:
+                print(f"   MLP weights not found for layer {layer_idx}, skipping MLP...")
+                mlp_output = torch.zeros_like(attention_with_residual)
+
+            # ============================================================
+            # FINAL RESIDUAL CONNECTION
+            # ============================================================
+            print(f"   Final residual connection...")
+            torch_start = time.time()
+
+            # Add MLP output (second residual)
+            current_hidden_state = attention_with_residual + mlp_output
+
+            torch_time += time.time() - torch_start
+            total_torch_time += torch_time
+
+            # Store layer output
+            layer_outputs[layer_idx] = {
+                'hidden_state': current_hidden_state.clone(),
+                'attention_output': attention_output_flat.clone(),
+                'mlp_output': mlp_output.clone() if 'mlp_output' in locals() else None
+            }
+
+            # ============================================================
+            # LAYER SUMMARY
+            # ============================================================
+            layer_end_time = time.time()
+            layer_total_time = layer_end_time - layer_start_time
+
+            print(f"\n📊 LAYER {layer_idx} SUMMARY:")
+            print(f"   • Hidden state shape: {current_hidden_state.shape}")
+            print(f"   • Attention output shape: {attention_output_flat.shape}")
+            print(f"   • Time: {layer_total_time:.2f}s")
+            print(f"   • Cluster ops: {cluster_time:.2f}s")
+            print(f"   • Torch ops: {torch_time:.2f}s")
+
+            # Clean up temporary files
+            temp_files = [
+                f'temp_layer{layer_idx}_hidden.pt',
+                f'temp_layer{layer_idx}_attn_out.pt'
+            ]
+            for temp_file in temp_files:
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
+
+        # ============================================================
+        # STEP 3: FINAL NORMALIZATION
+        # ============================================================
+        print(f"\n📏 STEP 3: FINAL NORMALIZATION")
+        print("-" * 50)
+
+        # Apply final layer normalization
+        final_norm_path = f'{self.model_matrix_fold_dir}norm_weight.pt'
+        if os.path.exists(final_norm_path):
+            print(f"   Applying final normalization...")
+            norm_weights = torch.load(final_norm_path)
+            eps = getattr(self.config, 'rms_norm_eps', 1e-5)
+            variance = current_hidden_state.pow(2).mean(-1, keepdim=True)
+            normalized = current_hidden_state * torch.rsqrt(variance + eps)
+            current_hidden_state = normalized * norm_weights
+            print(f"   Final normalized shape: {current_hidden_state.shape}")
+        else:
+            print(f"   No final normalization found, skipping...")
+
+        # ============================================================
+        # STEP 4: LANGUAGE MODEL HEAD
+        # ============================================================
+        print(f"\n📝 STEP 4: LANGUAGE MODEL HEAD")
+        print("-" * 50)
+
+        # Apply LM head if it exists
+        lm_head_path = f'{self.model_matrix_fold_dir}lm_head_weight.pt'
+        if os.path.exists(lm_head_path):
+            print(f"   Applying LM head...")
+
+            # Load LM head weights
+            lm_head_weights = torch.load(lm_head_path)
+            print(f"   LM head shape: {lm_head_weights.shape}")
+
+            # Convert to cluster for multiplication
+            torch.save(current_hidden_state, 'temp_final_hidden.pt')
+            final_hidden_cluster = cluster_matrix(
+                matrix_file_path='temp_final_hidden.pt',
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+                matrix_labeling='a'
+            )
+            final_hidden_cluster.convert_to_cluster_matrix_grid()
+            final_hidden_cluster.save_distribute_matrixA_grid_bin()
+
+            # Create cluster matrix for LM head
+            lm_head_cluster = cluster_matrix(
+                matrix_file_path=lm_head_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+                matrix_labeling='b'
+            )
+            lm_head_cluster.convert_to_cluster_matrix_grid()
+            lm_head_cluster.save_distribute_matrix_shards_bin()
+
+            # Apply LM head with CLUSTER
+            logits = final_hidden_cluster.cluster_shard_operation(
+                lm_head_cluster, False, True, True
+            )
+
+            # Get predicted tokens
+            predicted_token_ids = torch.argmax(logits, dim=-1)
+            predicted_tokens = self.tokenizer.decode(predicted_token_ids)
+
+            print(f"   Logits shape: {logits.shape}")
+            print(f"   Predicted token IDs: {predicted_token_ids.tolist()}")
+            print(f"   Predicted tokens: {predicted_tokens}")
+
+            # Clean up
+            if os.path.exists('temp_final_hidden.pt'):
+                os.remove('temp_final_hidden.pt')
+        else:
+            print(f"   No LM head found, skipping...")
+            logits = None
+            predicted_tokens = None
+
+        # ============================================================
+        # FINAL SUMMARY
+        # ============================================================
+        print("\n" + "=" * 70)
+        print("🎉 FULL MODEL FORWARD PASS COMPLETE!")
+        print("=" * 70)
+
+        print(f"\n📊 PERFORMANCE SUMMARY:")
+        print(f"   • Total layers processed: {len(layer_outputs)}")
+        print(f"   • Final hidden state shape: {current_hidden_state.shape}")
+        print(f"   • Total cluster time: {total_cluster_time:.2f}s")
+        print(f"   • Total torch time: {total_torch_time:.2f}s")
+        print(f"   • Total time: {total_cluster_time + total_torch_time:.2f}s")
+        print(f"   • Efficiency: {total_cluster_time/(total_cluster_time + total_torch_time)*100:.1f}% cluster, {total_torch_time/(total_cluster_time + total_torch_time)*100:.1f}% torch")
+
+        print(f"\n📋 LAYER OUTPUTS STORED FOR:")
+        for layer_idx in layer_outputs.keys():
+            print(f"   • Layer {layer_idx}")
+
+        print(f"\n🔍 FINAL HIDDEN STATE INFO:")
+        print(f"   • Shape: {current_hidden_state.shape}")
+        print(f"   • Mean: {current_hidden_state.mean().item():.6f}")
+        print(f"   • Std: {current_hidden_state.std().item():.6f}")
+        print(f"   • Min: {current_hidden_state.min().item():.6f}")
+        print(f"   • Max: {current_hidden_state.max().item():.6f}")
+
+        if logits is not None:
+            print(f"\n📝 GENERATION RESULTS:")
+            print(f"   • Predicted tokens: {predicted_tokens}")
+            print(f"   • Logits shape: {logits.shape}")
+
+        print("\n✅ All layers processed successfully!")
+
+        return {
+            'final_hidden_state': current_hidden_state,
+            'layer_outputs': layer_outputs,
+            }
+
+
+
 IP_list = [
     '192.168.2.100','192.168.2.100',
     '192.168.2.101','192.168.2.104',
@@ -1848,8 +2338,8 @@ print("=" * 70)
 #print("\n🎉 INFERENCE COMPLETE!")
 #print(f"Final hidden state shape: {result['final_hidden_state'].shape}")
 
-test.run_GQA_transformer_layer()  # Distribute ALL weights to cluster
+#test.run_GQA_transformer_layer()  # Distribute ALL weights to cluster
 
 # ULTRA-FAST INFERENCE (Run this as many times as you want!):
-#result = test.run_optimized_forward_pass("Your prompt here")
+result = test.run_full_model_forward("Your prompt here")
 #print(f"⚡ Inference completed in {result['performance']['total_time']:.2f}s!")
