@@ -1510,6 +1510,308 @@ class cluster_llm_transformer:
         
         return total_distributed
 
+    def run_GQA_transformer_layer(self, layer=0, text="fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!"):
+        """
+        Complete GQA transformer layer with automatic tokenization
+        Uses CLUSTER for heavy matrix multiplications, TORCH for lightweight additions
+        """
+        print(f"🧩 STEP 0: Tokenizing and distributing embeddings...")
+        # 1. Tokenize if not already done
+        if self.tokens is None:
+            self.tokenize_text(text)
+        # 2. Distribute embeddings if not already done
+        if self.cluster_token_embedding_matrix is None:
+            self.get_save_distribute_token_embeddings()
+        if self.cluster_token_embedding_matrix is None:
+            print("❌ Failed to distribute token embeddings!")
+            return None
+        
+        print(f"\n🔧 STEP 1: Loading Q, K, V projection weights for layer {layer}")
+        
+        # Load Q, K, V projection weights
+        attn_q_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_self_attn_q_proj_weight.pt'
+        attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_self_attn_k_proj_weight.pt'
+        attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_self_attn_v_proj_weight.pt'
+        
+        # Load torch references for comparison
+        print("📊 Loading torch references for verification...")
+        attn_q_proj_torch_ref = torch.load(attn_q_proj_path)
+        attn_k_proj_torch_ref = torch.load(attn_k_proj_path)
+        attn_v_proj_torch_ref = torch.load(attn_v_proj_path)
+        torch_embedding_ref = torch.load(self.model_matrix_fold_dir + 'input_token_embedding_matrix.pt')
+        
+        # Create torch references for Q, K, V projections
+        torch_q_ref = torch_embedding_ref @ attn_q_proj_torch_ref.T
+        torch_k_ref = torch_embedding_ref @ attn_k_proj_torch_ref.T
+        torch_v_ref = torch_embedding_ref @ attn_v_proj_torch_ref.T
+        
+        torch.save(torch_q_ref, 'torch_q_ref.pt')
+        torch.save(torch_k_ref, 'torch_k_ref.pt')
+        torch.save(torch_v_ref, 'torch_v_ref.pt')
+        
+        print(f"✅ Created torch references:")
+        print(f"   Q shape: {torch_q_ref.shape}")
+        print(f"   K shape: {torch_k_ref.shape}")
+        print(f"   V shape: {torch_v_ref.shape}")
+        
+        # ============================================================
+        # ATTENTION MECHANISM WITH CLUSTER MULTIPLICATIONS
+        # ============================================================
+        
+        print(f"\n🎯 STEP 2: DISTRIBUTED ATTENTION WITH CLUSTER")
+        print(f"   Using CLUSTER for heavy matrix multiplications")
+        print(f"   Using TORCH for reshape, softmax, and additions")
+        
+        # Create and distribute Q projection matrix
+        print(f"\n📦 STEP 2.1: Distributing Q projection matrix...")
+        attn_q_proj = cluster_matrix(
+            matrix_file_path=attn_q_proj_path,
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=True,
+            dim=0,
+            matrix_labeling='b'
+        )
+        attn_q_proj.convert_to_cluster_matrix_grid()
+        attn_q_proj.save_distribute_matrix_shards_bin()
+        
+        # Run Q projection operation with CLUSTER
+        print(f"\n🚀 STEP 2.2: Running Q projection with CLUSTER...")
+        cluster_q_result = self.cluster_token_embedding_matrix.cluster_shard_operation(
+            attn_q_proj, False, True, True
+        )
+        print("✅ Q projection complete!")
+        check_combined_result_values('torch_q_ref.pt', cluster_q_result)
+        
+        # Create and distribute K projection matrix
+        print(f"\n📦 STEP 2.3: Distributing K projection matrix...")
+        attn_k_proj = cluster_matrix(
+            matrix_file_path=attn_k_proj_path,
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=True,
+            dim=0,
+            matrix_labeling='b'
+        )
+        attn_k_proj.convert_to_cluster_matrix_grid()
+        attn_k_proj.save_distribute_matrix_shards_bin()
+        
+        # Run K projection operation with CLUSTER
+        print(f"\n🚀 STEP 2.4: Running K projection with CLUSTER...")
+        cluster_k_result = self.cluster_token_embedding_matrix.cluster_shard_operation(
+            attn_k_proj, False, True, True
+        )
+        print("✅ K projection complete!")
+        check_combined_result_values('torch_k_ref.pt', cluster_k_result)
+        
+        # Create and distribute V projection matrix
+        print(f"\n📦 STEP 2.5: Distributing V projection matrix...")
+        attn_v_proj = cluster_matrix(
+            matrix_file_path=attn_v_proj_path,
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=True,
+            dim=0,
+            matrix_labeling='b'
+        )
+        attn_v_proj.convert_to_cluster_matrix_grid()
+        attn_v_proj.save_distribute_matrix_shards_bin()
+        
+        # Run V projection operation with CLUSTER
+        print(f"\n🚀 STEP 2.6: Running V projection with CLUSTER...")
+        cluster_v_result = self.cluster_token_embedding_matrix.cluster_shard_operation(
+            attn_v_proj, False, True, True
+        )
+        print("✅ V projection complete!")
+        check_combined_result_values('torch_v_ref.pt', cluster_v_result)
+        
+        # ============================================================
+        # GQA ATTENTION WITH TORCH (reshape, softmax, matmul)
+        # ============================================================
+        
+        print(f"\n🔀 STEP 3: GQA ATTENTION COMPUTATION WITH TORCH")
+        print(f"   Using torch for reshape, softmax, and batch matmul")
+        
+        # Use the distributed results from cluster
+        cluster_q_tensor = cluster_q_result
+        cluster_k_tensor = cluster_k_result
+        cluster_v_tensor = cluster_v_result
+        
+        # Reshape for GQA attention with TORCH
+        seq_len = cluster_q_tensor.shape[0]
+        
+        q_reshaped = cluster_q_tensor.view(seq_len, self.num_q_heads, self.head_dim)
+        k_reshaped = cluster_k_tensor.view(seq_len, self.num_kv_heads, self.head_dim)
+        v_reshaped = cluster_v_tensor.view(seq_len, self.num_kv_heads, self.head_dim)
+        
+        # Repeat KV heads for GQA
+        if self.num_kv_heads < self.num_q_heads:
+            repeat_factor = self.num_q_heads // self.num_kv_heads
+            k_reshaped = k_reshaped.repeat_interleave(repeat_factor, dim=1)
+            v_reshaped = v_reshaped.repeat_interleave(repeat_factor, dim=1)
+        
+        # Transpose for batch matmul with TORCH
+        q_transposed = q_reshaped.transpose(0, 1)
+        k_transposed = k_reshaped.transpose(0, 1)
+        v_transposed = v_reshaped.transpose(0, 1)
+        
+        # Compute attention with TORCH
+        attention_scores = torch.matmul(q_transposed, k_transposed.transpose(-1, -2))
+        scaling_factor = 1.0 / (self.head_dim ** 0.5)
+        attention_scores = attention_scores * scaling_factor
+        attention_probs = torch.nn.functional.softmax(attention_scores, dim=-1)
+        attention_output = torch.matmul(attention_probs, v_transposed)
+        
+        # Reshape back with TORCH
+        attention_output = attention_output.transpose(0, 1)
+        attention_output_flat = attention_output.reshape(seq_len, -1)
+        
+        print(f"   GQA attention output shape: {attention_output_flat.shape}")
+        
+        # Save torch reference
+        torch.save(attention_output_flat, 'torch_attention_output.pt')
+        
+        # ============================================================
+        # ATTENTION OUTPUT PROJECTION WITH CLUSTER
+        # ============================================================
+        
+        print(f"\n🎯 STEP 4: ATTENTION OUTPUT PROJECTION WITH CLUSTER")
+        
+        # Load attention output projection
+        attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_self_attn_o_proj_weight.pt'
+        attn_o_proj_torch_ref = torch.load(attn_o_proj_path)
+        
+        print(f"📊 Output projection shape: {attn_o_proj_torch_ref.shape}")
+        
+        # Compute torch reference for verification
+        torch_attn_final = attention_output_flat @ attn_o_proj_torch_ref.T
+        torch.save(torch_attn_final, 'torch_attn_final.pt')
+        print(f"   Torch reference shape: {torch_attn_final.shape}")
+        
+        # Load and distribute output projection matrix
+        attn_o_proj = cluster_matrix(
+            matrix_file_path=attn_o_proj_path,
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=True,
+            dim=0,
+            matrix_labeling='b'
+        )
+        attn_o_proj.convert_to_cluster_matrix_grid()
+        attn_o_proj.save_distribute_matrix_shards_bin()
+        
+        # Convert attention output to cluster matrix for CLUSTER multiplication
+        print(f"\n📦 Preparing attention output for CLUSTER multiplication...")
+        torch.save(attention_output_flat, 'attention_output.pt')
+        cluster_attention_output = cluster_matrix(
+            matrix_file_path='attention_output.pt',
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=True,
+            dim=0,
+            matrix_labeling='a'
+        )
+        cluster_attention_output.convert_to_cluster_matrix_grid()
+        cluster_attention_output.save_distribute_matrixA_grid_bin()
+        
+        # Run output projection with CLUSTER
+        print(f"\n🚀 STEP 4.1: Running output projection with CLUSTER...")
+        attn_final_result = cluster_attention_output.cluster_shard_operation(
+            attn_o_proj, False, True, True
+        )
+        print("✅ Output projection complete!")
+        check_combined_result_values('torch_attn_final.pt', attn_final_result)
+        
+        # ============================================================
+        # RESIDUAL CONNECTION WITH TORCH (CHEAP OPERATION)
+        # ============================================================
+        
+        print(f"\n➕ STEP 5: RESIDUAL CONNECTION WITH TORCH")
+        print(f"   Using torch for addition (lightweight operation)")
+        
+        # Add input embeddings to attention output with TORCH
+        residual_result = torch_embedding_ref + attn_final_result
+        torch.save(residual_result, 'torch_residual.pt')
+        print(f"   Residual shape: {residual_result.shape}")
+        
+        # ============================================================
+        # MLP FORWARD PASS (Hybrid: some torch, some cluster)
+        # ============================================================
+        
+        print(f"\n🧠 STEP 6: MLP FORWARD PASS")
+        
+        # Load MLP weights
+        mlp_up_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_mlp_up_proj_weight.pt'
+        mlp_gate_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_mlp_gate_proj_weight.pt'
+        mlp_down_proj_path = f'{self.model_matrix_fold_dir}layers_{layer}_mlp_down_proj_weight.pt'
+        
+        mlp_up_proj_torch_ref = torch.load(mlp_up_proj_path)
+        mlp_gate_proj_torch_ref = torch.load(mlp_gate_proj_path)
+        mlp_down_proj_torch_ref = torch.load(mlp_down_proj_path)
+        
+        print(f"📊 MLP weights loaded:")
+        print(f"   Up projection shape: {mlp_up_proj_torch_ref.shape}")
+        print(f"   Gate projection shape: {mlp_gate_proj_torch_ref.shape}")
+        print(f"   Down projection shape: {mlp_down_proj_torch_ref.shape}")
+        
+        # Compute MLP with TORCH (all operations can be done locally)
+        print(f"\n🔍 Computing MLP with TORCH...")
+        
+        # Step 1: Apply gate projection + SiLU activation
+        gate_output = residual_result @ mlp_gate_proj_torch_ref.T
+        gate_activated = torch.nn.functional.silu(gate_output)
+        
+        # Step 2: Apply up projection
+        up_output = residual_result @ mlp_up_proj_torch_ref.T
+        
+        # Step 3: Element-wise multiply with TORCH
+        mlp_intermediate = gate_activated * up_output
+        
+        # Step 4: Apply down projection
+        mlp_output = mlp_intermediate @ mlp_down_proj_torch_ref.T
+        
+        torch.save(mlp_output, 'torch_mlp_output.pt')
+        print(f"   MLP output shape: {mlp_output.shape}")
+        
+        # ============================================================
+        # FINAL RESIDUAL CONNECTION WITH TORCH
+        # ============================================================
+        
+        print(f"\n➕ STEP 7: FINAL RESIDUAL CONNECTION WITH TORCH")
+        
+        # Add MLP output back to residual with TORCH
+        layer_output = residual_result + mlp_output
+        torch.save(layer_output, 'torch_layer_output.pt')
+        print(f"   Final layer output shape: {layer_output.shape}")
+        
+        print(f"\n🎉🎉🎉 LAYER {layer} COMPLETE! 🎉🎉🎉")
+        print(f"\n📊 OPERATION SUMMARY:")
+        print(f"   ✅ CLUSTER operations (heavy matrix multiplications):")
+        print(f"      • Q projection (TokenEmbeddings × Q_weights)")
+        print(f"      • K projection (TokenEmbeddings × K_weights)")
+        print(f"      • V projection (TokenEmbeddings × V_weights)")
+        print(f"      • Output projection (AttentionOutput × O_weights)")
+        print(f"   ✅ TORCH operations (lightweight/non-distributable):")
+        print(f"      • GQA reshape and attention computation")
+        print(f"      • Softmax activation")
+        print(f"      • Residual connections (additions)")
+        print(f"      • MLP forward pass")
+        print(f"      • SiLU activation")
+        print(f"\n💡 Strategy: Heavy O(n³) operations → CLUSTER, Light O(n²) operations → TORCH")
+        
+        # Return the final output
+        return layer_output
+
 IP_list = [
     '192.168.2.100','192.168.2.100',
     '192.168.2.101','192.168.2.104',
@@ -1546,8 +1848,8 @@ print("=" * 70)
 #print("\n🎉 INFERENCE COMPLETE!")
 #print(f"Final hidden state shape: {result['final_hidden_state'].shape}")
 
-test.save_distribute_model_matrices()  # Distribute ALL weights to cluster
+test.run_GQA_transformer_layer()  # Distribute ALL weights to cluster
 
 # ULTRA-FAST INFERENCE (Run this as many times as you want!):
-result = test.run_optimized_forward_pass("Your prompt here")
-print(f"⚡ Inference completed in {result['performance']['total_time']:.2f}s!")
+#result = test.run_optimized_forward_pass("Your prompt here")
+#print(f"⚡ Inference completed in {result['performance']['total_time']:.2f}s!")
