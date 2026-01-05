@@ -5,59 +5,6 @@ import torch
 import time
 import math
 
-def check_combined_result_values(c_ref_path, combined):
-    c_ref = torch.load(c_ref_path)
-    if c_ref.shape != combined.shape:
-        print(f"❌ Shape mismatch! Reference: {c_ref.shape}, Combined: {combined.shape}")
-    else:
-        print(f"✅ Shapes match: {c_ref.shape}")
-
-        # Ensure both are Torch tensors (defensive)
-        if not isinstance(c_ref, torch.Tensor):
-            c_ref = torch.from_numpy(c_ref)
-        if not isinstance(combined, torch.Tensor):
-            combined = torch.from_numpy(combined)
-
-        c_ref = c_ref.to(dtype=combined.dtype, device=combined.device)
-
-        # Calculate absolute differences
-        diff = torch.abs(c_ref - combined)
-
-        # Basic statistics
-        max_diff = torch.max(diff).item()
-        mean_diff = torch.mean(diff).item()
-
-        print(f"Max absolute difference:  {max_diff:.6e}")
-        print(f"Mean absolute difference: {mean_diff:.6e}")
-
-        # Looser tolerance for shard / float accumulation
-        tolerance = 0.15
-
-        if torch.allclose(c_ref, combined, rtol=tolerance, atol=tolerance):
-            print(f"✅ Results match within tolerance ({tolerance})")
-        else:
-            print(f"⚠️  Results differ beyond tolerance ({tolerance})")
-
-        significant_diff = diff > tolerance
-        num_different = torch.sum(significant_diff).item()
-        total_elements = c_ref.numel()
-
-        print(
-            f"Elements with > {tolerance} difference: "
-            f"{num_different}/{total_elements} "
-            f"({(num_different / total_elements * 100):.2f}%)"
-        )
-
-def print_matrix_sections(matrix, name, n_elements=100):
-    flat = matrix.flatten()
-    mid = flat.shape[0] // 2
-
-    print(f"\n{name} — first {n_elements} elements of first half:")
-    print(flat[:n_elements])
-
-    print(f"\n{name} — first {n_elements} elements of second half:")
-    print(flat[mid:mid + n_elements])
-
 class cluster_llm_transformer:
     def __init__(self, model_path, IP_list, percentages, CPU_GPU_select_list, backend_select_list):
         self.local_project_dir = "/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/"
