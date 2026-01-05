@@ -1,0 +1,305 @@
+======================================================================
+🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM
+======================================================================
+✅ Node configuration validated: 6 nodes configured
+✅ Percentage distribution validated: 1.000000
+
+🌐 CONFIGURING NETWORK SETTINGS...
+   Head Node Ethernet IP: 192.168.2.100
+   Head Node WiFi IP: 192.168.50.113
+   Head Node Ports: PULL=7779, PUSH=7780
+   Worker Node Ports: PULL=5557, PUSH=5558
+   Cluster Barrier Port: 7790
+
+📁 CONFIGURING STORAGE PATHS...
+   Local Paths:
+     - RAM Results: /dev/shm/matrix_results/
+     - Disk Folder: matrix_shards/
+     - RAM Folder: /dev/shm/matrix_shards/
+     - Project Dir: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/
+   Remote Paths:
+     - Disk Folder: matrix_shards/
+     - RAM Folder: /dev/shm/matrix_shards/
+     - RAM Results: /dev/shm/matrix_results/
+     - Project Dir: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/
+✅ Using Python path: /home/rino/anaconda3/envs/cluster-worker/bin/python
+
+📊 INITIALIZING INSTANCE VARIABLES...
+   Matrix Name: temp_layer31_attn_out
+   Split Matrix: True
+   Dimension: 0
+
+📂 CREATING LOCAL DIRECTORIES...
+✅ All required directories already exist
+
+🔌 SETTING UP ZEROMQ CONNECTIONS...
+   Connecting to 3 unique nodes...
+   ✅ Connected to worker node 192.168.2.101:5557
+   ✅ Connected to worker node 192.168.2.104:5557
+   ✅ Connected to worker WiFi 192.168.3.13:5557
+   ✅ Connected to worker WiFi 192.168.3.243:5557
+   ✅ Connected to worker WiFi 192.168.3.165:5557
+   ✅ Connected to head node (self) 192.168.2.100:7779
+   Total sockets in pool: 3
+
+🔄 SETTING UP CLUSTER BARRIER/ACK RECEIVER...
+✅ ACK receiver already exists on port 7790
+
+📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...
+   Sending command: mkdir -p /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/matrix_shards/ /dev/shm/matrix_shards/ /dev/shm/matrix_results/
+   ✅ Directory creation command sent to 192.168.2.101
+   ✅ Directory creation command sent to 192.168.2.104
+   ✅ Directory creation command sent to 192.168.2.100
+✅ Matrix A: torch.Size([4, 4096]) → [torch.Size([2, 4096]), torch.Size([2, 4096])] (split along dim=0)
+
+📤 Distributing Matrix A row shards
+Saving matrix to binary file: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_0.bin
+  Converting input to numpy array...
+    Input is PyTorch tensor: shape=torch.Size([2, 4096]), dtype=torch.float32, device=cpu
+    Converted to CPU float32 numpy array
+  Final numpy array: shape=(2, 4096), dtype=float32
+  Converting to 4D format...
+    2D (2, 4096) -> 4D (1, 1, 2, 4096)
+  Writing binary file...
+    Wrote ndim: 4
+    Dimensions: 1 × 1 × 2 × 4096
+    Wrote 8,192 float32 elements
+  File saved successfully
+  File size: 32,788 bytes
+  Expected size: 32,788 bytes
+  ✓ File size verification passed
+  Memory usage: 0.03 MB
+  Save completed: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_0.bin
+Saving matrix to binary file: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_1.bin
+  Converting input to numpy array...
+    Input is PyTorch tensor: shape=torch.Size([2, 4096]), dtype=torch.float32, device=cpu
+    Converted to CPU float32 numpy array
+  Final numpy array: shape=(2, 4096), dtype=float32
+  Converting to 4D format...
+    2D (2, 4096) -> 4D (1, 1, 2, 4096)
+  Writing binary file...
+    Wrote ndim: 4
+    Dimensions: 1 × 1 × 2 × 4096
+    Wrote 8,192 float32 elements
+  File saved successfully
+  File size: 32,788 bytes
+  Expected size: 32,788 bytes
+  ✓ File size verification passed
+  Memory usage: 0.03 MB
+  Save completed: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_1.bin
+  Copied shard 0 to: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix//temp_layer31_attn_out_shard_0.bin
+  Copied shard 0 to: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/matrix_shards/temp_layer31_attn_out_shard_0.bin
+  Copied shard 1 to: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix//temp_layer31_attn_out_shard_1.bin
+  Copied shard 1 to: /home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/matrix_shards/temp_layer31_attn_out_shard_1.bin
+📤 Sent file temp_layer31_attn_out_shard_0.bin to 192.168.2.101
+Sent shard 0 to IP: 192.168.2.101
+📤 Sent file temp_layer31_attn_out_shard_1.bin to 192.168.2.104
+✅ Received temp_layer31_attn_out_shard_1.bin 1/1
+✅ All ACKs received!
+Sent shard 1 to IP: 192.168.2.104
+📤 Sent file temp_layer31_attn_out_shard_1.bin to 192.168.2.101
+✅ Received temp_layer31_attn_out_shard_1.bin 1/1
+✅ All ACKs received!
+Sent shard 1 to IP: 192.168.2.101
+
+📋 Node shard assignments:
+  192.168.2.100 -> shard_0
+  192.168.2.100 -> shard_0
+  192.168.2.101 -> shard_0
+  192.168.2.104 -> shard_1
+  192.168.2.100 -> shard_1
+  192.168.2.101 -> shard_1
+
+✅ Final matrix_file_paths_list (paths only):
+  Node 0: shard_0
+  Node 1: shard_0
+  Node 2: shard_0
+  Node 3: shard_1
+  Node 4: shard_1
+  Node 5: shard_1
+
+============================================================
+🚀 STARTING CLUSTER OPERATION
+============================================================
+Matrix A: temp_layer31_attn_out
+Matrix B: layers_31_self_attn_o_proj_weight
+Operation: mul
+Transpose A: False, Transpose B: True
+Send back result: True
+Number of shards: 6
+
+📤 DISTRIBUTING OPERATIONS TO NODES
+----------------------------------------
+
+Processing shard 0:
+  Node: 192.168.2.100
+  Backend: llama
+  Use GPU: True (GPU #0)
+  Next GPU for this node will be: #1
+  Matrix A path: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_0.bin
+  Matrix B path: /dev/shm/matrix_shards/layers_31_self_attn_o_proj_weight_shard_0.bin
+  Final transpose flags - A: false, B: false
+  Send back result: Yes (-6 shards will be combined)
+DEBUG TEST: -6
+  Sending command to node...
+  ✅ Command sent to node 192.168.2.100
+
+Processing shard 1:
+  Node: 192.168.2.100
+  Backend: llama
+  Use GPU: True (GPU #1)
+  Next GPU for this node will be: #2
+  Matrix A path: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_0.bin
+  Matrix B path: /dev/shm/matrix_shards/layers_31_self_attn_o_proj_weight_shard_1.bin
+  Final transpose flags - A: false, B: false
+  Send back result: Yes (-6 shards will be combined)
+DEBUG TEST: -6
+  Sending command to node...
+  ✅ Command sent to node 192.168.2.100
+
+Processing shard 2:
+  Node: 192.168.2.101
+  Backend: llama
+  Use GPU: True (GPU #0)
+  Next GPU for this node will be: #1
+  Matrix A path: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_0.bin
+  Matrix B path: /dev/shm/matrix_shards/layers_31_self_attn_o_proj_weight_shard_2.bin
+  Final transpose flags - A: false, B: false
+  Send back result: Yes (-6 shards will be combined)
+DEBUG TEST: -6
+  Sending command to node...
+  ✅ Command sent to node 192.168.2.101
+
+Processing shard 3:
+  Node: 192.168.2.104
+  Backend: llama
+  Use GPU: True (GPU #0)
+  Next GPU for this node will be: #1
+  Matrix A path: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_1.bin
+  Matrix B path: /dev/shm/matrix_shards/layers_31_self_attn_o_proj_weight_shard_3.bin
+  Final transpose flags - A: false, B: false
+  Send back result: Yes (-6 shards will be combined)
+DEBUG TEST: -6
+  Sending command to node...
+  ✅ Command sent to node 192.168.2.104
+
+Processing shard 4:
+  Node: 192.168.2.100
+  Backend: llama
+  Use GPU: True (GPU #2)
+  Next GPU for this node will be: #3
+  Matrix A path: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_1.bin
+  Matrix B path: /dev/shm/matrix_shards/layers_31_self_attn_o_proj_weight_shard_4.bin
+  Final transpose flags - A: false, B: false
+  Send back result: Yes (-6 shards will be combined)
+DEBUG TEST: -6
+  Sending command to node...
+  ✅ Command sent to node 192.168.2.100
+
+Processing shard 5:
+  Node: 192.168.2.101
+  Backend: llama
+  Use GPU: True (GPU #1)
+  Next GPU for this node will be: #2
+  Matrix A path: /dev/shm/matrix_shards/temp_layer31_attn_out_shard_1.bin
+  Matrix B path: /dev/shm/matrix_shards/layers_31_self_attn_o_proj_weight_shard_5.bin
+  Final transpose flags - A: false, B: false
+  Send back result: Yes (-6 shards will be combined)
+DEBUG TEST: -6
+  Sending command to node...
+  ✅ Command sent to node 192.168.2.101
+
+⏳ WAITING FOR ACKS FROM NODES (6)
+✅ Received ACK_matrixOp_complete 1/6
+✅ Received ACK_matrixOp_complete 2/6
+✅ Received ACK_matrixOp_complete 3/6
+✅ Received ACK_matrixOp_complete 4/6
+✅ Received ACK_matrixOp_complete 5/6
+✅ Received ACK_matrixOp_complete 6/6
+✅ All ACKs received!
+
+============================================================
+✅ CLUSTER OPERATION COMPLETE
+============================================================
+Operation time: 0.08 seconds
+
+📊 Result base: layers_31_self_attn_o_proj_weightxtemp_layer31_attn_out (send_back=True)
+✅ Loaded /dev/shm/matrix_shards/layers_31_self_attn_o_proj_weightxtemp_layer31_attn_out_combined.bin
+  Original dims: [1, 1, 4, 4096]
+  Result tensor shape: torch.Size([4, 4096]), size: 65,536 bytes
+  Data range: [-13.182899, 5.229529]
+   Attention residual connection...
+   Post-attention normalization...
+   MLP forward pass...
+   Final residual connection...
+
+📊 LAYER 31 SUMMARY:
+   • Hidden state shape: torch.Size([4, 4096])
+   • Attention output shape: torch.Size([4, 4096])
+   • Time: 7.98s
+   • Cluster ops: 6.35s
+   • Torch ops: 0.07s
+
+📏 STEP 3: FINAL NORMALIZATION
+--------------------------------------------------
+   Applying final normalization...
+   Final normalized shape: torch.Size([4, 4096])
+
+📝 STEP 4: LANGUAGE MODEL HEAD
+--------------------------------------------------
+   No LM head found, skipping...
+
+======================================================================
+🎉 FULL MODEL FORWARD PASS COMPLETE!
+======================================================================
+
+📊 PERFORMANCE SUMMARY:
+   • Total layers processed: 32
+   • Final hidden state shape: torch.Size([4, 4096])
+   • Total cluster time: 354.96s
+   • Total torch time: 4.46s
+   • Total time: 359.42s
+   • Efficiency: 98.8% cluster, 1.2% torch
+
+📋 LAYER OUTPUTS STORED FOR:
+   • Layer 0
+   • Layer 1
+   • Layer 2
+   • Layer 3
+   • Layer 4
+   • Layer 5
+   • Layer 6
+   • Layer 7
+   • Layer 8
+   • Layer 9
+   • Layer 10
+   • Layer 11
+   • Layer 12
+   • Layer 13
+   • Layer 14
+   • Layer 15
+   • Layer 16
+   • Layer 17
+   • Layer 18
+   • Layer 19
+   • Layer 20
+   • Layer 21
+   • Layer 22
+   • Layer 23
+   • Layer 24
+   • Layer 25
+   • Layer 26
+   • Layer 27
+   • Layer 28
+   • Layer 29
+   • Layer 30
+   • Layer 31
+
+🔍 FINAL HIDDEN STATE INFO:
+   • Shape: torch.Size([4, 4096])
+   • Mean: 0.097668
+   • Std: 2.431947
+   • Min: -29.507620
+   • Max: 50.291306
+
+(ray-conda-env) rino@rino-Z370-HD3:~/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix$ 
