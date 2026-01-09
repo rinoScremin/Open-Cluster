@@ -1016,27 +1016,16 @@ class cluster_matrix:
         
         # ===== CONVERT INPUT TO NUMPY ARRAY =====
         # Handle both PyTorch tensors and numpy arrays
-        print("  Converting input to numpy array...")
         if isinstance(matrix, torch.Tensor):
-            # Convert PyTorch tensor to numpy
-            print(f"    Input is PyTorch tensor: shape={matrix.shape}, dtype={matrix.dtype}, device={matrix.device}")
             matrix_float = matrix.float().cpu()
             matrix_np = matrix_float.detach().numpy()
-            print(f"    Converted to CPU float32 numpy array")
         elif isinstance(matrix, np.ndarray):
-            # Already a numpy array
-            print(f"    Input is numpy array: shape={matrix.shape}, dtype={matrix.dtype}")
             matrix_np = matrix.astype('float32')
-            print(f"    Cast to float32")
         else:
-            # Unsupported type
-            error_msg = f"Unsupported matrix type: {type(matrix)}. Expected torch.Tensor or np.ndarray"
-            print(f"  ERROR: {error_msg}")
-            raise ValueError(error_msg)
+            raise ValueError("somthing got fucked!!")
         
         # Ensure float32 dtype
         matrix_np = matrix_np.astype('float32')
-        print(f"  Final numpy array: shape={matrix_np.shape}, dtype={matrix_np.dtype}")
         
         # ===== CONVERT TO 4D FORMAT =====
         # Always convert to 4D format for consistency (batch, channel, height, width)
@@ -1057,61 +1046,20 @@ class cluster_matrix:
             # Already 4D
             print(f"    Already 4D format: {matrix_np.shape}")
         else:
-            # Unsupported dimensionality
-            error_msg = f"Unsupported number of dimensions: {len(matrix_np.shape)}"
-            print(f"  ERROR: {error_msg}")
-            raise ValueError(error_msg)
+            raise ValueError('some thing fucked!!')
         
         # ===== WRITE BINARY FILE =====
         print(f"  Writing binary file...")
-        try:
-            with open(filename, 'wb') as f:
-                # Write number of dimensions (always 4 for consistency)
-                ndim = 4
-                f.write(struct.pack('i', ndim))
-                print(f"    Wrote ndim: {ndim}")
-                
-                # Write all 4 dimensions
-                for i, dim in enumerate(matrix_np.shape):
-                    f.write(struct.pack('i', dim))
-                    if i == 0:
-                        print(f"    Dimensions: {dim}", end="")
-                    else:
-                        print(f" × {dim}", end="")
-                print()  # New line after dimensions
-                
-                # Write the actual data
-                f.write(matrix_np.tobytes())
-                print(f"    Wrote {matrix_np.size:,} float32 elements")
-                
-        except Exception as e:
-            print(f"  ERROR writing file {filename}: {e}")
-            raise
-        
-        # ===== VERIFY FILE SIZE =====
-        try:
-            file_size = os.path.getsize(filename)
-            # Calculate expected size: 4 bytes for ndim + 4×4 bytes for dimensions + data size
-            expected_size = 4 + ndim * 4 + matrix_np.size * 4
-            print(f"  File saved successfully")
-            print(f"  File size: {file_size:,} bytes")
-            print(f"  Expected size: {expected_size:,} bytes")
-            
-            # Verify file size matches expected
-            if file_size == expected_size:
-                print(f"  ✓ File size verification passed")
-            else:
-                print(f"  ⚠️  File size mismatch: got {file_size:,}, expected {expected_size:,}")
-                
-            # Calculate memory usage
-            file_size_mb = file_size / (1024 * 1024)
-            print(f"  Memory usage: {file_size_mb:.2f} MB")
-            
-        except Exception as e:
-            print(f"  ERROR getting file size: {e}")
-        
-        print(f"  Save completed: {filename}")
-        return file_size
+
+        with open(filename, 'wb') as f:
+            # Write number of dimensions (always 4 for consistency)
+            ndim = 4
+            f.write(struct.pack('i', ndim))
+            # Write all 4 dimensions
+            for i, dim in enumerate(matrix_np.shape):
+                f.write(struct.pack('i', dim))
+            # Write the actual data
+            f.write(matrix_np.tobytes())
 
     def remote_save_distribute_matrix_shards_bin(self):
         """Save matrix shards as binary files and distribute to appropriate nodes."""
@@ -1771,6 +1719,16 @@ class cluster_matrix:
             )  
             return result_cluster_matrix
         return False  # Return the distributed result instance
+
+    def __del__(self):
+        """Destructor as fallback cleanup."""
+        try:
+            # Check if cleanup hasn't been called yet
+            if hasattr(self, '_cleaned_up') and not self._cleaned_up:
+                print(f"🧹 Destructor cleaning up ZMQ resources...")
+                self.cleanup()
+        except:
+            pass  # Avoid exceptions in destructor
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
