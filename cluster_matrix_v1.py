@@ -74,7 +74,7 @@ def print_matrix_sections(matrix, name, n_elements=100):
 class cluster_matrix:
     def __init__(self, matrix_file_path,
                 node_IP_list, CPU_GPU_select_list, node_percentages=[], back_end_select_list=[],
-                split_matrix=False, dim=0, matrix_labeling='' ,hierarchical_split_order=[]):
+                split_matrix=False, dim=0 , matrix_name='', matrix_labeling=''):
         
         print("=" * 70)
         print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
@@ -99,8 +99,8 @@ class cluster_matrix:
         sys2_split_percentages = node_percentages[:half_node_percentages]
         total_percent = sum(node_percentages)
 
-        if abs(total_percent - 1.0) > 0.01:  # Increased tolerance to 0.01
-            raise ValueError(f"Node configuration error: percentages sum to {total_percent:.6f}, should be 1.0")
+        #if abs(total_percent - 1.0) > 0.01:  # Increased tolerance to 0.01
+        #    raise ValueError(f"Node configuration error: percentages sum to {total_percent:.6f}, should be 1.0")
 
         print(f"✅ Node configuration validated: {len(node_IP_list)} nodes configured")
         print(f"✅ Percentage distribution validated: {total_percent:.6f}")
@@ -180,15 +180,17 @@ class cluster_matrix:
         self.OG_matrix_shape = []
         self.sys2_split_percentages = sys2_split_percentages
         self.matrix_labeling= matrix_labeling
-        self.split_depth = len(hierarchical_split_order)
-        self.hierarchical_split_order = hierarchical_split_order
 
         # Extract matrix name from file path
-        matrix_file_path_split = matrix_file_path.split('/')
-        self.matrix_name = matrix_file_path_split[len(matrix_file_path_split)-1].split('.pt')[0]
-        print(f"   Matrix Name: {self.matrix_name}")
-        print(f"   Split Matrix: {split_matrix}")
-        print(f"   Dimension: {dim}")
+        if torch.is_tensor(matrix_file_path):
+            #print(f'matrix_file_path.names : {matrix_file_path.names}')
+            self.matrix_name = matrix_name
+        else:
+            matrix_file_path_split = matrix_file_path.split('/')
+            self.matrix_name = matrix_file_path_split[len(matrix_file_path_split)-1].split('.pt')[0]
+            print(f"   Matrix Name: {self.matrix_name}")
+            print(f"   Split Matrix: {split_matrix}")
+            print(f"   Dimension: {dim}")
         
         # If no backend specified, default to 'torch' for all nodes
         if self.back_end_select_list == []:
@@ -488,143 +490,6 @@ class cluster_matrix:
             socket.close()
         self.zmq_context.term()
 
-    def convert_to_hierarchical_matrix_shards(self):
-        """
-        Apply hierarchical splits to the matrix.
-        For Matrix A: starts with full matrix (10000, 20000)
-        For Matrix B: starts with initial split based on node_percentages
-        """
-        matrix_type = 'Matrix A' if self.matrix_labeling == 'a' else 'Matrix B'
-        print(f"🚀 Creating hierarchical shards for {matrix_type}")
-        print(f"   Split order: {self.hierarchical_split_order}")
-        print(f"   Split depth: {self.split_depth}")
-        
-        # ============================================================
-        # INITIALIZE MATRICES
-        # ============================================================
-        if self.matrix_labeling == 'a':  # Matrix A
-            # Load full matrix
-            full_matrix = torch.load(self.matrix_file_path)
-            print(f"📥 Matrix A: Loaded full matrix {full_matrix.shape}")
-            current_shards = [full_matrix]
-            
-        else:  # Matrix B  
-            # Save init values
-            saved_node_IP_list = self.node_IP_list
-            
-            # Set new init values for initial split
-            # Use the first two percentages for the initial split
-            if len(self.node_percentages) >= 2:
-                initial_percentages = [self.node_percentages[0], self.node_percentages[1]]
-            else:
-                # Default to 50/50 if not enough percentages
-                initial_percentages = [0.5, 0.5]
-                
-            self.node_percentages = initial_percentages
-            self.node_IP_list = ['0.0.0.0', '0.0.0.0']
-            
-            # Get initial split (depth 0) based on self.dim
-            self.convert_to_cluster_matrix_shards()
-            
-            # Restore original values
-            self.node_IP_list = saved_node_IP_list
-
-            current_shards = self.node_matrices
-            
-            # Print the shard shapes
-            print(f"🔄 Matrix B: Initial split (dim={self.dim})")
-            for i, shard in enumerate(current_shards):
-                print(f"    B[{i}]: {shard.shape}")
-        
-        # ============================================================
-        # APPLY HIERARCHICAL SPLITS BASED ON hierarchical_split_order
-        # ============================================================
-        print(f"\n📊 Starting hierarchical splits with: {len(current_shards)} shard(s)")
-        for i, shard in enumerate(current_shards):
-            matrix_id = 'A' if self.matrix_labeling == 'a' else 'B'
-            print(f"    {matrix_id}[{i}]: {shard.shape}")
-        
-        depth_index = 0
-        
-        for split_dim in self.hierarchical_split_order:
-            print(f"\n🔧 Depth level {depth_index + 1}/{self.split_depth} (split along dim={split_dim})")
-            
-            if split_dim == 0:  # Split by rows
-                print("🔄 Splitting by rows (dim=0)")
-                new_shards = []
-                
-                for shard in current_shards:
-                    # Ensure 2D tensor
-                    if shard.dim() == 1:
-                        shard = shard.unsqueeze(0)
-                    
-                    # Check if we can split rows
-                    if shard.size(0) > 1:
-                        # Use torch.split() for cleaner code
-                        split_size = shard.size(0) // 2
-                        shard1, shard2 = torch.split(shard, split_size, dim=0)
-                        new_shards.extend([shard1, shard2])
-                    else:
-                        # Can't split further
-                        new_shards.append(shard)
-            
-            elif split_dim == 1:  # Split by columns
-                print("🔄 Splitting by columns (dim=1)")
-                new_shards = []
-                
-                for shard in current_shards:
-                    # Ensure 2D tensor
-                    if shard.dim() == 1:
-                        shard = shard.unsqueeze(0)
-                    
-                    # Check if we can split columns
-                    if shard.size(1) > 1:
-                        # Use torch.split() for cleaner code
-                        split_size = shard.size(1) // 2
-                        shard1, shard2 = torch.split(shard, split_size, dim=1)
-                        new_shards.extend([shard1, shard2])
-                    else:
-                        # Can't split further
-                        new_shards.append(shard)
-            else:
-                print(f"⚠️  Warning: Invalid split dimension {split_dim}, skipping")
-                new_shards = current_shards
-            
-            current_shards = new_shards
-            depth_index += 1
-            
-            print(f"📈 After depth {depth_index}: {len(current_shards)} shards")
-            matrix_id = 'A' if self.matrix_labeling == 'a' else 'B'
-            if len(current_shards) <= 10:
-                for i, shard in enumerate(current_shards):
-                    print(f"    {matrix_id}[{i}]: {shard.shape}")
-            else:
-                print(f"    (Showing first 10 of {len(current_shards)} shards)")
-                for i, shard in enumerate(current_shards[:10]):
-                    print(f"    {matrix_id}[{i}]: {shard.shape}")
-        
-        # ============================================================
-        # FINAL PROCESSING
-        # ============================================================
-        if self.matrix_labeling == 'a':  # Matrix A
-            # Duplicate for round-robin pairing with B shards
-            # Important: Create copies to avoid memory sharing
-            duplicated_shards = [shard.clone() for shard in current_shards]
-            self.node_matrices = current_shards + duplicated_shards
-        else:  # Matrix B
-            self.node_matrices = current_shards
-
-        print(f"\n✅ Hierarchical shards created for {matrix_type}!")
-        print(f"   Total shards: {len(self.node_matrices)}")
-        
-        # Also print individual shard shapes
-        print("📊 Final shard shapes:")
-        matrix_id = 'A' if self.matrix_labeling == 'a' else 'B'
-        for i, shard in enumerate(self.node_matrices):
-            print(f"    {matrix_id}[{i}]: {shard.shape}")
-        
-        return self.node_matrices
-
     def convert_to_cluster_matrix_grid(self):
         """
         Split matrix according to System 2 pattern using self.dim.
@@ -727,11 +592,12 @@ class cluster_matrix:
 
     def convert_to_cluster_matrix_shards(self):
 
-        if self.matrix_file_path is None:
-            raise ValueError("Matrix file path not set.")
-
+        if torch.is_tensor(self.matrix_file_path):
+            full_matrix = self.matrix_file_path
+        else:
         # Load full matrix
-        full_matrix = torch.load(self.matrix_file_path)
+            full_matrix = torch.load(self.matrix_file_path)
+
         total_rows = full_matrix.size(self.dim)  # typically dim=0
         self.node_matrices = []
 
@@ -863,9 +729,13 @@ class cluster_matrix:
         print(f"Local paths - DISK: {save_file_path_DISK}, RAM: {local_save_file_path_RAM}")
         
         # Load the full matrix from PyTorch file
-        print(f"Loading matrix from: {self.matrix_file_path}")
-        full_matrix = torch.load(self.matrix_file_path)
-        print(f"Matrix loaded - Shape: {full_matrix.shape}")
+
+        if torch.is_tensor(self.matrix_file_path):
+            full_matrix = self.matrix_file_path
+        else:
+            print(f"Loading matrix from: {self.matrix_file_path}")
+            full_matrix = torch.load(self.matrix_file_path)
+            print(f"Matrix loaded - Shape: {full_matrix.shape}")
         
         # Save to binary format locally
         print("Saving to local storage...")
@@ -1145,6 +1015,170 @@ class cluster_matrix:
         
         print(f"  Save completed: {filename}")
         return file_size
+
+    def remote_save_distribute_matrix_shards_bin(self):
+        """Save matrix shards as binary files and distribute to appropriate nodes."""
+        
+        # Get list of unique node IPs for ACK tracking
+        unique_node_IP_list = list(set(self.node_IP_list))
+        print(f"Starting distribution of {len(self.node_IP_list)} shards to {len(unique_node_IP_list)} unique nodes")
+        
+        # Clear the paths list
+        self.matrix_file_paths_list = []
+        
+        # Get the full path to THIS script (cluster_matrix_v1.py)
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        script_filename = os.path.basename(__file__)  # Gets 'cluster_matrix_v1.py'
+        script_path = os.path.join(current_dir, script_filename)
+        
+        # FIRST: Split the matrix on HEAD NODE to get node_matrices populated
+        print(f"\n🔧 Splitting matrix on head node first...")
+        if self.matrix_labeling == 'a' or self.matrix_labeling == 'b':
+            # System 2 (grid)
+            self.convert_to_cluster_matrix_grid()
+        elif self.matrix_labeling == '' and self.split_matrix == False:
+            # System 1, Matrix A (no split)
+            # Load full matrix
+            full_matrix = torch.load(self.matrix_file_path)
+            self.node_matrices = [full_matrix]  # Just one full matrix
+            print(f"✅ Matrix A (no split): {full_matrix.shape}")
+        elif self.matrix_labeling == '' and self.split_matrix == True:
+            # System 1, Matrix B (split)
+            self.convert_to_cluster_matrix_shards()
+        
+        # Track which unique shard indices have been saved for each node IP
+        node_shard_mapping = {}  # Maps node_IP -> list of (shard_index, unique_shard_index)
+        
+        # Create mapping: For each unique node IP, track which shards it should get
+        # This is needed because multiple entries in node_IP_list might refer to the same node
+        for shard_index, node_IP in enumerate(self.node_IP_list):
+            if node_IP not in node_shard_mapping:
+                node_shard_mapping[node_IP] = []
+            
+            # Determine which unique shard this IP gets (based on position among unique nodes)
+            unique_nodes = list(set(self.node_IP_list))
+            node_position = unique_nodes.index(node_IP) % len(self.node_matrices)
+            unique_shard_index = node_position  # This maps IP to a unique shard
+            
+            node_shard_mapping[node_IP].append((shard_index, unique_shard_index))
+        
+        # Now process each node IP and its assigned shards
+        for node_IP, shard_assignments in node_shard_mapping.items():
+            for shard_index, unique_shard_index in shard_assignments:
+                print(f"Processing shard {shard_index} (unique shard {unique_shard_index}) for node {node_IP}")
+                
+                # Create filename for this shard
+                save_name = self.matrix_name.split('.pt')[0] + '_shard_' + str(shard_index) + '.bin'
+                
+                # Handle shard for HEAD NODE (local storage)
+                if node_IP == self.IP:
+                    # For Matrix A (no split), we need to handle the case where head node has multiple shards
+                    if self.matrix_labeling == '' and self.split_matrix == False:
+                        # System 1, Matrix A (no split) - head node gets the full matrix
+                        # Save with shard_0 filename for the first head node assignment
+                        if shard_index == 0 or self.node_percentages[shard_index] > 0:
+                            save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
+                            save_file_path_RAM = os.path.join(self.local_RAM_folder, save_name)
+                            
+                            print(f"  Head node: Saving to DISK={save_file_path_DISK}")
+                            print(f"  Head node: Saving to RAM={save_file_path_RAM}")
+                            
+                            # Save the full matrix (node_matrices[0]) to this shard file
+                            self.save_matrix_binary(self.node_matrices[0].float(), save_file_path_DISK)
+                            self.save_matrix_binary(self.node_matrices[0].float(), save_file_path_RAM)
+                            
+                            # Store RAM path for later access
+                            self.matrix_file_paths_list.append(save_file_path_RAM)
+                            print(f"  Added RAM path to file list")
+                        else:
+                            print(f"  ⚠️  Skipping duplicate shard {shard_index} for head node (already saved)")
+                    else:
+                        # Normal split matrices (System 1 Matrix B or System 2)
+                        if unique_shard_index < len(self.node_matrices):
+                            save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
+                            save_file_path_RAM = os.path.join(self.local_RAM_folder, save_name)
+                            
+                            print(f"  Head node: Saving to DISK={save_file_path_DISK}")
+                            print(f"  Head node: Saving to RAM={save_file_path_RAM}")
+                            
+                            # Save tensor to binary file in both locations
+                            self.save_matrix_binary(self.node_matrices[unique_shard_index].float(), save_file_path_DISK)
+                            self.save_matrix_binary(self.node_matrices[unique_shard_index].float(), save_file_path_RAM)
+                            
+                            # Store RAM path for later access
+                            self.matrix_file_paths_list.append(save_file_path_RAM)
+                            print(f"  Added RAM path to file list")
+                        else:
+                            print(f"  ⚠️  No matrix found for shard {shard_index} (unique shard {unique_shard_index}) on head node")
+                            
+                # Handle shard for REMOTE NODE - RUN THE SCRIPT
+                elif node_IP != self.IP:
+                    print(f"  Remote node {node_IP}: Beginning remote split for shard {shard_index}")
+                    
+                    # Step 1: Determine the command based on matrix configuration
+                    percentages_str = ','.join([str(p) for p in self.node_percentages])
+                    
+                    # Build the remote command
+                    if self.matrix_labeling == 'a' or self.matrix_labeling == 'b':
+                        # System 2 (grid) - use matrix_labeling directly
+                        remote_split_command = (
+                            f'conda run -n cluster-worker python {script_path} '
+                            f'"{self.matrix_file_path}" '
+                            f'"{percentages_str}" '
+                            f'{self.dim} '
+                            f'2 '  # system 2
+                            f'"{self.matrix_labeling}" '
+                            f'{unique_shard_index}'  # Send the UNIQUE shard index, not the loop index
+                        )
+                    elif self.matrix_labeling == '' and self.split_matrix == False:
+                        # System 1, Matrix A (no split, save full matrix)
+                        remote_split_command = (
+                            f'conda run -n cluster-worker python {script_path} '
+                            f'"{self.matrix_file_path}" '
+                            f'"{percentages_str}" '
+                            f'{self.dim} '
+                            f'1 '  # system 1
+                            f'"a" '
+                            f'{shard_index}'  # For System 1 Matrix A, we still use shard_index
+                        )
+                    elif self.matrix_labeling == '' and self.split_matrix == True:
+                        # System 1, Matrix B (split)
+                        remote_split_command = (
+                            f'conda run -n cluster-worker python {script_path} '
+                            f'"{self.matrix_file_path}" '
+                            f'"{percentages_str}" '
+                            f'{self.dim} '
+                            f'1 '  # system 1
+                            f'"b" '
+                            f'{unique_shard_index}'  # Send the UNIQUE shard index
+                        )
+                    else:
+                        # Fallback to old file transfer method
+                        print(f"  Unknown configuration, falling back to file transfer")
+                        remote_split_command = None
+                    
+                    if remote_split_command:
+                        print(f"  Step 1: Sending remote split command: {remote_split_command[:100]}...")
+                                            
+                        # Send the split command
+                        self.zmq_send_command(node_IP, remote_split_command)
+                        
+                        # Step 2: Store remote RAM path
+                        # The script should save files with standard naming convention
+                        remote_filename = f'{os.path.basename(self.matrix_file_path).replace(".pt", "")}_shard_{shard_index}.bin'
+                        remote_ram_path = os.path.join(self.remote_RAM_folder, remote_filename)
+                        
+                        # For System 1, Matrix A (no split), the file might be named differently
+                        if self.matrix_labeling == '' and self.split_matrix == False:
+                            remote_filename = f'{os.path.basename(self.matrix_file_path).replace(".pt", "")}.bin'
+                            remote_ram_path = os.path.join(self.remote_RAM_folder, remote_filename)
+                        
+                        self.matrix_file_paths_list.append(remote_ram_path)
+                        print(f"  Added remote RAM path to file list: {remote_ram_path}")
+                        
+        self.wait_for_acks(len(unique_node_IP_list)-1,'MATRIX_SPLIT_COMPLETE_')
+        print(f"Distribution complete: {len(self.matrix_file_paths_list)} shards saved and distributed")
+        return self.matrix_file_paths_list
 
     def convert_bin_matrix_to_pt(self, filename, force_2d=True):  
         """  
@@ -1542,26 +1576,31 @@ class cluster_matrix:
             TransposeB_str = str(local_TransposeB).lower()
             print(f"  Final transpose flags - A: {TransposeA_str}, B: {TransposeB_str}")
             
+
             # ===== PREPARE SEND_BACK FLAG =====
-            # Send total_shards count instead of just true/false
-            send_back_str=''
-            if send_back_result:
-                send_back_str = len(self.node_IP_list)  # Number of shards to combine
-                if (self.matrix_labeling=='a' or self.matrix_labeling=='b'):
-                    send_back_str = send_back_str * -1 # make send back negative to signle system 2 combine
-                print(f"  Send back result: Yes ({send_back_str} shards will be combined)")
+
+            if not send_back_result:
+                send_back = 0
+                print("Send back result: No (keep distributed)")
+
             else:
-                send_back_str = "0"  # 0 means no send back
-                print(f"  Send back result: No (keep distributed)")
-            
-            if (self.split_depth != 0):
-                split_dim_string = ''
-                for split_dim in self.hierarchical_split_order:
-                    split_dim_string+= str(split_dim)
-                send_back_str = str(send_back_str) + '/' + str(self.dim) + split_dim_string # added a  '/' as delimiter
-             
-            print(f'DEBUG TEST: {send_back_str}')
-            
+                shard_count = len(self.node_IP_list)
+
+                # join_dim must ALWAYS be set
+                join_dim = self.dim  # 0 or 1
+
+                # Encode: join_dim * 10 + shard_count
+                send_back = join_dim * 10 + shard_count
+
+                # System 2 → negative
+                if self.matrix_labeling in ('a', 'b'):
+                    send_back = -send_back
+
+                print(f"Send back result: Yes ({send_back} shards will be combined)")
+                print(f"  → system={'2' if send_back < 0 else '1'}, join_dim={join_dim}, shards={shard_count}")
+
+            print(f"DEBUG SEND_BACK VALUE: {send_back}")
+
             # ===== BUILD COMMAND FOR SPECIFIC BACKEND =====
             command = (
                 f"server_command={back_end_select} "
@@ -1571,7 +1610,7 @@ class cluster_matrix:
                 f"{TransposeB_str} "
                 f"{use_gpu_str} "
                 f"{current_gpu_number} "
-                f"{send_back_str} "
+                f"{send_back} "
                 f"{operation} "
                 f"2 "
                 f"{shard_index}"
@@ -1612,15 +1651,15 @@ class cluster_matrix:
         if send_back_result:  
             path = self.local_RAM_folder + base_result_name + '_combined.bin'  
             if os.path.exists(path):  
-                time.sleep(0.5)  
+                time.sleep(0.15)  
                 combined_matrix = self.convert_bin_matrix_to_pt(path)  
-                time.sleep(0.5)  
+                time.sleep(0.15)  
                 os.remove(path)  
             else:  
                 self.wait_for_acks(1, "ACK_combined_matrix_saved")  
                 # Add this check - file might not exist yet  
                 if not os.path.exists(path):  
-                    time.sleep(0.5)  # Brief wait for file system  
+                    time.sleep(0.15)  # Brief wait for file system  
                 combined_matrix = self.convert_bin_matrix_to_pt(path)  
                 os.remove(path)  # Clean up any existing combined file  
             return combined_matrix  
@@ -1635,193 +1674,6 @@ class cluster_matrix:
             )  
             return result_cluster_matrix
         return False  # Return the distributed result instance
-
-    def remote_save_distribute_matrix_shards_bin(self):
-        """Save matrix shards as binary files and distribute to appropriate nodes."""
-        
-        # Get list of unique node IPs for ACK tracking
-        unique_node_IP_list = list(set(self.node_IP_list))
-        print(f"Starting distribution of {len(self.node_IP_list)} shards to {len(unique_node_IP_list)} unique nodes")
-        
-        # Clear the paths list
-        self.matrix_file_paths_list = []
-        
-        # Get the full path to THIS script (cluster_matrix_v1.py)
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        script_filename = os.path.basename(__file__)  # Gets 'cluster_matrix_v1.py'
-        script_path = os.path.join(current_dir, script_filename)
-        
-        # FIRST: Split the matrix on HEAD NODE to get node_matrices populated
-        print(f"\n🔧 Splitting matrix on head node first...")
-        if self.matrix_labeling == 'a' or self.matrix_labeling == 'b':
-            # System 2 (grid)
-            self.convert_to_cluster_matrix_grid()
-        elif self.matrix_labeling == '' and self.split_matrix == False:
-            # System 1, Matrix A (no split)
-            # Load full matrix
-            full_matrix = torch.load(self.matrix_file_path)
-            self.node_matrices = [full_matrix]  # Just one full matrix
-            print(f"✅ Matrix A (no split): {full_matrix.shape}")
-        elif self.matrix_labeling == '' and self.split_matrix == True:
-            # System 1, Matrix B (split)
-            self.convert_to_cluster_matrix_shards()
-        
-        # Track which shards have been saved for head node (to avoid duplicates)
-        head_node_shards_saved = []
-        
-        # Process each shard
-        for shard_index, node_IP in enumerate(self.node_IP_list):
-            print(f"Processing shard {shard_index} for node {node_IP}")
-            
-            # Create filename for this shard
-            save_name = self.matrix_name.split('.pt')[0] + '_shard_' + str(shard_index) + '.bin'
-            
-            # Handle shard for HEAD NODE (local storage)
-            if node_IP == self.IP:
-                # For Matrix A (no split), we need to handle the case where head node has multiple shards
-                if self.matrix_labeling == '' and self.split_matrix == False:
-                    # System 1, Matrix A (no split) - head node gets the full matrix
-                    # Save with shard_0 filename for the first head node assignment
-                    if shard_index == 0 or self.node_percentages[shard_index] > 0:
-                        save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
-                        save_file_path_RAM = os.path.join(self.local_RAM_folder, save_name)
-                        
-                        print(f"  Head node: Saving to DISK={save_file_path_DISK}")
-                        print(f"  Head node: Saving to RAM={save_file_path_RAM}")
-                        
-                        # Save the full matrix (node_matrices[0]) to this shard file
-                        self.save_matrix_binary(self.node_matrices[0].float(), save_file_path_DISK)
-                        self.save_matrix_binary(self.node_matrices[0].float(), save_file_path_RAM)
-                        
-                        # Store RAM path for later access
-                        self.matrix_file_paths_list.append(save_file_path_RAM)
-                        print(f"  Added RAM path to file list")
-                        head_node_shards_saved.append(shard_index)
-                    else:
-                        print(f"  ⚠️  Skipping duplicate shard {shard_index} for head node (already saved)")
-                else:
-                    # Normal split matrices (System 1 Matrix B or System 2)
-                    if shard_index < len(self.node_matrices):
-                        save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
-                        save_file_path_RAM = os.path.join(self.local_RAM_folder, save_name)
-                        
-                        print(f"  Head node: Saving to DISK={save_file_path_DISK}")
-                        print(f"  Head node: Saving to RAM={save_file_path_RAM}")
-                        
-                        # Save tensor to binary file in both locations
-                        self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_DISK)
-                        self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_RAM)
-                        
-                        # Store RAM path for later access
-                        self.matrix_file_paths_list.append(save_file_path_RAM)
-                        print(f"  Added RAM path to file list")
-                    else:
-                        print(f"  ⚠️  No matrix found for shard {shard_index} on head node")
-                        
-            # Handle shard for REMOTE NODE - RUN THE SCRIPT
-            elif node_IP != self.IP:
-                print(f"  Remote node {node_IP}: Beginning remote split")
-                
-                # Step 1: Determine the command based on matrix configuration
-                percentages_str = ','.join([str(p) for p in self.node_percentages])
-                
-                # Build the remote command
-                if self.matrix_labeling == 'a' or self.matrix_labeling == 'b':
-                    # System 2 (grid) - use matrix_labeling directly
-                    remote_split_command = (
-                        f'conda run -n cluster-worker python {script_path} '
-                        f'"{self.matrix_file_path}" '
-                        f'"{percentages_str}" '
-                        f'{self.dim} '
-                        f'2 '  # system 2
-                        f'"{self.matrix_labeling}" '
-                        f'{shard_index}'
-                    )
-                elif self.matrix_labeling == '' and self.split_matrix == False:
-                    # System 1, Matrix A (no split, save full matrix)
-                    remote_split_command = (
-                        f'conda run -n cluster-worker python {script_path} '
-                        f'"{self.matrix_file_path}" '
-                        f'"{percentages_str}" '
-                        f'{self.dim} '
-                        f'1 '  # system 1
-                        f'"a" '
-                        f'{shard_index}'
-                    )
-                elif self.matrix_labeling == '' and self.split_matrix == True:
-                    # System 1, Matrix B (split)
-                    remote_split_command = (
-                        f'conda run -n cluster-worker python {script_path} '
-                        f'"{self.matrix_file_path}" '
-                        f'"{percentages_str}" '
-                        f'{self.dim} '
-                        f'1 '  # system 1
-                        f'"b" '
-                        f'{shard_index}'
-                    )
-                else:
-                    # Fallback to old file transfer method
-                    print(f"  Unknown configuration, falling back to file transfer")
-                    remote_split_command = None
-                
-                if remote_split_command:
-                    print(f"  Step 1: Sending remote split command: {remote_split_command[:100]}...")
-                    
-                    # Create remote directories first
-                    mkdir_cmd = f"mkdir -p {self.remote_RAM_folder} {self.remote_DISK_folder} {self.remote_matrix_results_RAM_folder}"
-                    self.zmq_send_command(node_IP, mkdir_cmd)
-                    
-                    # Send the split command
-                    self.zmq_send_command(node_IP, remote_split_command)
-                    
-                    # Step 2: Store remote RAM path
-                    # The script should save files with standard naming convention
-                    remote_filename = f'{os.path.basename(self.matrix_file_path).replace(".pt", "")}_shard_{shard_index}.bin'
-                    remote_ram_path = os.path.join(self.remote_RAM_folder, remote_filename)
-                    
-                    # For System 1, Matrix A (no split), the file might be named differently
-                    if self.matrix_labeling == '' and self.split_matrix == False:
-                        remote_filename = f'{os.path.basename(self.matrix_file_path).replace(".pt", "")}.bin'
-                        remote_ram_path = os.path.join(self.remote_RAM_folder, remote_filename)
-                    
-                    self.matrix_file_paths_list.append(remote_ram_path)
-                    print(f"  Added remote RAM path to file list: {remote_ram_path}")
-                    
-                    # Optional: We could wait for ACK from the script
-                    # But for now, assume it works
-                    
-                else:
-                    # Fallback: Use original file transfer method
-                    print(f"  Falling back to file transfer for shard {shard_index}")
-                    
-                    # Save shard locally first
-                    save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
-                    print(f"  Step 1: Saving locally to {save_file_path_DISK}")
-                    self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_DISK)
-                    
-                    # Send file to remote node
-                    print(f"  Step 2: Sending file to remote node {node_IP}")
-                    self.zmq_send_file(node_IP, save_file_path_DISK)
-                    
-                    # Create directories on remote
-                    mkdir_cmd = f"mkdir -p {self.remote_RAM_folder} {self.remote_DISK_folder} {self.remote_matrix_results_RAM_folder}"
-                    self.zmq_send_command(node_IP, mkdir_cmd)
-                    
-                    # Wait for ACK
-                    self.wait_for_acks(1, save_name)
-                    
-                    # Copy from RAM to disk on remote
-                    remote_ram_path = os.path.join(self.remote_RAM_folder, save_name)
-                    remote_disk_path = os.path.join(self.remote_project_dir, self.remote_DISK_folder, save_name)
-                    copy_command = f'cp {remote_ram_path} {remote_disk_path}'
-                    self.zmq_send_command(node_IP, copy_command)
-                    
-                    self.matrix_file_paths_list.append(remote_ram_path)
-                    print(f"  Added remote RAM path to file list: {remote_ram_path}")
-        
-        self.wait_for_acks(len(unique_node_IP_list)-1,'MATRIX_SPLIT_COMPLETE_')
-        print(f"Distribution complete: {len(self.matrix_file_paths_list)} shards saved and distributed")
-        return self.matrix_file_paths_list
 
 
 if __name__ == "__main__":
