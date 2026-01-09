@@ -697,10 +697,6 @@ class llama_zmq_server
                     }
                     std::cout << "**run_server_command** shard_index_override: " << shard_index_override << std::endl;
                     std::cout << "**run_server_command** send_back: " << send_back << std::endl;
-
-                    
-                    // Store for later use in result distribution
-                    send_back_number_of_shards = send_back;
                     
                     bool operation_success = false;
                     std::string backend_name;
@@ -1178,6 +1174,7 @@ class llama_zmq_server
         }
 
 
+
         bool handle_combine_matrix_shard_list(
             const std::string& filename,
             std::unique_ptr<float[]> data,
@@ -1198,8 +1195,7 @@ class llama_zmq_server
             // ============================================================
             // EXTRACT MATRIX NAME AND SHARD NUMBER
             // ============================================================
-            auto [matrix_name, shard_num] =
-                get_matrix_name_and_shard_number(filename);
+            auto [matrix_name, shard_num] = get_matrix_name_and_shard_number(filename);
 
             std::cout << "DEBUG: Extracted matrix_name='"
                     << matrix_name << "', shard_num=" << shard_num << std::endl;
@@ -1226,9 +1222,7 @@ class llama_zmq_server
                 );
             }
 
-            size_t data_size =
-                static_cast<size_t>(shard_rows) * shard_cols * sizeof(float);
-
+            size_t data_size = static_cast<size_t>(shard_rows) * shard_cols * sizeof(float);
             shard_bytes.insert(
                 shard_bytes.end(),
                 reinterpret_cast<uint8_t*>(data.get()),
@@ -1239,7 +1233,7 @@ class llama_zmq_server
                     << shard_bytes.size() << std::endl;
 
             // ============================================================
-            // TRACK SHARD
+            // TRACK EXISTING MATRIX
             // ============================================================
             std::cout << "DEBUG: Checking "
                     << combined_matrix_shards_list.size()
@@ -1247,22 +1241,32 @@ class llama_zmq_server
 
             for (auto& combined : combined_matrix_shards_list)
             {
-                auto [combined_name, _] =
-                    get_matrix_name_and_shard_number(combined.file_name);
+                auto [combined_name, _] = get_matrix_name_and_shard_number(combined.file_name);
 
                 if (combined_name == matrix_name)
                 {
                     std::cout << "DEBUG: FOUND MATCH for matrix '"
                             << matrix_name << "'" << std::endl;
 
-                    // 🔴 🔴 🔴 CRITICAL FIX 🔴 🔴 🔴
-                    // First shard may arrive with total_shards == 0
-                    // Later shard carries the real value → update it
+                    // Update shard count if first shard was placeholder
                     if (combined.number_of_shards_needed == 0 && total_shards != 0)
                     {
-                        combined.number_of_shards_needed = total_shards;
+                        int abs_val = std::abs(total_shards);
+                        int join_dim = 0;
+                        int shards_needed = abs_val;
+
+                        if (abs_val >= 10)
+                        {
+                            join_dim = abs_val / 10;
+                            shards_needed = abs_val % 10;
+                        }
+
+                        combined.join_dim = join_dim;
+                        combined.number_of_shards_needed = shards_needed;
+
                         std::cout << "DEBUG: number_of_shards_needed UPDATED to "
-                                << total_shards << std::endl;
+                                << shards_needed
+                                << ", join_dim=" << join_dim << std::endl;
                     }
 
                     combined.total_shards_reserved++;
@@ -1275,22 +1279,18 @@ class llama_zmq_server
                             << " of " << combined.number_of_shards_needed
                             << std::endl;
 
-                    int needed =
-                        std::abs(combined.number_of_shards_needed);
+                    int needed = std::abs(combined.number_of_shards_needed);
 
-                    if (needed > 0 &&
-                        combined.total_shards_reserved == needed)
+                    if (needed > 0 && combined.total_shards_reserved == needed)
                     {
-                        bool is_system2 =
-                            (combined.number_of_shards_needed < 0);
+                        bool is_system2 = (total_shards < 0);
 
                         std::cout << "DEBUG: ALL SHARDS RECEIVED! Combining..."
                                 << std::endl;
 
-                        MatrixResult full =
-                            is_system2
-                                ? combine_matrix_shards_grid_2d(combined)
-                                : combine_matrix_shards_2d(combined);
+                        MatrixResult full = is_system2
+                            ? combine_matrix_shards_grid_2d(combined)
+                            : combine_matrix_shards_2d(combined);
 
                         if (full.data)
                         {
@@ -1310,6 +1310,7 @@ class llama_zmq_server
                                     << matrix_name << std::endl;
                         }
 
+                        // Remove completed matrix from tracking
                         combined_matrix_shards_list.erase(
                             std::remove_if(
                                 combined_matrix_shards_list.begin(),
@@ -1329,32 +1330,48 @@ class llama_zmq_server
             }
 
             // ============================================================
-            // FIRST SHARD → CREATE ENTRY
+            // FIRST SHARD → CREATE NEW TRACKING ENTRY
             // ============================================================
             combined_matrix_shards combined;
             combined.file_name = matrix_name;
-            combined.number_of_shards_needed = total_shards;
+
+            // ---- Parse send_back encoding
+            int abs_val = std::abs(total_shards);
+            int join_dim = 0;
+            int shards_needed = abs_val;
+
+            if (abs_val >= 10)
+            {
+                join_dim = abs_val / 10;
+                shards_needed = abs_val % 10;
+            }
+
+            combined.join_dim = join_dim;
+            combined.number_of_shards_needed = shards_needed;
             combined.total_shards_reserved = 1;
+
             combined.shard_numbers.push_back(shard_num);
             combined.received_matrix_data.push_back(std::move(shard_bytes));
             combined.dims_list.push_back({1, 1, shard_rows, shard_cols});
 
             combined_matrix_shards_list.push_back(std::move(combined));
 
-            std::cout << "Started tracking new matrix: "
+            std::cout << "Started tracking matrix: "
                     << matrix_name
-                    << " (shard " << shard_num
-                    << " of " << std::abs(total_shards)
-                    << ")" << std::endl;
+                    << " | shards=" << shards_needed
+                    << " | join_dim=" << join_dim
+                    << " | system=" << (total_shards < 0 ? "2" : "1")
+                    << std::endl;
 
             return true;
         }
+
+
 
         MatrixResult combine_matrix_shards_2d(const combined_matrix_shards& combined)
         {
             MatrixResult result;
 
-            // Early return if no data received
             if (combined.received_matrix_data.empty()) {
                 return result;
             }
@@ -1362,258 +1379,229 @@ class llama_zmq_server
             // ============================================================
             // STEP 1: SORT SHARDS BY SHARD NUMBER
             // ============================================================
-            // Create vector of (shard_number, shard_data_pointer) pairs
-            std::vector<std::pair<int, const std::vector<uint8_t>*>> sorted_shards;
-            
+            struct ShardEntry {
+                int shard_num;
+                torch::Tensor tensor;
+            };
+
+            std::vector<ShardEntry> shards;
+
             auto shard_num_it = combined.shard_numbers.begin();
             auto data_it      = combined.received_matrix_data.begin();
 
-            // Pair each shard number with its corresponding data
             for (; shard_num_it != combined.shard_numbers.end() &&
                 data_it      != combined.received_matrix_data.end();
                 ++shard_num_it, ++data_it)
             {
-                sorted_shards.emplace_back(*shard_num_it, &(*data_it));
-            }
+                // Save shard bytes to temp file OR directly load from memory
+                // You already have bin layout → reuse loader
+                const std::vector<uint8_t>& bytes = *data_it;
 
-            // Sort by shard number to ensure correct concatenation order
-            std::sort(sorted_shards.begin(), sorted_shards.end(),
-                    [](auto& a, auto& b){ return a.first < b.first; });
-
-            // ============================================================
-            // STEP 2: COMPUTE TOTAL DIMENSIONS
-            // ============================================================
-            // Calculate total rows (sum of all shard rows) 
-            // and total cols (maximum shard columns)
-            int total_rows = 0;
-            int total_cols = 0;
-
-            for (const auto& [shard_num, shard_bytes] : sorted_shards) {
-                const uint8_t* p = shard_bytes->data();
-
-                // Read metadata from shard
-                int ndim = *reinterpret_cast<const int*>(p);
-                p += sizeof(int);
-
-                std::vector<int> dims(ndim);
-                for (int i = 0; i < ndim; ++i) {
-                    dims[i] = *reinterpret_cast<const int*>(p);
-                    p += sizeof(int);
+                // Write to temp buffer-backed stream
+                std::string tmp_path = "/dev/shm/tmp_shard_" + std::to_string(*shard_num_it) + ".bin";
+                {
+                    std::ofstream f(tmp_path, std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
                 }
 
-                int rows = dims[2];  // rows dimension
-                int cols = dims[3];  // cols dimension
+                torch::Tensor t = load_matrix_bin_as_torch_view(tmp_path);
 
-                total_rows += rows;
-                total_cols = std::max(total_cols, cols);
+                shards.push_back({*shard_num_it, t});
             }
 
-            std::cout << "Combining " << sorted_shards.size() << " shards into "
-                    << total_rows << "x" << total_cols << " matrix" << std::endl;
+            std::sort(shards.begin(), shards.end(),
+                    [](const ShardEntry& a, const ShardEntry& b) {
+                        return a.shard_num < b.shard_num;
+                    });
 
             // ============================================================
-            // STEP 3: ALLOCATE OUTPUT MATRIX
+            // STEP 2: VALIDATE SHAPES
             // ============================================================
-            // Set dimensions: single batch and depth, combined rows and cols
-            result.dims[0] = 1;  // batch
-            result.dims[1] = 1;  // depth
-            result.dims[2] = total_rows;
-            result.dims[3] = total_cols;
+            const auto& ref = shards[0].tensor.sizes();
+            int64_t batch = (ref.size() == 4) ? ref[0] : 1;
+            int64_t depth = (ref.size() == 4) ? ref[1] : 1;
 
-            // Allocate memory for combined matrix
-            result.data = std::make_unique<float[]>(
-                static_cast<size_t>(total_rows) * total_cols
+            for (const auto& s : shards) {
+                const auto& sz = s.tensor.sizes();
+
+                if (sz.size() != ref.size()) {
+                    throw std::runtime_error("Shard rank mismatch");
+                }
+
+                if (sz.size() == 4) {
+                    if (sz[0] != batch || sz[1] != depth) {
+                        throw std::runtime_error("Batch/depth mismatch between shards");
+                    }
+                }
+            }
+
+            // ============================================================
+            // STEP 3: TORCH CONCAT
+            // ============================================================
+            std::vector<torch::Tensor> tensors;
+            for (auto& s : shards) {
+                tensors.push_back(s.tensor);
+            }
+
+            int torch_join_dim;
+            if (ref.size() == 2) {
+                torch_join_dim = combined.join_dim;
+            } else if (ref.size() == 3) {
+                torch_join_dim = combined.join_dim + 1; // skip batch
+            } else {
+                torch_join_dim = combined.join_dim + 2; // skip batch + depth
+            }
+
+            torch::Tensor combined_tensor = torch::cat(tensors, torch_join_dim);
+
+            // ============================================================
+            // STEP 4: EXPORT BACK TO MatrixResult
+            // ============================================================
+            auto sizes = combined_tensor.sizes();
+
+            result.dims[0] = (sizes.size() == 4) ? sizes[0] : 1;
+            result.dims[1] = (sizes.size() == 4) ? sizes[1] : 1;
+            result.dims[2] = sizes[sizes.size() - 2];
+            result.dims[3] = sizes[sizes.size() - 1];
+
+            size_t total = combined_tensor.numel();
+            result.data = std::make_unique<float[]>(total);
+
+            std::memcpy(
+                result.data.get(),
+                combined_tensor.contiguous().data_ptr<float>(),
+                total * sizeof(float)
             );
 
-            // ============================================================
-            // STEP 4: COPY SHARDS (ROW-MAJOR CONCATENATION)
-            // ============================================================
-            int row_offset = 0;  // Track where to place next shard
+            std::cout << "Torch combine complete → shape ("
+                    << result.dims[2] << " x " << result.dims[3] << ")\n";
 
-            for (const auto& [shard_num, shard_bytes] : sorted_shards) {
-                const uint8_t* p = shard_bytes->data();
-
-                // Read shard metadata
-                int ndim = *reinterpret_cast<const int*>(p);
-                p += sizeof(int);
-
-                std::vector<int> dims(ndim);
-                for (int i = 0; i < ndim; ++i) {
-                    dims[i] = *reinterpret_cast<const int*>(p);
-                    p += sizeof(int);
-                }
-
-                int rows = dims[2];
-                int cols = dims[3];
-                
-                const float* shard_data = reinterpret_cast<const float*>(p);
-
-                std::cout << "  Copying shard " << shard_num << ": " 
-                        << rows << "x" << cols << std::endl;
-
-                // Row-major copy: concatenate shards vertically
-                for (int r = 0; r < rows; ++r) {
-                    std::memcpy(
-                        result.data.get() + (row_offset + r) * total_cols,
-                        shard_data + r * cols,
-                        sizeof(float) * cols
-                    );
-                }
-
-                row_offset += rows;
-            }
-
-            std::cout << "Matrix combination complete" << std::endl;
-            
             return result;
         }
 
 
-        MatrixResult combine_matrix_shards_grid_2d(const combined_matrix_shards& combined)
+        MatrixResult combine_matrix_shards_grid_2d(
+            const combined_matrix_shards& combined
+        )
         {
             MatrixResult result;
-            
+
             if (combined.received_matrix_data.empty()) {
                 return result;
             }
-            
-            std::cout << "DEBUG: Starting System 2 grid combine" << std::endl;
-            std::cout << "DEBUG: Total shards: " << combined.received_matrix_data.size() << std::endl;
-            
+
             // ============================================================
-            // STEP 1: SORT SHARDS BY SHARD NUMBER
+            // STEP 1: LOAD SHARDS AS TORCH TENSORS (SORTED)
             // ============================================================
-            std::vector<std::tuple<int, const std::vector<uint8_t>*, std::vector<int>>> sorted_shards;
-            
-            auto shard_num_it = combined.shard_numbers.begin();
-            auto data_it      = combined.received_matrix_data.begin();
-            auto dims_it      = combined.dims_list.begin();
-            
-            for (; shard_num_it != combined.shard_numbers.end() &&
-                data_it      != combined.received_matrix_data.end() &&
-                dims_it      != combined.dims_list.end();
-                ++shard_num_it, ++data_it, ++dims_it)
-            {
-                sorted_shards.emplace_back(*shard_num_it, &(*data_it), *dims_it);
+            struct Shard {
+                int index;
+                torch::Tensor t;
+                int rows;
+                int cols;
+            };
+
+            std::vector<Shard> shards;
+
+            auto n_it = combined.shard_numbers.begin();
+            auto d_it = combined.received_matrix_data.begin();
+            auto s_it = combined.dims_list.begin();
+
+            for (; n_it != combined.shard_numbers.end(); ++n_it, ++d_it, ++s_it) {
+
+                const int shard_index = *n_it;
+                const auto& dims = *s_it;   // [batch, depth, rows, cols]
+
+                const int rows = dims[2];
+                const int cols = dims[3];
+
+                const uint8_t* p = d_it->data();
+                p += sizeof(int) + 4 * sizeof(int); // skip ndim + dims
+
+                const float* raw = reinterpret_cast<const float*>(p);
+
+                auto t = torch::from_blob(
+                    (void*)raw,
+                    {rows, cols},
+                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
+                ).clone(); // own memory
+
+                shards.push_back({shard_index, t, rows, cols});
             }
-            
-            std::sort(sorted_shards.begin(), sorted_shards.end(),
-                    [](auto& a, auto& b){ return std::get<0>(a) < std::get<0>(b); });
-            
-            int total_shards = sorted_shards.size();
-            std::cout << "DEBUG: Sorted " << total_shards << " shards" << std::endl;
-            
+
+            std::sort(shards.begin(), shards.end(),
+                    [](const Shard& a, const Shard& b) {
+                        return a.index < b.index;
+                    });
+
             // ============================================================
-            // STEP 2: DETERMINE GRID DIMENSIONS
+            // STEP 2: INFER GRID STRUCTURE AUTOMATICALLY
             // ============================================================
-            // For GEMM: A is split into 2 shards, B into (total_shards/2) shards
-            const int grid_rows = 2;
-            const int grid_cols = total_shards / grid_rows;  // Should be 3 for 6 shards
-            
-            std::cout << "DEBUG: Grid layout: " << grid_rows << "×" << grid_cols 
-                    << " (A split into " << grid_rows << ", B split into " << grid_cols << ")" << std::endl;
-            
-            // ============================================================
-            // STEP 3: VERIFY SHARD DIMENSIONS
-            // ============================================================
-            int shard_rows = 0;
-            int shard_cols = 0;
-            
-            for (int i = 0; i < total_shards; i++) {
-                auto& [shard_num, shard_data, dims] = sorted_shards[i];
-                int current_rows = dims[2];
-                int current_cols = dims[3];
-                
-                std::cout << "DEBUG: Shard " << shard_num << ": " 
-                        << current_rows << "×" << current_cols << std::endl;
-                
-                if (shard_rows == 0) shard_rows = current_rows;
-                if (shard_cols == 0) shard_cols = current_cols;
-                
-                // All shards should have same dimensions in GEMM
-                if (current_rows != shard_rows || current_cols != shard_cols) {
-                    std::cout << "WARNING: Shard " << shard_num << " has different dimensions: "
-                            << current_rows << "×" << current_cols 
-                            << " (expected " << shard_rows << "×" << shard_cols << ")" << std::endl;
+            const int total_shards = shards.size();
+            const int shard_rows   = shards[0].rows;
+            const int shard_cols   = shards[0].cols;
+
+            // Count how many shards contribute to the same row-block
+            // by detecting when row offset changes
+            int B_parts = 0;
+            for (int i = 0; i < total_shards; ++i) {
+                if (shards[i].index == i) {
+                    B_parts++;
+                } else {
+                    break;
                 }
             }
-            
+
+            if (B_parts == 0) {
+                throw std::runtime_error("Failed to infer System-2 grid");
+            }
+
+            const int A_parts = total_shards / B_parts;
+
             // ============================================================
-            // STEP 4: CALCULATE FINAL DIMENSIONS
+            // STEP 3: FINAL SHAPE
             // ============================================================
-            // With 6 shards of 5000×5000 in 2×3 grid:
-            // Total rows: 2 × 5000 = 10000
-            // Total cols: 3 × 5000 = 15000
-            int total_rows = grid_rows * shard_rows;
-            int total_cols = grid_cols * shard_cols;
-            
-            std::cout << "DEBUG: Each shard: " << shard_rows << "×" << shard_cols << std::endl;
-            std::cout << "DEBUG: Final matrix: " << total_rows << "×" << total_cols 
-                    << " (should be 10000×15000)" << std::endl;
-            
-            // ============================================================
-            // STEP 5: ALLOCATE OUTPUT MATRIX
-            // ============================================================
+            const int total_rows = A_parts * shard_rows;
+            const int total_cols = shard_cols;
+
             result.dims[0] = 1;
             result.dims[1] = 1;
             result.dims[2] = total_rows;
             result.dims[3] = total_cols;
-            
-            result.data = std::make_unique<float[]>(
-                static_cast<size_t>(total_rows) * total_cols
+
+            auto out = torch::zeros(
+                {total_rows, total_cols},
+                torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
             );
-            
-            std::fill_n(result.data.get(), total_rows * total_cols, 0.0f);
-            
+
             // ============================================================
-            // STEP 6: ASSEMBLE THE GRID
+            // STEP 4: SYSTEM-2 COMBINE (SUM PARTIALS)
             // ============================================================
-            // Each column in the grid corresponds to one B shard
-            // Shards 0,1,2: Row 0 (A1 × B0.T, A1 × B1.T, A1 × B2.T)
-            // Shards 3,4,5: Row 1 (A2 × B0.T, A2 × B1.T, A2 × B2.T)
-            
-            for (int i = 0; i < total_shards; i++) {
-                auto& [shard_num, shard_data, dims] = sorted_shards[i];
-                
-                int shard_rows = dims[2];
-                int shard_cols = dims[3];
-                
-                // Calculate grid position
-                int grid_row = i / grid_cols;      // 0 or 1
-                int grid_col = i % grid_cols;      // 0, 1, or 2
-                
-                // Calculate destination position
-                int dest_row_start = grid_row * shard_rows;      // 0 or 5000
-                int dest_col_start = grid_col * shard_cols;      // 0, 5000, or 10000
-                
-                // Get shard data
-                const uint8_t* p = shard_data->data();
-                p += sizeof(int) + 4 * sizeof(int);
-                const float* shard_float_data = reinterpret_cast<const float*>(p);
-                
-                std::cout << "DEBUG: Placing shard " << shard_num 
-                        << " (" << shard_rows << "×" << shard_cols << ")"
-                        << " at grid[" << grid_row << "][" << grid_col << "]"
-                        << " → dest[" << dest_row_start << ":" << dest_row_start + shard_rows
-                        << ", " << dest_col_start << ":" << dest_col_start + shard_cols << "]" << std::endl;
-                
-                // Copy data
-                for (int r = 0; r < shard_rows; r++) {
-                    int dest_row = dest_row_start + r;
-                    std::memcpy(
-                        result.data.get() + dest_row * total_cols + dest_col_start,
-                        shard_float_data + r * shard_cols,
-                        sizeof(float) * shard_cols
-                    );
-                }
+            for (int i = 0; i < total_shards; ++i) {
+
+                const int a = i / B_parts;   // row block
+                const int row_offset = a * shard_rows;
+
+                out.slice(
+                    0,
+                    row_offset,
+                    row_offset + shard_rows
+                ).add_(shards[i].t);
             }
-            
-            std::cout << "DEBUG: Grid assembly complete: " 
-                    << total_rows << "×" << total_cols << std::endl;
-            
+
+            // ============================================================
+            // STEP 5: EXPORT RESULT
+            // ============================================================
+            result.data = std::make_unique<float[]>(total_rows * total_cols);
+            std::memcpy(
+                result.data.get(),
+                out.contiguous().data_ptr<float>(),
+                sizeof(float) * total_rows * total_cols
+            );
+
             return result;
         }
 
+        
 
         bool matrix_operation(
             const std::string& backend_type,
