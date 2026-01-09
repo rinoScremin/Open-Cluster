@@ -17,6 +17,7 @@ import shutil
 import glob
 import math
 import sys
+import io
 
 def check_combined_result_values(c_ref_path, combined):
     c_ref = torch.load(c_ref_path)
@@ -483,6 +484,121 @@ class cluster_matrix:
             ])
             print(f"📤 Sent file {filename_only} to {worker_ip}")
         
+    def stream_matrix_binary(self, worker_ip, matrix, save_name):
+        """
+        Stream a matrix as binary data directly to a remote node without saving locally.
+        Creates the binary file data in memory and sends it via ZeroMQ.
+        
+        Args:
+            matrix: PyTorch tensor to stream
+            worker_ip: IP address of the target worker node
+            save_name: Filename to use for the streamed file
+        """
+        print(f"📤 Streaming matrix to {worker_ip} as {save_name}")
+        
+        if worker_ip not in self.llama_socket_pool:
+            print(f"  ERROR: No socket connection to {worker_ip}")
+            return
+        
+        socket_eth = self.llama_socket_pool[worker_ip]
+        
+        # ===== CREATE BINARY FILE DATA IN MEMORY =====
+        print("  Creating binary file data in memory...")
+        
+        # Convert to numpy if needed
+        if isinstance(matrix, torch.Tensor):
+            print(f"    Input is PyTorch tensor: shape={matrix.shape}")
+            matrix_float = matrix.float().cpu()
+            matrix_np = matrix_float.detach().numpy()
+        elif isinstance(matrix, np.ndarray):
+            print(f"    Input is numpy array: shape={matrix.shape}")
+            matrix_np = matrix.astype('float32')
+        else:
+            error_msg = f"Unsupported matrix type: {type(matrix)}"
+            print(f"  ERROR: {error_msg}")
+            raise ValueError(error_msg)
+        
+        # Ensure float32 dtype
+        matrix_np = matrix_np.astype('float32')
+        print(f"    Converted to numpy: shape={matrix_np.shape}, dtype={matrix_np.dtype}")
+        
+        # ===== CONVERT TO 4D FORMAT =====
+        # Follow the same format as save_matrix_binary
+        original_shape = matrix_np.shape
+        
+        if len(matrix_np.shape) == 2:
+            # 2D matrix -> reshape to (1, 1, height, width)
+            new_shape = (1, 1, matrix_np.shape[0], matrix_np.shape[1])
+            matrix_np = matrix_np.reshape(new_shape)
+            print(f"    2D {original_shape} -> 4D {new_shape}")
+        elif len(matrix_np.shape) == 3:
+            # 3D matrix -> reshape to (1, channels, height, width)
+            new_shape = (1, matrix_np.shape[0], matrix_np.shape[1], matrix_np.shape[2])
+            matrix_np = matrix_np.reshape(new_shape)
+            print(f"    3D {original_shape} -> 4D {new_shape}")
+        elif len(matrix_np.shape) == 4:
+            # Already 4D
+            print(f"    Already 4D format: {matrix_np.shape}")
+        else:
+            error_msg = f"Unsupported number of dimensions: {len(matrix_np.shape)}"
+            print(f"  ERROR: {error_msg}")
+            raise ValueError(error_msg)
+        
+        # ===== CREATE COMPLETE BINARY DATA =====
+        # Create header: [num_dims, dim1, dim2, dim3, dim4]
+        ndim = 4
+        
+        # Build the binary data
+        binary_data = bytearray()
+        
+        # Add number of dimensions
+        binary_data.extend(struct.pack('i', ndim))
+        
+        # Add all 4 dimensions
+        for i, dim in enumerate(matrix_np.shape):
+            binary_data.extend(struct.pack('i', dim))
+            if i == 0:
+                print(f"    Dimensions: {dim}", end="")
+            else:
+                print(f" × {dim}", end="")
+        print()  # New line after dimensions
+        
+        # Add matrix data
+        binary_data.extend(matrix_np.tobytes())
+        
+        # Convert to bytes
+        file_data = bytes(binary_data)
+        
+        # Calculate size info
+        expected_size = 4 + ndim * 4 + matrix_np.size * 4
+        actual_size = len(file_data)
+        
+        print(f"  Binary data size: {actual_size:,} bytes")
+        print(f"  Expected size: {expected_size:,} bytes")
+        print(f"  Memory usage: {actual_size/(1024*1024):.2f} MB")
+        
+        if actual_size == expected_size:
+            print(f"  ✓ Binary data verification passed")
+        else:
+            print(f"  ⚠️  Binary data size mismatch")
+        
+        # ===== SEND VIA ZMQ =====
+        # Use the exact same pattern as zmq_send_file
+        try:
+            socket_eth.send_multipart([
+                save_name.encode(),
+                file_data
+            ])
+            
+            print(f"  ✓ Matrix streamed to {worker_ip}")
+            print(f"  Sent: {save_name} ({actual_size:,} bytes)")
+            
+        except Exception as e:
+            print(f"  ERROR streaming matrix to {worker_ip}: {e}")
+            raise
+        
+        return actual_size
+
     def cleanup(self):
         for socket in self.llama_socket_pool.values():
             socket.close()
@@ -647,18 +763,14 @@ class cluster_matrix:
 
     def save_distribute_matrix_shards_bin(self):
         """Save matrix shards as binary files and distribute to appropriate nodes."""
-        
         # Get list of unique node IPs for ACK tracking
         unique_node_IP_list = list(set(self.node_IP_list))
         print(f"Starting distribution of {len(self.node_IP_list)} shards to {len(unique_node_IP_list)} unique nodes")
-        
         # Process each shard
         for shard_index, node_IP in enumerate(self.node_IP_list):
             print(f"Processing shard {shard_index} for node {node_IP}")
-            
             # Create filename for this shard
             save_name = self.matrix_name.split('.pt')[0] + '_shard_' + str(shard_index)
-            
             # Handle shard for HEAD NODE (local storage)
             if node_IP == self.IP:
                 save_name += '.bin'
@@ -679,20 +791,10 @@ class cluster_matrix:
             # Handle shard for REMOTE NODE
             elif node_IP != self.IP:
                 save_name += '.bin'
-                
                 print(f"  Remote node {node_IP}: Beginning distribution")
-                
-                # Step 1: Save shard locally first
-                save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
-                print(f"  Step 1: Saving locally to {save_file_path_DISK}")
-                self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_DISK)
-                
 
-                print(f'DEBUG::: {save_name}')
+                self.stream_matrix_binary(node_IP, self.node_matrices[shard_index].float(), save_name)
 
-                # Step 2: Send file to remote node via ZeroMQ
-                print(f"  Step 2: Sending file to remote node {node_IP}")
-                self.zmq_send_file(node_IP, save_file_path_DISK)
                 self.wait_for_acks(1,save_name)
                 # Step 3: Tell remote node to copy from RAM to DISK
                 remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, save_name)
@@ -703,15 +805,10 @@ class cluster_matrix:
                 copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
                 print(f"  Step 3: Sending copy command to remote")
                 self.zmq_send_command(node_IP, copy_command)
-                
                 # Step 4: Store remote RAM path (not local)
                 self.matrix_file_paths_list.append(remote_save_file_path_RAM)
                 print(f"  Added remote RAM path to file list: {remote_save_file_path_RAM}")
-        
-        # Wait for ACK signals from remote nodes (excluding head node)
-        #print(f"Waiting for ACKs from {len(unique_node_IP_list)-1} remote nodes...")
-        #self.wait_for_acks(len(unique_node_IP_list)-1)
-        
+                
         print(f"Distribution complete: {len(self.matrix_file_paths_list)} shards saved and distributed")
         return self.matrix_file_paths_list
 
@@ -1675,7 +1772,6 @@ class cluster_matrix:
             return result_cluster_matrix
         return False  # Return the distributed result instance
 
-
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         print("REMOTE-SPLIT STARTED")
@@ -1798,13 +1894,3 @@ if __name__ == "__main__":
         
         print("REMOTE-SPLIT COMPLETE")
 
-'''
-# Command line usage:
-python cluster_matrix_worker.py \
-  --matrix "model_matrixs/layers_0_self_attn_q_proj_weight.pt" \
-  --percentages "0.5,0.25,0.25" \
-  --dim 0 \
-  --system 1 \
-  --label "b" \
-  --remote_node_number 2
-'''
