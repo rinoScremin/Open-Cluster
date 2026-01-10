@@ -18,6 +18,7 @@ import glob
 import math
 import sys
 import io
+import pyopencl as cl
 
 def check_combined_result_values(c_ref_path, combined):
     c_ref = torch.load(c_ref_path)
@@ -484,7 +485,7 @@ class cluster_matrix:
             ])
             print(f"📤 Sent file {filename_only} to {worker_ip}")
         
-    def stream_matrix_binary(self, worker_ip, matrix, save_name):
+    def stream_matrix_binary_CPU(self, worker_ip, matrix, save_name):
         """
         Stream a matrix as binary data directly to a remote node without saving locally.
         Creates the binary file data in memory and sends it via ZeroMQ.
@@ -597,6 +598,102 @@ class cluster_matrix:
             print(f"  ERROR streaming matrix to {worker_ip}: {e}")
             raise
         
+        return actual_size
+
+    def stream_matrix_binary(self, worker_ip, matrix, save_name, ctx=None, queue=None):
+        """
+        Stream a matrix as binary data via ZMQ using OpenCL device memory.
+        Binary format is IDENTICAL to save_matrix_binary / stream_matrix_binary.
+        """
+
+        print(f"📤 Streaming matrix (OpenCL) to {worker_ip} as {save_name}")
+
+        if worker_ip not in self.llama_socket_pool:
+            print(f"  ERROR: No socket connection to {worker_ip}")
+            return
+
+        socket_eth = self.llama_socket_pool[worker_ip]
+
+        # ===== OPENCL SETUP =====
+        if ctx is None or queue is None:
+            ctx = cl.create_some_context(interactive=False)
+            queue = cl.CommandQueue(ctx)
+
+        # ===== CONVERT INPUT TO NUMPY =====
+        if isinstance(matrix, torch.Tensor):
+            matrix_np = matrix.float().cpu().detach().numpy()
+            print(f"    Input PyTorch tensor -> numpy {matrix_np.shape}")
+        elif isinstance(matrix, np.ndarray):
+            matrix_np = matrix.astype(np.float32)
+            print(f"    Input numpy array {matrix_np.shape}")
+        else:
+            raise ValueError(f"Unsupported matrix type: {type(matrix)}")
+
+        # ===== CONVERT TO 4D =====
+        original_shape = matrix_np.shape
+
+        if matrix_np.ndim == 2:
+            matrix_np = matrix_np.reshape(1, 1, matrix_np.shape[0], matrix_np.shape[1])
+            print(f"    2D {original_shape} -> 4D {matrix_np.shape}")
+        elif matrix_np.ndim == 3:
+            matrix_np = matrix_np.reshape(1, matrix_np.shape[0],
+                                        matrix_np.shape[1], matrix_np.shape[2])
+            print(f"    3D {original_shape} -> 4D {matrix_np.shape}")
+        elif matrix_np.ndim == 4:
+            print(f"    Already 4D format: {matrix_np.shape}")
+        else:
+            raise ValueError(f"Unsupported number of dimensions: {matrix_np.ndim}")
+
+        matrix_np = matrix_np.astype(np.float32)
+
+        # ===== OPENCL BUFFER =====
+        mf = cl.mem_flags
+        buffer_size = matrix_np.nbytes
+
+        cl_buffer = cl.Buffer(
+            ctx,
+            mf.READ_ONLY | mf.COPY_HOST_PTR,
+            hostbuf=matrix_np
+        )
+
+        # ===== COPY BACK FROM DEVICE =====
+        matrix_out = np.empty_like(matrix_np)
+        cl.enqueue_copy(queue, matrix_out, cl_buffer)
+        queue.finish()
+
+        # ===== BUILD BINARY DATA IN MEMORY =====
+        ndim = 4
+        binary_data = bytearray()
+
+        binary_data.extend(struct.pack('i', ndim))
+        for dim in matrix_out.shape:
+            binary_data.extend(struct.pack('i', dim))
+
+        binary_data.extend(matrix_out.tobytes())
+        file_data = bytes(binary_data)
+
+        expected_size = 4 + ndim * 4 + matrix_out.size * 4
+        actual_size = len(file_data)
+
+        print(f"  Binary size: {actual_size:,} bytes")
+        print(f"  Expected:   {expected_size:,} bytes")
+
+        if actual_size != expected_size:
+            print("  ⚠️  Size mismatch detected")
+        else:
+            print("  ✓ Binary data verified")
+
+        # ===== STREAM VIA ZMQ =====
+        try:
+            socket_eth.send_multipart([
+                save_name.encode(),
+                file_data
+            ])
+            print(f"  ✓ Streamed to {worker_ip}")
+        except Exception as e:
+            print(f"  ERROR streaming to {worker_ip}: {e}")
+            raise
+
         return actual_size
 
     def cleanup(self):
@@ -999,7 +1096,7 @@ class cluster_matrix:
 
         return self.matrix_file_paths_list
 
-    def save_matrix_binary(self, matrix, filename):
+    def save_matrix_binary_CPU(self, matrix, filename):
         """
         Save a PyTorch tensor or numpy array as a binary file.
         
@@ -1022,10 +1119,10 @@ class cluster_matrix:
         elif isinstance(matrix, np.ndarray):
             matrix_np = matrix.astype('float32')
         else:
-            raise ValueError("somthing got fucked!!")
+            raise ValueError("error!!")
         
         # Ensure float32 dtype
-        matrix_np = matrix_np.astype('float32')
+        #matrix_np = matrix_np.astype('float32')
         
         # ===== CONVERT TO 4D FORMAT =====
         # Always convert to 4D format for consistency (batch, channel, height, width)
@@ -1060,6 +1157,73 @@ class cluster_matrix:
                 f.write(struct.pack('i', dim))
             # Write the actual data
             f.write(matrix_np.tobytes())
+    
+    def save_matrix_binary(self, matrix, filename, ctx=None, queue=None):
+        """
+        Save a matrix using OpenCL device memory before writing to disk.
+
+        Binary format:
+        [num_dims, dim1, dim2, dim3, dim4, data]
+        Always saved as float32 and 4D.
+        """
+
+        print(f"Saving matrix to binary file (OpenCL): {filename}")
+
+        # ===== OPENCL SETUP =====
+        if ctx is None or queue is None:
+            ctx = cl.create_some_context(interactive=False)
+            queue = cl.CommandQueue(ctx)
+
+        # ===== CONVERT INPUT TO NUMPY =====
+        if isinstance(matrix, torch.Tensor):
+            matrix_np = matrix.float().cpu().detach().numpy()
+        elif isinstance(matrix, np.ndarray):
+            matrix_np = matrix.astype(np.float32)
+        else:
+            raise ValueError("Unsupported input type")
+
+        original_shape = matrix_np.shape
+        print(f"Original shape: {original_shape}")
+
+        # ===== CONVERT TO 4D =====
+        if matrix_np.ndim == 2:
+            matrix_np = matrix_np.reshape(1, 1, matrix_np.shape[0], matrix_np.shape[1])
+        elif matrix_np.ndim == 3:
+            matrix_np = matrix_np.reshape(1, matrix_np.shape[0],
+                                        matrix_np.shape[1], matrix_np.shape[2])
+        elif matrix_np.ndim == 4:
+            pass
+        else:
+            raise ValueError("Invalid tensor dimensionality")
+
+        print(f"Converted to 4D: {matrix_np.shape}")
+
+        # ===== OPENCL BUFFER =====
+        mf = cl.mem_flags
+        buffer_size = matrix_np.nbytes
+
+        cl_buffer = cl.Buffer(
+            ctx,
+            mf.READ_ONLY | mf.COPY_HOST_PTR,
+            hostbuf=matrix_np
+        )
+
+        # ===== READ BACK FROM DEVICE =====
+        matrix_out = np.empty_like(matrix_np)
+        cl.enqueue_copy(queue, matrix_out, cl_buffer)
+        queue.finish()
+
+        # ===== WRITE BINARY FILE =====
+        print("Writing binary file...")
+
+        with open(filename, "wb") as f:
+            ndim = 4
+            f.write(struct.pack("i", ndim))
+            for dim in matrix_out.shape:
+                f.write(struct.pack("i", dim))
+            f.write(matrix_out.tobytes())
+
+        print("Done.")
 
     def remote_save_distribute_matrix_shards_bin(self):
         """Save matrix shards as binary files and distribute to appropriate nodes."""
