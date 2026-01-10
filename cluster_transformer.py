@@ -1,5 +1,5 @@
 import os
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, AutoConfig
 from cluster_matrix_v1 import cluster_matrix
 import torch
 import time
@@ -59,64 +59,96 @@ def print_matrix_sections(matrix, name, n_elements=100):
 
 class cluster_llm_transformer:
     def __init__(self, model_path, IP_list, percentages, CPU_GPU_select_list, backend_select_list):
+        # --------------------------------------------------
+        # Paths
+        # --------------------------------------------------
         self.local_project_dir = "/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/"
         self.model_path = model_path
-        self.model = AutoModel.from_pretrained(model_path, torch_dtype=torch.float16)
         self.model_matrix_fold_dir = "model_matrixs/"
+
+        os.makedirs(self.model_matrix_fold_dir, exist_ok=True)
+
+        # --------------------------------------------------
+        # LOAD METADATA ONLY (NO MODEL WEIGHTS)
+        # --------------------------------------------------
+        self.config = AutoConfig.from_pretrained(model_path)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.config = self.model.config
-        
-        # Get attention configuration
-        self.attention_type, self.num_q_heads, self.num_kv_heads = self.detect_attention_type()
+
+        # --------------------------------------------------
+        # ATTENTION / MODEL GEOMETRY
+        # --------------------------------------------------
         self.hidden_size = self.config.hidden_size
-        
-        # Calculate head dimension (should be hidden_size ÷ num_q_heads)
+
+        # You already have this logic
+        self.attention_type, self.num_q_heads, self.num_kv_heads = self.detect_attention_type()
+
         self.head_dim = self.hidden_size // self.num_q_heads
-        
-        # KV dimension for GQA/MQA
         self.kv_dim = self.num_kv_heads * self.head_dim
-        
-        # Store attention configuration
+
         self.Model_Attention = self.attention_type
         self.attention_Heads = [self.num_q_heads, self.num_kv_heads]
         self.Hidden_size = self.hidden_size
+
+        # --------------------------------------------------
+        # RUNTIME STATE
+        # --------------------------------------------------
+        self.tokens = None
         self.seq_len = 0
-        
-        print(f"🔍 Model: {self.config.model_type}")
-        print(f"🔍 Attention: {self.attention_type}")
-        print(f"🔍 Heads: Q={self.num_q_heads}, KV={self.num_kv_heads}")
-        print(f"🔍 Hidden size: {self.hidden_size}")
-        print(f"🔍 Head dimension: {self.head_dim}")
-        print(f"🔍 KV dimension: {self.kv_dim}")
-        
+
+        # --------------------------------------------------
+        # CLUSTER CONFIG
+        # --------------------------------------------------
         self.IP_list = IP_list
         self.percentages = percentages
         self.CPU_GPU_select_list = CPU_GPU_select_list
         self.backend_select_list = backend_select_list
-        self.tokens = None
-        
-        # Create directory for matrices
-        os.makedirs("model_matrixs", exist_ok=True)
+
+        # --------------------------------------------------
+        # PLACEHOLDERS (NO TENSORS LOADED HERE)
+        # --------------------------------------------------
         self.token_embedding_matrix = None
         self.token_embedding_matrix_path = ""
         self.cluster_token_embedding_matrix = None
         self.full_token_embedding_matrix = None
 
+        # --------------------------------------------------
+        # LOG
+        # --------------------------------------------------
+        print(f"🔍 Model: {getattr(self.config, 'model_type', 'unknown')}")
+        print(f"🔍 Attention: {self.attention_type}")
+        print(f"🔍 Heads: Q={self.num_q_heads}, KV={self.num_kv_heads}")
+        print(f"🔍 Hidden size: {self.hidden_size}")
+        print(f"🔍 Head dimension: {self.head_dim}")
+        print(f"🔍 KV dimension: {self.kv_dim}")
+
     def detect_attention_type(self):
-        """Detect what kind of attention bullshit we're dealing with"""
-        config = self.model.config
-        
-        num_heads = getattr(config, 'num_attention_heads', 32)
-        num_kv_heads = getattr(config, 'num_key_value_heads', num_heads)
-        
-        if num_kv_heads == num_heads:
-            return "MHA", num_heads, num_kv_heads
-        elif num_kv_heads == 1:
-            return "MQA", num_heads, num_kv_heads  
-        elif num_kv_heads < num_heads:
-            return "GQA", num_heads, num_kv_heads
+        """
+        Detect attention type (MHA / GQA / MQA) using config only.
+        NO model weights required.
+        """
+
+        config = self.config
+
+        # Default assumptions
+        num_q_heads = getattr(config, "num_attention_heads", None)
+        num_kv_heads = getattr(config, "num_key_value_heads", None)
+
+        if num_q_heads is None:
+            raise ValueError("Config missing num_attention_heads")
+
+        # If num_key_value_heads not present → standard MHA
+        if num_kv_heads is None:
+            num_kv_heads = num_q_heads
+            attention_type = "MHA"
         else:
-            return "WTF", num_heads, num_kv_heads
+            if num_kv_heads == 1:
+                attention_type = "MQA"
+            elif num_kv_heads < num_q_heads:
+                attention_type = "GQA"
+            else:
+                attention_type = "MHA"
+
+        return attention_type, num_q_heads, num_kv_heads
 
     def list_llm_layer(self):
         for name, param in self.model.named_parameters():
@@ -497,7 +529,6 @@ class cluster_llm_transformer:
         
         return total_distributed
 
-
     def _apply_layer_norm(self, x, weight, eps=1e-5):
         """
         Apply layer normalization to input tensor x.
@@ -536,7 +567,7 @@ class cluster_llm_transformer:
         
         return x_normalized
 
-    def run_full_model_forward(self, text="fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!"):
+    def save_distribute_run_full_model_forward(self, text="fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!"):
         """
         Run the full transformer model through all layers using cluster acceleration.
         Returns predicted text along with intermediate hidden states.
@@ -574,11 +605,8 @@ class cluster_llm_transformer:
         print(f"Token IDs: {self.tokens.input_ids[0].tolist()}")
         current_hidden_state_mul = self.get_save_distribute_token_embeddings('mul') # set up cluster for mul op
 
-        current_hidden_state_add = self.get_save_distribute_token_embeddings('add') # set up cluster for mul op
-
         for layer_idx in range(num_layers):
         #for layer_idx in range(1):
-
             # ============================================================
             # LOAD ATTENTION WEIGHTS FOR THIS LAYER
             # ============================================================
@@ -588,7 +616,6 @@ class cluster_llm_transformer:
             attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_k_proj_weight.pt'
             attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt'
             attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt'
-
 
             # ============================================================
             # Q, K, V PROJECTIONS WITH CLUSTER
@@ -792,7 +819,6 @@ class cluster_llm_transformer:
                 matrix_name='mlp_intermediate_cluster'
             )
             mlp_intermediate_cluster.save_distribute_full_matrix_bin()
-            
             # Load MLP down weights - shape should be [14336, 4096] for Llama
             mlp_down_proj = cluster_matrix(
                 matrix_file_path=mlp_down_path,
@@ -803,24 +829,16 @@ class cluster_llm_transformer:
                 split_matrix=True,
                 dim=0
             )
-            
             mlp_down_proj.convert_to_cluster_matrix_shards()
             mlp_down_proj.save_distribute_matrix_shards_bin()
-
             # Multiply: mlp_intermediate @ down_proj
             mlp_output = mlp_intermediate_cluster.cluster_shard_operation(
                 mlp_down_proj, False, True, True
             )
-
-        
-
-        
             # ============================================================
             # ADD RESIDUAL CONNECTION (MLP output + attention output)
             # ============================================================
             print(f"   Adding residual connection (MLP + attention)...")
-            
-
             # Create cluster matrix for mlp_output
             mlp_output_cluster = cluster_matrix(
                 matrix_file_path=mlp_output,
@@ -896,8 +914,388 @@ class cluster_llm_transformer:
                 print(f"   Warning: No post-attention layer norm found at {post_attention_layernorm_path}")
                 print(f"   Skipping layer normalization for this layer")
 
+    def load_run_full_model_forward(self, text="fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!"):
+        """
+        Run the full transformer model through all layers using cluster acceleration.
+        Returns predicted text along with intermediate hidden states.
+        """
+        
+        '''
+        input_enbedding = torch.load(f'{self.model_matrix_fold_dir}input_token_embedding_matrix.pt')
+        q_matrix = torch.load(f'{self.model_matrix_fold_dir}layers_{0}_self_attn_q_proj_weight.pt')
+        q_matrix_ref = input_enbedding @ q_matrix
 
-                    
+        k_matrix = torch.load(f'{self.model_matrix_fold_dir}layers_{0}_self_attn_k_proj_weight.pt')
+        k_matrix_ref = input_enbedding @ k_matrix.T
+
+        v_matrix = torch.load(f'{self.model_matrix_fold_dir}layers_{0}_self_attn_v_proj_weight.pt')
+        v_matrix_ref = input_enbedding @ v_matrix.T
+        '''
+
+        print("=" * 70)
+        print("🚀 STARTING FULL MODEL FORWARD PASS")
+        print("=" * 70)
+
+        num_layers = getattr(self.config, 'num_hidden_layers', 32)
+        print(f"📊 Model: {getattr(self.config,'model_type','Unknown')}")
+        print(f"📊 Total layers: {num_layers}")
+        print(f"📊 Attention type: {self.Model_Attention}")
+        print(f"📊 Heads: Q={self.attention_Heads[0]}, KV={self.attention_Heads[1]}")
+        print(f"📊 Hidden size: {self.Hidden_size}")
+        print(f"📊 Text: {text[:50]}...")
+        print("-" * 70)
+
+        # -----------------------------
+        # STEP 1: TOKENIZE + EMBEDDINGS
+        # -----------------------------
+        self.tokenize_text(text)
+        print(f"Token IDs: {self.tokens.input_ids[0].tolist()}")
+        current_hidden_state_mul = self.get_save_distribute_token_embeddings('mul') # set up cluster for mul op
+
+        for layer_idx in range(num_layers):
+        #for layer_idx in range(1):
+            # ============================================================
+            # LOAD ATTENTION WEIGHTS FOR THIS LAYER
+            # ============================================================
+            print(f"   Loading attention weights for layer {layer_idx}...")
+
+            attn_q_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_q_proj_weight.pt'
+            attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_k_proj_weight.pt'
+            attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt'
+            attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt'
+
+            # ============================================================
+            # Q, K, V PROJECTIONS WITH CLUSTER
+            # ============================================================
+            print(f"   Running Q/K/V projections with CLUSTER...")
+            cluster_start = time.time()
+
+            # Load and distribute Q projection
+            attn_q_proj = cluster_matrix(
+                matrix_file_path=attn_q_proj_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1
+            )
+            attn_q_proj.load_cluster_matrix_shards()
+
+            cluster_q_result = current_hidden_state_mul.cluster_shard_operation(
+                attn_q_proj, False, False, True
+            )
+            #check_combined_result_values(q_matrix_ref,cluster_q_result)
+
+            # K projection with CLUSTER
+            attn_k_proj = cluster_matrix(
+                matrix_file_path=attn_k_proj_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+            )
+            attn_k_proj.load_cluster_matrix_shards()
+
+            cluster_k_result = current_hidden_state_mul.cluster_shard_operation(
+                attn_k_proj, False, True, True
+            )
+            #check_combined_result_values(k_matrix_ref,cluster_k_result)
+            
+            # V projection with CLUSTER
+            attn_v_proj = cluster_matrix(
+                matrix_file_path=attn_v_proj_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0,
+            )
+            attn_v_proj.load_cluster_matrix_shards()
+
+            cluster_v_result = current_hidden_state_mul.cluster_shard_operation(
+                attn_v_proj, False, True, True
+            )
+            #check_combined_result_values(v_matrix_ref,cluster_v_result)
+
+
+            # ============================================================
+            # GQA ATTENTION WITH TORCH (CORRECT & COMPLETE)
+            # ============================================================
+            print(f"   Computing GQA attention with TORCH...")
+            torch_start = time.time()
+
+            seq_len = cluster_q_result.shape[0]
+            device = cluster_q_result.device
+            dtype = cluster_q_result.dtype
+
+            # ---- reshape to [seq, heads, head_dim]
+            q = cluster_q_result.view(seq_len, self.num_q_heads, self.head_dim)
+            k = cluster_k_result.view(seq_len, self.num_kv_heads, self.head_dim)
+            v = cluster_v_result.view(seq_len, self.num_kv_heads, self.head_dim)
+
+            # ---- expand KV for GQA
+            if self.num_kv_heads < self.num_q_heads:
+                repeat_factor = self.num_q_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeat_factor, dim=1)
+                v = v.repeat_interleave(repeat_factor, dim=1)
+
+            # ---- transpose to [heads, seq, head_dim]
+            q = q.transpose(0, 1)   # [Hq, S, D]
+            k = k.transpose(0, 1)   # [Hq, S, D]
+            v = v.transpose(0, 1)   # [Hq, S, D]
+
+            # ---- scaled dot-product attention
+            attn_scores = torch.matmul(q, k.transpose(-1, -2))
+            attn_scores *= (1.0 / (self.head_dim ** 0.5))
+
+            # ---- causal mask
+            causal_mask = torch.triu(
+                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
+                diagonal=1
+            )
+            attn_scores.masked_fill_(causal_mask, float("-inf"))
+
+            # ---- softmax (numerically stable)
+            attn_probs = torch.softmax(attn_scores, dim=-1)
+
+            # ---- attention output
+            attn_output = torch.matmul(attn_probs, v)   # [Hq, S, D]
+
+            # ---- restore shape → [S, hidden]
+            attn_output = attn_output.transpose(0, 1).contiguous()
+            attn_output_flat_torch = attn_output.view(seq_len, self.Hidden_size)
+
+            print(f'attn_output_flat shape : {attn_output_flat_torch.shape}')
+
+            # ------------------------------------------------------------
+            # Paths
+            # ------------------------------------------------------------
+            mlp_gate_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt'
+            mlp_up_path   = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt'
+            mlp_down_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt'
+
+            attn_output_flat = cluster_matrix(
+                matrix_file_path=attn_output_flat_torch,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,  # Split columns
+                matrix_name='attn_output_flat'
+            )
+            attn_output_flat.load_cluster_matrix()
+
+            # Load MLP gate weights - shape should be [4096, 11008] for Llama
+            mlp_gate_proj = cluster_matrix(
+                matrix_file_path=mlp_gate_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0 # Split columns
+            )
+            mlp_gate_proj.load_cluster_matrix_shards()
+
+            # Multiply: attn_output @ gate_proj
+            cluster_gate_result = attn_output_flat.cluster_shard_operation(
+                mlp_gate_proj, False, True, True
+            )
+            
+            # ============================================================
+            # MLP UP PROJECTION (parallel to gate)
+            # ============================================================
+            print(f"   Running MLP up projection...")
+            
+            # Load MLP up weights - shape should be [4096, 14336] for Llama
+            mlp_up_proj = cluster_matrix(
+                matrix_file_path=mlp_up_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0  # Split columns
+            )
+            mlp_up_proj.load_cluster_matrix_shards()
+
+            # Multiply: attn_output @ up_proj
+            cluster_up_result = attn_output_flat.cluster_shard_operation(
+                mlp_up_proj, False, True, True
+            )
+            
+            print(f"   Up projection result shape: {cluster_up_result.shape}")
+
+            # ============================================================
+            # APPLY SILU ACTIVATION TO GATE
+            # ============================================================
+            print(f"   Applying SiLU activation to gate...")
+            gate_silu = torch.nn.functional.silu(cluster_gate_result)
+            
+            # ============================================================
+            # ELEMENT-WISE MULTIPLICATION: gate_silu * up
+            # ============================================================
+            print(f"   Element-wise multiplication (gate_silu * up)...")
+            mlp_intermediate = gate_silu * cluster_up_result
+            print(f"   MLP intermediate shape: {mlp_intermediate.shape}")
+            
+            # ============================================================
+            # MLP DOWN PROJECTION
+            # ============================================================
+            print(f"   Running MLP down projection...")
+            
+            # Create cluster matrix for intermediate result
+            mlp_intermediate_cluster = cluster_matrix(
+                matrix_file_path=mlp_intermediate,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=False,
+                dim=1,
+                matrix_name='mlp_intermediate_cluster'
+            )
+            mlp_intermediate_cluster.save_distribute_full_matrix_bin()
+            # Load MLP down weights - shape should be [14336, 4096] for Llama
+            mlp_down_proj = cluster_matrix(
+                matrix_file_path=mlp_down_path,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=0
+            )
+            mlp_down_proj.load_cluster_matrix_shards()
+            # Multiply: mlp_intermediate @ down_proj
+            mlp_output = mlp_intermediate_cluster.cluster_shard_operation(
+                mlp_down_proj, False, True, True
+            )
+            # ============================================================
+            # ADD RESIDUAL CONNECTION (MLP output + attention output)
+            # ============================================================
+            print(f"   Adding residual connection (MLP + attention)...")
+            # Create cluster matrix for mlp_output
+            mlp_output_cluster = cluster_matrix(
+                matrix_file_path=mlp_output,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=[True, True, True, False],
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                matrix_name='mlp_output_cluster'
+            )
+            mlp_output_cluster.load_cluster_matrix_shards()
+            
+            # Create cluster matrix for attention output
+            attn_output_cluster = cluster_matrix(
+                matrix_file_path=attn_output_flat_torch,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=[True, True, True, False],
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                matrix_name='attn_outpuattn_output_clustert_flat'
+            )
+            attn_output_cluster.load_cluster_matrix_shards()
+
+            # Perform addition using cluster operation
+            layer_output_cluster = mlp_output_cluster.cluster_shard_operation(
+                attn_output_cluster, False, True, True, 'add'
+            )
+
+            # ============================================================
+            # APPLY POST-ATTENTION LAYER NORMALIZATION
+            # ============================================================
+            print(f"   Applying post-attention layer normalization...")
+
+            # Load post-attention layer norm weights
+            post_attention_layernorm_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_post_attention_layernorm_weight.pt'
+
+            if os.path.exists(post_attention_layernorm_path):
+                try:
+                    post_attention_layernorm = torch.load(post_attention_layernorm_path, map_location='cpu')
+                    print(f"   Loaded post-attention layer norm weights: shape {post_attention_layernorm.shape}")
+
+                    # layer_output_cluster is already a tensor (not cluster_matrix)
+                    # So we apply layer norm directly
+                    layer_output_tensor = self._apply_layer_norm(layer_output_cluster, post_attention_layernorm)
+                    print(f"   Applied layer normalization")
+
+                    if layer_idx == num_layers:
+                        return layer_output_tensor
+
+                    # If the next layer expects a cluster_matrix, wrap it again
+                    layer_output_cluster = cluster_matrix(
+                        matrix_file_path=layer_output_tensor,
+                        node_IP_list=self.IP_list,
+                        CPU_GPU_select_list=self.CPU_GPU_select_list,
+                        node_percentages=self.percentages,
+                        back_end_select_list=self.backend_select_list,
+                        split_matrix=True,
+                        dim=1,  # split across columns
+                        matrix_name=f'layer_{layer_idx}_output_cluster'
+                    )
+                    layer_output_cluster.convert_to_cluster_matrix_shards()
+
+                except Exception as e:
+                    print(f"   Error loading/applying layer norm: {e}")
+                    print(f"   Skipping layer normalization for this layer")
+            else:
+                print(f"   Warning: No post-attention layer norm found at {post_attention_layernorm_path}")
+                print(f"   Skipping layer normalization for this layer")
+         
+    def run_lm_head_and_decode(self, final_hidden_state):
+        print("=" * 70)
+        print("🧠 FINAL LM HEAD")
+        print("=" * 70)
+
+        # ------------------------------------------------------------
+        # Final RMSNorm
+        # ------------------------------------------------------------
+        final_hidden_state = self._apply_layer_norm(final_hidden_state)
+        print(f"After final norm: {final_hidden_state.shape}")
+
+        # ------------------------------------------------------------
+        # Load tied embedding matrix (LM head)
+        # ------------------------------------------------------------
+        embed_path = f"{self.model_matrix_fold_dir}embed_tokens_weight.pt"
+        embed_weight = torch.load(embed_path, map_location=final_hidden_state.device)
+
+        print(f"Embed weight shape: {embed_weight.shape}")
+
+        # ------------------------------------------------------------
+        # Compute logits
+        # ------------------------------------------------------------
+        logits = final_hidden_state @ embed_weight.T
+        print(f"Logits shape: {logits.shape}")
+
+        # ------------------------------------------------------------
+        # Pick tokens (greedy for now)
+        # ------------------------------------------------------------
+        token_ids = torch.argmax(logits, dim=-1)
+
+        # ------------------------------------------------------------
+        # Decode
+        # ------------------------------------------------------------
+        text = self.tokenizer.decode(
+            token_ids.tolist(),
+            skip_special_tokens=True
+        )
+
+        print("=" * 70)
+        print("📤 OUTPUT TEXT")
+        print("=" * 70)
+        print(text)
+
+        return text
 
 
 IP_list = [
@@ -938,5 +1336,6 @@ print("=" * 70)
 #test.run_GQA_transformer_layer()  # Distribute ALL weights to cluster
 
 # ULTRA-FAST INFERENCE (Run this as many times as you want!):
-result = test.run_full_model_forward("fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!")
+result = test.save_distribute_run_full_model_forward("fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!")
+print(test.run_lm_head_and_decode(result))
 #print(f"⚡ Inference completed in {result['performance']['total_time']:.2f}s!")
