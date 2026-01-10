@@ -203,9 +203,9 @@ class cluster_matrix:
         self.node_matrices = []
         self.matrix_file_paths_list = []  # List for storing matrix file paths
         
+        '''
         # =============== CREATE LOCAL DIRECTORIES ===============
         print("\n📂 CREATING LOCAL DIRECTORIES...")
-        
         directories_created = []
         if not os.path.exists(self.local_DISK_folder):
             os.makedirs(self.local_DISK_folder)
@@ -221,6 +221,7 @@ class cluster_matrix:
             print(f"✅ Created directories: {', '.join(directories_created)}")
         else:
             print("✅ All required directories already exist")
+        '''
 
         # =============== ZEROMMQ SOCKET SETUP ===============
         print("\n🔌 SETTING UP ZEROMQ CONNECTIONS...")
@@ -297,6 +298,7 @@ class cluster_matrix:
             # Reference it in the instance
             self.ack_receiver_socket = cluster_matrix._ack_receiver_socket
 
+        '''
             # =============== CREATE REMOTE DIRECTORIES ===============
             print("\n📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...")
             
@@ -309,7 +311,7 @@ class cluster_matrix:
                     print(f"   ✅ Directory creation command sent to {node_ip}")
                 except Exception as e:
                     print(f"   ❌ Failed to send command to {node_ip}: {e}")
-
+        '''
 
         '''
         # =============== MATRIX DISTRIBUTION LOGIC ===============
@@ -839,9 +841,9 @@ class cluster_matrix:
             self.node_matrices.append(shard)
             start_idx = end_idx
 
-        print(f"✅ Created {len(self.node_matrices)} shards according to node percentages")
-        for i, shard in enumerate(self.node_matrices):
-            print(f"  Node {i}: shard shape {shard.shape}")
+        #print(f"✅ Created {len(self.node_matrices)} shards according to node percentages")
+        #for i, shard in enumerate(self.node_matrices):
+        #    print(f"  Node {i}: shard shape {shard.shape}")
 
         return self.node_matrices
 
@@ -860,10 +862,6 @@ class cluster_matrix:
 
     def save_distribute_matrix_shards_bin(self):
         """Save matrix shards as binary files and distribute to appropriate nodes."""
-        # Get list of unique node IPs for ACK tracking
-        unique_node_IP_list = list(set(self.node_IP_list))
-        print(f"Starting distribution of {len(self.node_IP_list)} shards to {len(unique_node_IP_list)} unique nodes")
-        # Process each shard
         for shard_index, node_IP in enumerate(self.node_IP_list):
             print(f"Processing shard {shard_index} for node {node_IP}")
             # Create filename for this shard
@@ -897,16 +895,12 @@ class cluster_matrix:
                 remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, save_name)
                 remote_disk_dir_full = os.path.join(self.remote_project_dir, self.remote_DISK_folder)
                 remote_save_file_path_DISK = os.path.join(remote_disk_dir_full, save_name)
-                mkdir_cmd = f"mkdir -p {remote_disk_dir_full} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}"
-                self.zmq_send_command(node_IP, mkdir_cmd)
                 copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
                 print(f"  Step 3: Sending copy command to remote")
                 self.zmq_send_command(node_IP, copy_command)
                 # Step 4: Store remote RAM path (not local)
                 self.matrix_file_paths_list.append(remote_save_file_path_RAM)
                 print(f"  Added remote RAM path to file list: {remote_save_file_path_RAM}")
-                
-        print(f"Distribution complete: {len(self.matrix_file_paths_list)} shards saved and distributed")
         return self.matrix_file_paths_list
 
     def save_distribute_full_matrix_bin(self):
@@ -962,10 +956,6 @@ class cluster_matrix:
             if node_ip != self.IP:  # Skip local node
                 print(f"Sending to {node_ip}")
 
-                # Ensure dirs exist on remote
-                mkdir_cmd = f"mkdir -p {remote_disk_dir_full} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}"
-                self.zmq_send_command(node_ip, mkdir_cmd)
-
                 # Step 1: Send the file to remote node's RAM
                 self.zmq_send_file(node_ip, save_file_path_DISK)
                 
@@ -975,8 +965,6 @@ class cluster_matrix:
                 # Step 2: Tell remote node to copy from RAM to DISK for persistence
                 copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
                 self.zmq_send_command(node_ip, copy_command)
-        
-
         
         print(f"Full matrix distribution completed")
         print(f"Total file paths tracked: {len(self.matrix_file_paths_list)}")
@@ -1705,7 +1693,7 @@ class cluster_matrix:
         
         return True
 
-    def cluster_shard_operation(self, cluster_matrixB, TransposeA, TransposeB, send_back_result=False, operation='mul'):
+    def cluster_shard_operation(self, cluster_matrixB, TransposeA=False, TransposeB=False, send_back_result=True, operation='mul'):
         """
         Perform a distributed matrix operation across the cluster.
         
@@ -1785,30 +1773,21 @@ class cluster_matrix:
             TransposeB_str = str(local_TransposeB).lower()
             print(f"  Final transpose flags - A: {TransposeA_str}, B: {TransposeB_str}")
             
-
             # ===== PREPARE SEND_BACK FLAG =====
-
             if not send_back_result:
                 send_back = 0
                 print("Send back result: No (keep distributed)")
-
             else:
                 shard_count = len(self.node_IP_list)
-
                 # join_dim must ALWAYS be set
                 join_dim = self.dim  # 0 or 1
-
                 # Encode: join_dim * 10 + shard_count
                 send_back = join_dim * 10 + shard_count
-
                 # System 2 → negative
                 if self.matrix_labeling in ('a', 'b'):
                     send_back = -send_back
-
                 print(f"Send back result: Yes ({send_back} shards will be combined)")
                 print(f"  → system={'2' if send_back < 0 else '1'}, join_dim={join_dim}, shards={shard_count}")
-
-            print(f"DEBUG SEND_BACK VALUE: {send_back}")
 
             # ===== BUILD COMMAND FOR SPECIFIC BACKEND =====
             command = (
@@ -1847,8 +1826,6 @@ class cluster_matrix:
         # ===== SETUP RESULT FILENAMES =====
         # Result names match the operand order we send to the server:
         # self (matrix A) first, then cluster_matrixB (matrix B)
-
-
         base_result_name=''
         if back_end_select == 'torch':
             base_result_name = f"{self.matrix_name}x{cluster_matrixB.matrix_name}"
@@ -1860,17 +1837,18 @@ class cluster_matrix:
         if send_back_result:  
             path = self.local_RAM_folder + base_result_name + '_combined.bin'  
             if os.path.exists(path):  
-                time.sleep(0.15)  
+                time.sleep(0.05)  
                 combined_matrix = self.convert_bin_matrix_to_pt(path)  
-                time.sleep(0.15)  
+                time.sleep(0.05)  
                 os.remove(path)  
             else:  
                 self.wait_for_acks(1, "ACK_combined_matrix_saved")  
                 # Add this check - file might not exist yet  
                 if not os.path.exists(path):  
-                    time.sleep(0.15)  # Brief wait for file system  
+                    time.sleep(0.05)  # Brief wait for file system  
                 combined_matrix = self.convert_bin_matrix_to_pt(path)  
                 os.remove(path)  # Clean up any existing combined file  
+                cluster_matrixB.cleanup()
             return combined_matrix  
         else:  
             result_cluster_matrix = cluster_matrix(  
