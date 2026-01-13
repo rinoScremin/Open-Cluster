@@ -76,7 +76,8 @@ def print_matrix_sections(matrix, name, n_elements=100):
 class cluster_matrix:
     def __init__(self, matrix_file_path,
                 node_IP_list, CPU_GPU_select_list, node_percentages=[], back_end_select_list=[],
-                split_matrix=False, dim=0 , matrix_name='', matrix_labeling=''):
+                split_matrix=False, dim=0 , matrix_name='', matrix_labeling='', auto_set_up=[]):
+        
         
         print("=" * 70)
         print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
@@ -313,98 +314,21 @@ class cluster_matrix:
                     print(f"   ❌ Failed to send command to {node_ip}: {e}")
         '''
 
-        '''
         # =============== MATRIX DISTRIBUTION LOGIC ===============
-        print("\n" + "=" * 70)
-        print("🧮 MATRIX DISTRIBUTION PHASE")
-        print("=" * 70)
+        # auto_set_up format: [system_id, "save"|"load"]
 
-        # Initialize with a default value
-        matrix_shards_found = True  # Default to True
-        matrix_exists = os.path.exists(matrix_file_path)
-
-        # Check for shard file (this is what was working!)
-        matrix_shard_file_path = self.local_project_dir + self.local_DISK_folder + self.matrix_name + '_shard_0.bin'
-        matrix_shard_exists = os.path.exists(matrix_shard_file_path)
-
-        print(f"   Matrix file exists: {matrix_exists}")
-        print(f"   Split matrix mode: {split_matrix}")
-
-        # Decision tree for matrix handling
-        if matrix_exists and self.matrix_labeling == '' and split_matrix:
-            print("NEW MATRIX SYSTEM 1 SPLIT")
-            self.convert_to_cluster_matrix_shards()
-            self.save_distribute_matrix_shards_bin()
-            matrix_shards_found = True
-
-        elif matrix_exists and self.matrix_labeling == '' and split_matrix == False:
-            print("NEW MATRIX SYSTEM 1 FULL")
-            self.save_distribute_full_matrix_bin()
-            matrix_shards_found = True
-
-        elif matrix_exists and self.matrix_labeling == 'a':
-            print("NEW MATRIX A - SYSTEM 2 GRID")
-            self.convert_to_cluster_matrix_grid()
-            self.save_distribute_matrixA_grid_bin()
-            matrix_shards_found = True
-
-        elif matrix_exists and self.matrix_labeling == 'b':
-            print("NEW MATRIX B - SYSTEM 2 GRID")
-            self.convert_to_cluster_matrix_grid()
-            self.save_distribute_matrix_shards_bin()
-            matrix_shards_found = True
-
-        # Loading existing data - USE SHARD CHECK!
-        elif matrix_shard_exists and self.matrix_labeling == '' and split_matrix:
-            print("LOADING EXISTING SHARDS - SYSTEM 1")
-            self.load_cluster_matrix_shards()
-            matrix_shards_found = True
-
-        elif matrix_exists == False and self.matrix_labeling == '' and split_matrix == False:
-            # For full matrix, check if .bin exists
-            full_matrix_path = self.local_project_dir + self.local_DISK_folder + self.matrix_name + '.bin'
-            if os.path.exists(full_matrix_path):
-                print("LOADING EXISTING FULL MATRIX")
+        if len(auto_set_up) == 2:
+            if auto_set_up[0] == 1 and auto_set_up[1] == 'save' and self.split_matrix == False:
+                self.save_distribute_full_matrix_bin()
+            if auto_set_up[0] == 1 and auto_set_up[1] == 'load' and self.split_matrix == False:
                 self.load_cluster_matrix()
-                matrix_shards_found = True
-            else:
-                print(f"ERROR: Full matrix file not found: {full_matrix_path}")
-                matrix_shards_found = False
 
-        elif matrix_shard_exists and self.matrix_labeling == 'a':
-            print("LOADING EXISTING MATRIX A GRID")
-            self.load_cluster_matrixA_grid()
-            matrix_shards_found = True
-
-        elif matrix_shard_exists and self.matrix_labeling == 'b':
-            print("LOADING EXISTING MATRIX B SHARDS")
-            self.load_cluster_matrix_shards()
-            matrix_shards_found = True
-
-        elif matrix_shards_found == False:
-            print('FILE NOT FOUND!! Checking both matrix and shard files...')
-            print(f'  Matrix path: {matrix_file_path}')
-            print(f'  Shard 0 path: {matrix_shard_file_path}')
-
-        # =============== FINAL VALIDATION ===============
-        print("\n" + "=" * 70)
-        print("🏁 INITIALIZATION COMPLETE")
-        print("=" * 70)
-
-        if not matrix_shards_found:
-            print("❌ ERROR: MATRIX SHARDS/FILES NOT FOUND!")
-            print("   Possible causes:")
-            print("   1. Matrix file path is incorrect")
-            print("   2. Distributed shards were not properly created")
-            print("   3. Network issues preventing file access")
-        else:
-            print("✅ Cluster matrix initialization successful!")
-            print(f"   - Total nodes configured: {len(node_IP_list)}")
-            print(f"   - Matrix handling mode: {'Split' if split_matrix else 'Full'}")
-            print(f"   - Backends: {self.back_end_select_list}")
-            print(f"   - CPU/GPU selections: {self.CPU_GPU_select_list}")
-        '''
-        
+            if auto_set_up[0] == 1 and auto_set_up[1] == 'save' and self.split_matrix:
+                self.convert_to_cluster_matrix_shards()
+                self.save_distribute_matrix_shards_bin()
+            if auto_set_up[0] == 1 and auto_set_up[1] == 'load' and self.split_matrix:
+                self.load_cluster_matrix_shards()    
+                     
     def send_ack_confirmation(self, ack_msg="ACK"):    
         """    
         Send ACK confirmation back to C++ backend    
@@ -1993,4 +1917,3 @@ if __name__ == "__main__":
             print(f"ERROR: Invalid combination - system: {split_system_type}, label: {matrix_label}")
         
         print("REMOTE-SPLIT COMPLETE")
-
