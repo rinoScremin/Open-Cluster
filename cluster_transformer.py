@@ -5,58 +5,6 @@ import torch
 import time
 import math
 
-def check_combined_result_values(c_ref, combined):
-    if c_ref.shape != combined.shape:
-        print(f"❌ Shape mismatch! Reference: {c_ref.shape}, Combined: {combined.shape}")
-    else:
-        print(f"✅ Shapes match: {c_ref.shape}")
-
-        # Ensure both are Torch tensors (defensive)
-        if not isinstance(c_ref, torch.Tensor):
-            c_ref = torch.from_numpy(c_ref)
-        if not isinstance(combined, torch.Tensor):
-            combined = torch.from_numpy(combined)
-
-        c_ref = c_ref.to(dtype=combined.dtype, device=combined.device)
-
-        # Calculate absolute differences
-        diff = torch.abs(c_ref - combined)
-
-        # Basic statistics
-        max_diff = torch.max(diff).item()
-        mean_diff = torch.mean(diff).item()
-
-        print(f"Max absolute difference:  {max_diff:.6e}")
-        print(f"Mean absolute difference: {mean_diff:.6e}")
-
-        # Looser tolerance for shard / float accumulation
-        tolerance = 0.15
-
-        if torch.allclose(c_ref, combined, rtol=tolerance, atol=tolerance):
-            print(f"✅ Results match within tolerance ({tolerance})")
-        else:
-            print(f"⚠️  Results differ beyond tolerance ({tolerance})")
-
-        significant_diff = diff > tolerance
-        num_different = torch.sum(significant_diff).item()
-        total_elements = c_ref.numel()
-
-        print(
-            f"Elements with > {tolerance} difference: "
-            f"{num_different}/{total_elements} "
-            f"({(num_different / total_elements * 100):.2f}%)"
-        )
-
-def print_matrix_sections(matrix, name, n_elements=100):
-    flat = matrix.flatten()
-    mid = flat.shape[0] // 2
-
-    print(f"\n{name} — first {n_elements} elements of first half:")
-    print(flat[:n_elements])
-
-    print(f"\n{name} — first {n_elements} elements of second half:")
-    print(flat[mid:mid + n_elements])
-
 class cluster_llm_transformer:
     def __init__(self, model_path, IP_list, percentages, CPU_GPU_select_list, backend_select_list):
         # --------------------------------------------------
@@ -73,6 +21,8 @@ class cluster_llm_transformer:
         # --------------------------------------------------
         self.config = AutoConfig.from_pretrained(model_path)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+        self.num_layers = self.config.num_hidden_layers
+
 
         # --------------------------------------------------
         # ATTENTION / MODEL GEOMETRY
@@ -107,9 +57,15 @@ class cluster_llm_transformer:
         # PLACEHOLDERS (NO TENSORS LOADED HERE)
         # --------------------------------------------------
         self.token_embedding_matrix = None
+        self.embed_tokens_weight = None
+        self.lm_head_weight = None
+        self.final_norm_weight = None
         self.token_embedding_matrix_path = ""
         self.cluster_token_embedding_matrix = None
         self.full_token_embedding_matrix = None
+        self._cluster_anchor = None
+        self._final_norm_weight = None
+        self._lm_head_weight = None
 
         # --------------------------------------------------
         # LOG
@@ -120,6 +76,100 @@ class cluster_llm_transformer:
         print(f"🔍 Hidden size: {self.hidden_size}")
         print(f"🔍 Head dimension: {self.head_dim}")
         print(f"🔍 KV dimension: {self.kv_dim}")
+
+    def _get_final_norm_weight_path(self) -> str:
+        candidates = (
+            f"{self.model_matrix_fold_dir}model_norm_weight.pt",
+            f"{self.model_matrix_fold_dir}norm_weight.pt",
+        )
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        raise FileNotFoundError(f"Final norm weight not found. Tried: {candidates}")
+
+    def _get_lm_head_weight_path(self) -> str:
+        path = f"{self.model_matrix_fold_dir}lm_head_weight.pt"
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"LM head weight not found: {path}")
+        return path
+
+    def decode_next_token(
+        self,
+        hidden_out: torch.Tensor,
+        *,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        use_cluster: bool = False,
+    ) -> tuple[int, torch.Tensor]:
+        """
+        Convert the final hidden state for a single token into logits and pick the next token id.
+        Uses final RMSNorm + LM head.
+
+        Returns:
+            (next_token_id, logits_1d[vocab])
+        """
+        if hidden_out.ndim != 1:
+            raise ValueError(f"decode_next_token expects [hidden], got {tuple(hidden_out.shape)}")
+
+        if self._final_norm_weight is None:
+            self._final_norm_weight = torch.load(self._get_final_norm_weight_path(), map_location="cpu")
+        norm_w = self._final_norm_weight
+        if norm_w.ndim != 1 or norm_w.shape[0] != hidden_out.shape[0]:
+            raise ValueError(f"final_norm_weight mismatch: weight={tuple(norm_w.shape)} hidden={tuple(hidden_out.shape)}")
+
+        hidden_norm = self.rms_norm(hidden_out.unsqueeze(0), norm_w).squeeze(0)  # [hidden]
+
+        if self._lm_head_weight is None:
+            self._lm_head_weight = torch.load(self._get_lm_head_weight_path(), map_location="cpu")
+        lm_head_w = self._lm_head_weight  # [vocab, hidden]
+        if lm_head_w.ndim != 2 or lm_head_w.shape[1] != hidden_norm.shape[0]:
+            raise ValueError(f"lm_head_weight mismatch: weight={tuple(lm_head_w.shape)} hidden={tuple(hidden_norm.shape)}")
+
+        if use_cluster:
+            # Cluster decode is optional; local decode is the default for correctness.
+            hidden_cluster = cluster_matrix(
+                matrix_file_path=hidden_norm.unsqueeze(1).contiguous(),  # [hidden, 1]
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=False,
+                dim=1,
+                auto_set_up=[1, "save"],
+                matrix_name="decode_hidden",
+            )
+            lm_head_w_t_cluster = cluster_matrix(
+                matrix_file_path=lm_head_w.t().contiguous(),  # [hidden, vocab]
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "save"],
+                matrix_name="lm_head_w_t",
+            )
+            logits_2d = hidden_cluster.cluster_shard_operation(lm_head_w_t_cluster, True, False, True)  # [1, vocab]
+            logits = logits_2d.squeeze(0)
+        else:
+            logits = (hidden_norm.unsqueeze(0) @ lm_head_w.t()).squeeze(0)  # [vocab]
+
+        if temperature is None or temperature <= 0.0:
+            next_id = int(torch.argmax(logits).item())
+            return next_id, logits
+
+        scaled = logits / float(temperature)
+        if top_k and top_k > 0:
+            k = min(int(top_k), scaled.numel())
+            top_vals, top_idx = torch.topk(scaled, k)
+            probs = torch.softmax(top_vals, dim=-1)
+            next_local = int(torch.multinomial(probs, num_samples=1).item())
+            next_id = int(top_idx[next_local].item())
+            return next_id, logits
+
+        probs = torch.softmax(scaled, dim=-1)
+        next_id = int(torch.multinomial(probs, num_samples=1).item())
+        return next_id, logits
 
     def detect_attention_type(self):
         """
@@ -154,8 +204,13 @@ class cluster_llm_transformer:
         for name, param in self.model.named_parameters():
             print("LLM layer --> ", name)
 
-    def tokenize_text(self, text):
-        self.tokens = self.tokenizer(text, return_tensors="pt")
+    def tokenize_text(self, text, use_chat_template=False):
+        if use_chat_template and getattr(self.tokenizer, "chat_template", None) and hasattr(self.tokenizer, "apply_chat_template"):
+            messages = [{"role": "user", "content": text}]
+            chat_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+            self.tokens = self.tokenizer(chat_prompt, return_tensors="pt", add_special_tokens=False)
+        else:
+            self.tokens = self.tokenizer(text, return_tensors="pt")
         return self.tokens.input_ids
 
     def save_all_model_layers(self, start_layer=0, end_layer=None, batch_size=4):
@@ -234,1108 +289,538 @@ class cluster_llm_transformer:
         
         return total_saved
 
-    def get_save_distribute_token_embeddings(self, op='mul'):
-        """Get embeddings for the tokenized input using the full model"""
+    def get_token_embeddings(self, input_prompt='Hello! are you working??', use_chat_template=False):
+        """Get and distribute token embeddings"""
+        # Tokenize the input prompt
+        self.tokenize_text(input_prompt, use_chat_template=use_chat_template)
+        
         if self.tokens is None:
-            print("❌ No tokens found. Call tokenize_text() first.")
+            print("❌ No tokens found.")
             return None
         
-        print("🔍 Getting token embeddings from full model...")
-        
-        # Check if we already have saved embeddings
-        embedding_path = self.model_matrix_fold_dir + 'embed_tokens_weight.pt'
-        if not os.path.exists(embedding_path):
-            print("❌ Embedding weights not found. Run save_all_model_layers() first.")
-            return None
+        print("🔍 Getting and distributing token embeddings...")
         
         # Load embedding matrix
+        embedding_path = self.model_matrix_fold_dir + 'embed_tokens_weight.pt'
+        if not os.path.exists(embedding_path):
+            print("❌ Embedding weights not found.")
+            return None
+        
         embedding_matrix = torch.load(embedding_path)
-        print(f"📊 Using embedding matrix: {embedding_matrix.shape}")
+        print(f"📊 Embedding matrix shape: {embedding_matrix.shape}")
+        self.embed_tokens_weight = embedding_matrix
         
-        # Get embeddings for each token ID
-        token_embeddings = []
-        for token_id in self.tokens.input_ids[0]:
-            # Look up the embedding in the full matrix
-            embedding = embedding_matrix[token_id]  # Shape: [hidden_size]
-            token_text = self.tokenizer.decode(token_id)
-            print(f"🔤 Token {token_id}: '{token_text}' -> embedding shape: {embedding.shape}")
-            token_embeddings.append(embedding)
+        # Get token IDs
+        token_ids = self.tokens.input_ids[0]
+        print(f"📊 Token IDs: {token_ids.tolist()}")
         
-        # Stack all embeddings
-        all_embeddings = torch.stack(token_embeddings)  # Shape: [seq_len, hidden_size]
-        self.seq_len = all_embeddings.shape[0]
-        print(f"📦 Combined embeddings shape: {all_embeddings.shape}")
+        # Vectorized embedding lookup: [seq] -> [seq, hidden]
+        all_embeddings = embedding_matrix[token_ids]
+        print(f"📦 Token embeddings shape: {all_embeddings.shape}")
         
-        # Save to disk
-        path = self.model_matrix_fold_dir + 'input_token_embedding_matrix.pt'
-        torch.save(all_embeddings.float(), path)
         self.token_embedding_matrix = all_embeddings
-        
-        # Create and distribute cluster matrix for token embeddings
-        print("🔀 Distributing token embeddings across cluster...")
-        if op == 'mul':
-            # Create cluster matrix object for token embeddings
-            # Based on your working example above, use the correct parameters
-            self.cluster_token_embedding_matrix = cluster_matrix(
-                matrix_file_path=path,
+        return self.token_embedding_matrix
+
+    def save_distribute_model_matrices(
+        self,
+        include_embed_tokens: bool = False,
+        include_lm_head: bool = False,
+        include_final_norm: bool = False,
+    ):
+        num_layers = getattr(self.config, "num_hidden_layers", 32)
+        print(f"📊 Total layers: {num_layers}")
+        print("-" * 70)
+
+        extra_paths: list[str] = []
+        if include_embed_tokens:
+            extra_paths.append(f"{self.model_matrix_fold_dir}embed_tokens_weight.pt")
+        if include_lm_head:
+            extra_paths.append(f"{self.model_matrix_fold_dir}lm_head_weight.pt")
+        if include_final_norm:
+            extra_paths.extend(
+                [
+                    f"{self.model_matrix_fold_dir}model_norm_weight.pt",
+                    f"{self.model_matrix_fold_dir}norm_weight.pt",
+                ]
+            )
+
+        for extra_path in extra_paths:
+            if not os.path.exists(extra_path):
+                print(f"⚠️  Missing extra weight (skip): {extra_path}")
+                continue
+            cluster_matrix(
+                matrix_file_path=extra_path,
                 node_IP_list=self.IP_list,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
-                split_matrix=False,
-                dim=1,  
-            )
-            # Convert and distribute
-            self.cluster_token_embedding_matrix.save_distribute_full_matrix_bin()
-            #self.cluster_token_embedding_matrix.convert_to_cluster_matrix_grid()
-            #self.cluster_token_embedding_matrix.save_distribute_matrixA_grid_bin()
-
-            print("✅ Token embeddings distributed successfully!")
-            return self.cluster_token_embedding_matrix
-        if op == 'add':
-            # Create cluster matrix object for token embeddings
-            # Based on your working example above, use the correct parameters
-           
-            self.cluster_token_embedding_matrix = cluster_matrix(
-                matrix_file_path=path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=[True, True, True, False],
                 split_matrix=True,
-                dim=1,  # Split by rows (sequence dimension)
+                dim=1,
+                auto_set_up=[1, "save"],
             )
-            
-            # Convert and distribute
-            self.cluster_token_embedding_matrix.convert_to_cluster_matrix_shards()
-            self.cluster_token_embedding_matrix.save_distribute_matrix_shards_bin()
-            
-            print("✅ Token embeddings distributed successfully!")
-            return self.cluster_token_embedding_matrix
 
-    def save_distribute_model_matrices(self, batch_size=4):
-        """
-        ONE-TIME SETUP: Save and distribute ALL model matrices to cluster
-        Handles both 2D matrices and 1D vectors (normalization weights)
-        Uses remote_save_distribute_matrix_shards_bin_cpp_server() for direct distribution
-        """
-        print("=" * 70)
-        print("🚀 SAVING AND DISTRIBUTING ALL MODEL MATRICES (REMOTE DISTRIBUTION)")
-        print("=" * 70)
-        
-        num_layers = getattr(self.config, 'num_hidden_layers', 32)
-        
-        # Dictionary to track all distributed matrices
-        self.distributed_matrices = {}
-        total_distributed = 0
-        
-        print(f"\n📦 DISTRIBUTING {num_layers} TRANSFORMER LAYERS...")
-        print("-" * 50)
-        
-        # Process layers in batches to avoid memory issues
-        for batch_start in range(0, num_layers, batch_size):
-            batch_end = min(batch_start + batch_size - 1, num_layers - 1)
-            print(f"\n🔧 Batch {batch_start} to {batch_end}...")
-            
-            for layer_idx in range(batch_start, batch_end + 1):
-                print(f"  📁 Layer {layer_idx}: ", end="")
-                
-                # List of weight matrices for this layer (2D matrices)
-                layer_matrices_2d = [
-                    (f'layers_{layer_idx}_self_attn_q_proj_weight', 'b'),
-                    (f'layers_{layer_idx}_self_attn_k_proj_weight', 'b'),
-                    (f'layers_{layer_idx}_self_attn_v_proj_weight', 'b'),
-                    (f'layers_{layer_idx}_self_attn_o_proj_weight', 'b'),
-                    (f'layers_{layer_idx}_mlp_up_proj_weight', 'b'),
-                    (f'layers_{layer_idx}_mlp_gate_proj_weight', 'b'),
-                    (f'layers_{layer_idx}_mlp_down_proj_weight', 'b'),
-                ]
-                
-                # List of normalization weights (1D vectors - handle separately!)
-                layer_matrices_1d = [
-                    (f'layers_{layer_idx}_input_layernorm_weight', 'norm'),
-                    (f'layers_{layer_idx}_post_attention_layernorm_weight', 'norm'),
-                ]
-                
-                # Save and distribute 2D matrices
-                for matrix_name, matrix_label in layer_matrices_2d:
-                    matrix_path = f'{self.model_matrix_fold_dir}{matrix_name}.pt'
-                    
-                    if os.path.exists(matrix_path):
-                        print(f"{matrix_label} ", end="")
-                        
-                        try:
-                            # Create cluster matrix for 2D weights
-                            cluster_mat = cluster_matrix(
-                                matrix_file_path=matrix_path,
-                                node_IP_list=self.IP_list,
-                                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                                node_percentages=self.percentages,
-                                back_end_select_list=self.backend_select_list,
-                                split_matrix=True,
-                                dim=0,  # Always split by rows for weights
-                                matrix_labeling=matrix_label
-                            )
-                            
-                            # REMOTE DISTRIBUTION: Use remote_save_distribute_matrix_shards_bin_cpp_server()
-                            # This directly sends shards to cluster nodes via C++ server
-                            result_paths = cluster_mat.remote_save_distribute_matrix_shards_bin_cpp_server()
-                            
-                            # Store reference with distribution info
-                            key = f'layer_{layer_idx}_{matrix_name}'
-                            self.distributed_matrices[key] = {
-                                'matrix': cluster_mat,
-                                'name': matrix_name,
-                                'label': matrix_label,
-                                'dim': 2,  # Mark as 2D
-                                'path': matrix_path,
-                                'remote_paths': result_paths,  # Store remote paths
-                                'distribution_method': 'remote_cpp_server'
-                            }
-                            total_distributed += 1
-                            print(f"✓ ", end="")
-                        except Exception as e:
-                            print(f"❌{matrix_label}({str(e)[:30]}) ", end="")
-                    else:
-                        print(f"❌{matrix_name[0]} ", end="")
-                
-                # Handle 1D normalization weights (store locally, not in cluster)
-                for matrix_name, weight_type in layer_matrices_1d:
-                    matrix_path = f'{self.model_matrix_fold_dir}{matrix_name}.pt'
-                    
-                    if os.path.exists(matrix_path):
-                        print(f"N({weight_type[0]}) ", end="")
-                        
-                        # Load the 1D weight vector
-                        norm_weight = torch.load(matrix_path)
-                        
-                        # Store it locally (1D vectors don't need cluster distribution)
-                        key = f'layer_{layer_idx}_{matrix_name}'
-                        self.distributed_matrices[key] = {
-                            'weight': norm_weight,
-                            'name': matrix_name,
-                            'type': weight_type,
-                            'dim': 1,  # Mark as 1D
-                            'path': matrix_path,
-                            'shape': norm_weight.shape,
-                            'distribution_method': 'local_storage'
-                        }
-                        total_distributed += 1
-                    else:
-                        print(f"• ", end="")  # Not all models have all normalization layers
-                
-                print()  # New line after each layer
-        
-        # Special layers (norm, lm_head, embeddings)
-        print(f"\n📁 DISTRIBUTING SPECIAL LAYERS...")
-        print("-" * 50)
-        
-        # 2D special matrices
-        special_matrices_2d = [
-            ('lm_head_weight', 'b'),
-            ('embed_tokens_weight', 'b'),
-        ]
-        
-        # 1D special vectors
-        special_matrices_1d = [
-            ('norm_weight', 'norm'),
-        ]
-        
-        # Handle 2D special matrices
-        for matrix_name, matrix_label in special_matrices_2d:
-            matrix_path = f'{self.model_matrix_fold_dir}{matrix_name}.pt'
-            
-            if os.path.exists(matrix_path):
-                print(f"  ✅ {matrix_name}...", end=" ")
-                
-                try:
-                    cluster_mat = cluster_matrix(
-                        matrix_file_path=matrix_path,
-                        node_IP_list=self.IP_list,
-                        CPU_GPU_select_list=self.CPU_GPU_select_list,
-                        node_percentages=self.percentages,
-                        back_end_select_list=self.backend_select_list,
-                        split_matrix=True,
-                        dim=0,
-                        matrix_labeling=matrix_label
-                    )
-                    
-                    # REMOTE DISTRIBUTION for special matrices
-                    result_paths = cluster_mat.remote_save_distribute_matrix_shards_bin_cpp_server()
-                    
-                    key = f'special_{matrix_name}'
-                    self.distributed_matrices[key] = {
-                        'matrix': cluster_mat,
-                        'name': matrix_name,
-                        'label': matrix_label,
-                        'dim': 2,
-                        'path': matrix_path,
-                        'remote_paths': result_paths,
-                        'distribution_method': 'remote_cpp_server'
-                    }
-                    total_distributed += 1
-                    
-                    print(f"Distributed ({len(result_paths)} shards)")
-                except Exception as e:
-                    print(f"Failed: {str(e)[:50]}")
-            else:
-                print(f"  ❌ {matrix_name}: Not found")
-        
-        # Handle 1D special vectors
-        for matrix_name, weight_type in special_matrices_1d:
-            matrix_path = f'{self.model_matrix_fold_dir}{matrix_name}.pt'
-            
-            if os.path.exists(matrix_path):
-                print(f"  📏 {matrix_name} (1D vector)...", end=" ")
-                
-                # Load 1D vector
-                norm_weight = torch.load(matrix_path)
-                
-                key = f'special_{matrix_name}'
-                self.distributed_matrices[key] = {
-                    'weight': norm_weight,
-                    'name': matrix_name,
-                    'type': weight_type,
-                    'dim': 1,
-                    'path': matrix_path,
-                    'shape': norm_weight.shape,
-                    'distribution_method': 'local_storage'
-                }
-                total_distributed += 1
-                
-                print(f"Stored locally")
-            else:
-                print(f"  ❌ {matrix_name}: Not found")
-        
-        # Summary
-        print(f"\n🎉 REMOTE DISTRIBUTION COMPLETE!")
-        print(f"   • Total matrices distributed: {total_distributed}")
-        
-        # Count types
-        count_2d = sum(1 for v in self.distributed_matrices.values() if v.get('dim') == 2)
-        count_1d = sum(1 for v in self.distributed_matrices.values() if v.get('dim') == 1)
-        
-        print(f"   • 2D matrices (remote cluster): {count_2d}")
-        print(f"   • 1D vectors (local storage): {count_1d}")
-        print(f"   • Layers processed: {num_layers}")
-        print(f"   • All 2D matrices now distributed to cluster nodes via C++ servers!")
-        
-        # Optional: Verify remote distribution
-        print(f"\n📋 DISTRIBUTION VERIFICATION:")
-        print(f"   • Distribution method: remote_save_distribute_matrix_shards_bin_cpp_server()")
-        print(f"   • Matrix shards sent directly to: {self.IP_list}")
-        print(f"   • CPU/GPU devices: {self.CPU_GPU_select_list}")
-        print(f"   • Backend selection: {self.backend_select_list}")
-        
-        return total_distributed
+        for layer_idx in range(num_layers):
+            print(f"SAVING LAYER: {layer_idx}")
+            # ------------------------------------------------------------
+            # Paths
+            # ------------------------------------------------------------
+            attn_q_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_q_proj_weight.pt'
+            attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_k_proj_weight.pt'
+            attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt'
+            attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt'
 
-    def _apply_layer_norm(self, x, weight, eps=1e-5):
+            mlp_gate_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt'
+            mlp_up_path   = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt'
+            mlp_down_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt'
+
+            # ============================================================
+            # ATTENTION MATRIX SHARDS (Matrix B)
+            # ============================================================
+
+            weight_paths = (
+                attn_q_proj_path,
+                attn_k_proj_path,
+                attn_v_proj_path,
+                attn_o_proj_path,
+                mlp_gate_path,
+                mlp_up_path,
+                mlp_down_path,
+            )
+            for weight_path in weight_paths:
+                if not os.path.exists(weight_path):
+                    print(f"⚠️  Missing weight (skip): {weight_path}")
+                    continue
+                cluster_matrix(
+                    matrix_file_path=weight_path,
+                    node_IP_list=self.IP_list,
+                    CPU_GPU_select_list=self.CPU_GPU_select_list,
+                    node_percentages=self.percentages,
+                    back_end_select_list=self.backend_select_list,
+                    split_matrix=True,
+                    dim=1,
+                    auto_set_up=[1, "save"],
+                )
+
+    def rms_norm(self, x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
+        # x: [..., hidden]
+        # weight: [hidden]
+        x_fp32 = x.float()
+        rms = torch.rsqrt(x_fp32.pow(2).mean(dim=-1, keepdim=True) + eps)
+        y = (x_fp32 * rms).to(x.dtype)
+        return y * weight.to(x.dtype)
+
+    def rope_apply(self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        position: int,
+        rope_theta: float = 10000.0,
+        rotary_dim: int | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Apply layer normalization to input tensor x.
-        
+        Apply Llama-style RoPE to Q and K for a single position.
+
+        q: [..., head_dim]
+        k: [..., head_dim]
+        position: int (token index)
+        """
+        if rotary_dim is None:
+            rotary_dim = self.head_dim
+        if rotary_dim <= 0:
+            return q, k
+
+        device = q.device
+        dtype = q.dtype
+        rotary_dim = int(rotary_dim)
+
+        inv_freq = 1.0 / (rope_theta ** (torch.arange(0, rotary_dim, 2, device=device, dtype=torch.float32) / rotary_dim))
+        freqs = inv_freq * float(position)                       # [rotary_dim/2]
+        emb = torch.cat((freqs, freqs), dim=-1).to(dtype=dtype)  # [rotary_dim]
+        cos = emb.cos()
+        sin = emb.sin()
+
+        def rotate_half(x: torch.Tensor) -> torch.Tensor:
+            x1 = x[..., : x.shape[-1] // 2]
+            x2 = x[..., x.shape[-1] // 2 :]
+            return torch.cat((-x2, x1), dim=-1)
+
+        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
+        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
+
+        q_rot = (q_rot * cos) + (rotate_half(q_rot) * sin)
+        k_rot = (k_rot * cos) + (rotate_half(k_rot) * sin)
+
+        q_out = torch.cat((q_rot, q_pass), dim=-1)
+        k_out = torch.cat((k_rot, k_pass), dim=-1)
+        return q_out, k_out
+
+    def expand_kv(self, k, v):
+        """
+        Expand KV heads for Grouped Query Attention (GQA).
+
         Args:
-            x: Input tensor of shape [batch, seq_len, hidden_size] or [seq_len, hidden_size]
-            weight: Scaling weights of shape [hidden_size]
-            eps: Small epsilon for numerical stability
-            
+            k: Tensor (num_kv_heads, head_dim)
+            v: Tensor (num_kv_heads, head_dim)
+
         Returns:
-            Normalized tensor of same shape as x
+            k_expanded: (num_q_heads, head_dim)
+            v_expanded: (num_q_heads, head_dim)
         """
-        # Ensure x is at least 2D
-        if x.dim() == 2:
-            # [seq_len, hidden_size] - add batch dimension
-            x = x.unsqueeze(0)  # [1, seq_len, hidden_size]
-            needs_squeeze = True
-        else:
-            needs_squeeze = False
-        
-        # Calculate mean and variance along the last dimension (hidden_size)
-        mean = x.mean(dim=-1, keepdim=True)  # [batch, seq_len, 1]
-        var = x.var(dim=-1, keepdim=True, unbiased=False)  # [batch, seq_len, 1]
-        
-        # Normalize
-        x_normalized = (x - mean) / torch.sqrt(var + eps)
-        
-        # Apply scaling weights
-        # weight shape: [hidden_size] -> reshape to [1, 1, hidden_size] for broadcasting
-        weight_expanded = weight.view(1, 1, -1)
-        x_normalized = x_normalized * weight_expanded
-        
-        # Remove batch dimension if we added it
-        if needs_squeeze:
-            x_normalized = x_normalized.squeeze(0)  # [seq_len, hidden_size]
-        
-        return x_normalized
-
-    def save_distribute_run_full_model_forward(self, text="fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!"):
-        """
-        Run the full transformer model through all layers using cluster acceleration.
-        Returns predicted text along with intermediate hidden states.
-        """
-        
-        '''
-        input_enbedding = torch.load(f'{self.model_matrix_fold_dir}input_token_embedding_matrix.pt')
-        q_matrix = torch.load(f'{self.model_matrix_fold_dir}layers_{0}_self_attn_q_proj_weight.pt')
-        q_matrix_ref = input_enbedding @ q_matrix
-
-        k_matrix = torch.load(f'{self.model_matrix_fold_dir}layers_{0}_self_attn_k_proj_weight.pt')
-        k_matrix_ref = input_enbedding @ k_matrix.T
-
-        v_matrix = torch.load(f'{self.model_matrix_fold_dir}layers_{0}_self_attn_v_proj_weight.pt')
-        v_matrix_ref = input_enbedding @ v_matrix.T
-        '''
-
-        print("=" * 70)
-        print("🚀 STARTING FULL MODEL FORWARD PASS")
-        print("=" * 70)
-
-        num_layers = getattr(self.config, 'num_hidden_layers', 32)
-        print(f"📊 Model: {getattr(self.config,'model_type','Unknown')}")
-        print(f"📊 Total layers: {num_layers}")
-        print(f"📊 Attention type: {self.Model_Attention}")
-        print(f"📊 Heads: Q={self.attention_Heads[0]}, KV={self.attention_Heads[1]}")
-        print(f"📊 Hidden size: {self.Hidden_size}")
-        print(f"📊 Text: {text[:50]}...")
-        print("-" * 70)
-
-        # -----------------------------
-        # STEP 1: TOKENIZE + EMBEDDINGS
-        # -----------------------------
-        self.tokenize_text(text)
-        print(f"Token IDs: {self.tokens.input_ids[0].tolist()}")
-        current_hidden_state_mul = self.get_save_distribute_token_embeddings('mul') # set up cluster for mul op
-
-        for layer_idx in range(num_layers):
-        #for layer_idx in range(1):
-            # ============================================================
-            # LOAD ATTENTION WEIGHTS FOR THIS LAYER
-            # ============================================================
-            print(f"   Loading attention weights for layer {layer_idx}...")
-
-            attn_q_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_q_proj_weight.pt'
-            attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_k_proj_weight.pt'
-            attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt'
-            attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt'
-
-            # ============================================================
-            # Q, K, V PROJECTIONS WITH CLUSTER
-            # ============================================================
-            print(f"   Running Q/K/V projections with CLUSTER...")
-            cluster_start = time.time()
-
-            # Load and distribute Q projection
-            attn_q_proj = cluster_matrix(
-                matrix_file_path=attn_q_proj_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1
-            )
-            attn_q_proj.convert_to_cluster_matrix_shards()
-            attn_q_proj.save_distribute_matrix_shards_bin()
-
-            cluster_q_result = current_hidden_state_mul.cluster_shard_operation(
-                attn_q_proj, False, False, True
-            )
-            #check_combined_result_values(q_matrix_ref,cluster_q_result)
-
-            # K projection with CLUSTER
-            attn_k_proj = cluster_matrix(
-                matrix_file_path=attn_k_proj_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0,
-            )
-            attn_k_proj.convert_to_cluster_matrix_shards()
-            attn_k_proj.save_distribute_matrix_shards_bin()
-
-            cluster_k_result = current_hidden_state_mul.cluster_shard_operation(
-                attn_k_proj, False, True, True
-            )
-            #check_combined_result_values(k_matrix_ref,cluster_k_result)
-            
-            # V projection with CLUSTER
-            attn_v_proj = cluster_matrix(
-                matrix_file_path=attn_v_proj_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0,
-            )
-            attn_v_proj.convert_to_cluster_matrix_shards()
-            attn_v_proj.save_distribute_matrix_shards_bin()
-
-            cluster_v_result = current_hidden_state_mul.cluster_shard_operation(
-                attn_v_proj, False, True, True
-            )
-            #check_combined_result_values(v_matrix_ref,cluster_v_result)
-
-
-            # ============================================================
-            # GQA ATTENTION WITH TORCH (CORRECT & COMPLETE)
-            # ============================================================
-            print(f"   Computing GQA attention with TORCH...")
-            torch_start = time.time()
-
-            seq_len = cluster_q_result.shape[0]
-            device = cluster_q_result.device
-            dtype = cluster_q_result.dtype
-
-            # ---- reshape to [seq, heads, head_dim]
-            q = cluster_q_result.view(seq_len, self.num_q_heads, self.head_dim)
-            k = cluster_k_result.view(seq_len, self.num_kv_heads, self.head_dim)
-            v = cluster_v_result.view(seq_len, self.num_kv_heads, self.head_dim)
-
-            # ---- expand KV for GQA
-            if self.num_kv_heads < self.num_q_heads:
-                repeat_factor = self.num_q_heads // self.num_kv_heads
-                k = k.repeat_interleave(repeat_factor, dim=1)
-                v = v.repeat_interleave(repeat_factor, dim=1)
-
-            # ---- transpose to [heads, seq, head_dim]
-            q = q.transpose(0, 1)   # [Hq, S, D]
-            k = k.transpose(0, 1)   # [Hq, S, D]
-            v = v.transpose(0, 1)   # [Hq, S, D]
-
-            # ---- scaled dot-product attention
-            attn_scores = torch.matmul(q, k.transpose(-1, -2))
-            attn_scores *= (1.0 / (self.head_dim ** 0.5))
-
-            # ---- causal mask
-            causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
-                diagonal=1
-            )
-            attn_scores.masked_fill_(causal_mask, float("-inf"))
-
-            # ---- softmax (numerically stable)
-            attn_probs = torch.softmax(attn_scores, dim=-1)
-
-            # ---- attention output
-            attn_output = torch.matmul(attn_probs, v)   # [Hq, S, D]
-
-            # ---- restore shape → [S, hidden]
-            attn_output = attn_output.transpose(0, 1).contiguous()
-            attn_output_flat_torch = attn_output.view(seq_len, self.Hidden_size)
-
-            print(f'attn_output_flat shape : {attn_output_flat_torch.shape}')
-
-            # ------------------------------------------------------------
-            # Paths
-            # ------------------------------------------------------------
-            mlp_gate_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt'
-            mlp_up_path   = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt'
-            mlp_down_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt'
-
-            attn_output_flat = cluster_matrix(
-                matrix_file_path=attn_output_flat_torch,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,  # Split columns
-                matrix_name='attn_output_flat'
-            )
-            attn_output_flat.save_distribute_full_matrix_bin()
-
-            # Load MLP gate weights - shape should be [4096, 11008] for Llama
-            mlp_gate_proj = cluster_matrix(
-                matrix_file_path=mlp_gate_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0 # Split columns
-            )
-            mlp_gate_proj.convert_to_cluster_matrix_shards()
-            mlp_gate_proj.save_distribute_matrix_shards_bin()
-
-            # Multiply: attn_output @ gate_proj
-            cluster_gate_result = attn_output_flat.cluster_shard_operation(
-                mlp_gate_proj, False, True, True
-            )
-            
-            # ============================================================
-            # MLP UP PROJECTION (parallel to gate)
-            # ============================================================
-            print(f"   Running MLP up projection...")
-            
-            # Load MLP up weights - shape should be [4096, 14336] for Llama
-            mlp_up_proj = cluster_matrix(
-                matrix_file_path=mlp_up_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0  # Split columns
-            )
-            mlp_up_proj.convert_to_cluster_matrix_shards()
-            mlp_up_proj.save_distribute_matrix_shards_bin()
-
-            # Multiply: attn_output @ up_proj
-            cluster_up_result = attn_output_flat.cluster_shard_operation(
-                mlp_up_proj, False, True, True
-            )
-            
-            print(f"   Up projection result shape: {cluster_up_result.shape}")
-
-            # ============================================================
-            # APPLY SILU ACTIVATION TO GATE
-            # ============================================================
-            print(f"   Applying SiLU activation to gate...")
-            gate_silu = torch.nn.functional.silu(cluster_gate_result)
-            
-            # ============================================================
-            # ELEMENT-WISE MULTIPLICATION: gate_silu * up
-            # ============================================================
-            print(f"   Element-wise multiplication (gate_silu * up)...")
-            mlp_intermediate = gate_silu * cluster_up_result
-            print(f"   MLP intermediate shape: {mlp_intermediate.shape}")
-            
-            # ============================================================
-            # MLP DOWN PROJECTION
-            # ============================================================
-            print(f"   Running MLP down projection...")
-            
-            # Create cluster matrix for intermediate result
-            mlp_intermediate_cluster = cluster_matrix(
-                matrix_file_path=mlp_intermediate,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=False,
-                dim=1,
-                matrix_name='mlp_intermediate_cluster'
-            )
-            mlp_intermediate_cluster.save_distribute_full_matrix_bin()
-            # Load MLP down weights - shape should be [14336, 4096] for Llama
-            mlp_down_proj = cluster_matrix(
-                matrix_file_path=mlp_down_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0
-            )
-            mlp_down_proj.convert_to_cluster_matrix_shards()
-            mlp_down_proj.save_distribute_matrix_shards_bin()
-            # Multiply: mlp_intermediate @ down_proj
-            mlp_output = mlp_intermediate_cluster.cluster_shard_operation(
-                mlp_down_proj, False, True, True
-            )
-            # ============================================================
-            # ADD RESIDUAL CONNECTION (MLP output + attention output)
-            # ============================================================
-            print(f"   Adding residual connection (MLP + attention)...")
-            # Create cluster matrix for mlp_output
-            mlp_output_cluster = cluster_matrix(
-                matrix_file_path=mlp_output,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=[True, True, True, False],
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                matrix_name='mlp_output_cluster'
-            )
-            mlp_output_cluster.convert_to_cluster_matrix_shards()
-            mlp_output_cluster.save_distribute_matrix_shards_bin()
-            
-
-            # Create cluster matrix for attention output
-            attn_output_cluster = cluster_matrix(
-                matrix_file_path=attn_output_flat_torch,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=[True, True, True, False],
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                matrix_name='attn_outpuattn_output_clustert_flat'
-            )
-            attn_output_cluster.convert_to_cluster_matrix_shards()
-            attn_output_cluster.save_distribute_matrix_shards_bin()
-
-            # Perform addition using cluster operation
-            layer_output_cluster = mlp_output_cluster.cluster_shard_operation(
-                attn_output_cluster, False, True, True, 'add'
-            )
-
-            # ============================================================
-            # APPLY POST-ATTENTION LAYER NORMALIZATION
-            # ============================================================
-            print(f"   Applying post-attention layer normalization...")
-
-            # Load post-attention layer norm weights
-            post_attention_layernorm_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_post_attention_layernorm_weight.pt'
-
-            if os.path.exists(post_attention_layernorm_path):
-                try:
-                    post_attention_layernorm = torch.load(post_attention_layernorm_path, map_location='cpu')
-                    print(f"   Loaded post-attention layer norm weights: shape {post_attention_layernorm.shape}")
-
-                    # layer_output_cluster is already a tensor (not cluster_matrix)
-                    # So we apply layer norm directly
-                    layer_output_tensor = self._apply_layer_norm(layer_output_cluster, post_attention_layernorm)
-                    print(f"   Applied layer normalization")
-
-                    if layer_idx == num_layers:
-                        return layer_output_tensor
-
-                    # If the next layer expects a cluster_matrix, wrap it again
-                    layer_output_cluster = cluster_matrix(
-                        matrix_file_path=layer_output_tensor,
-                        node_IP_list=self.IP_list,
-                        CPU_GPU_select_list=self.CPU_GPU_select_list,
-                        node_percentages=self.percentages,
-                        back_end_select_list=self.backend_select_list,
-                        split_matrix=True,
-                        dim=1,  # split across columns
-                        matrix_name=f'layer_{layer_idx}_output_cluster'
-                    )
-                    layer_output_cluster.convert_to_cluster_matrix_shards()
-
-                except Exception as e:
-                    print(f"   Error loading/applying layer norm: {e}")
-                    print(f"   Skipping layer normalization for this layer")
-            else:
-                print(f"   Warning: No post-attention layer norm found at {post_attention_layernorm_path}")
-                print(f"   Skipping layer normalization for this layer")
-
-    def load_run_full_model_forward(self, text="fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!"):
-        """
-        Run the full transformer model through all layers using cluster acceleration.
-        Returns predicted text along with intermediate hidden states.
-        """
-        
-        '''
-        input_enbedding = torch.load(f'{self.model_matrix_fold_dir}input_token_embedding_matrix.pt')
-        q_matrix = torch.load(f'{self.model_matrix_fold_dir}layers_{0}_self_attn_q_proj_weight.pt')
-        q_matrix_ref = input_enbedding @ q_matrix
-
-        k_matrix = torch.load(f'{self.model_matrix_fold_dir}layers_{0}_self_attn_k_proj_weight.pt')
-        k_matrix_ref = input_enbedding @ k_matrix.T
-
-        v_matrix = torch.load(f'{self.model_matrix_fold_dir}layers_{0}_self_attn_v_proj_weight.pt')
-        v_matrix_ref = input_enbedding @ v_matrix.T
-        '''
-
-        print("=" * 70)
-        print("🚀 STARTING FULL MODEL FORWARD PASS")
-        print("=" * 70)
-
-        num_layers = getattr(self.config, 'num_hidden_layers', 32)
-        print(f"📊 Model: {getattr(self.config,'model_type','Unknown')}")
-        print(f"📊 Total layers: {num_layers}")
-        print(f"📊 Attention type: {self.Model_Attention}")
-        print(f"📊 Heads: Q={self.attention_Heads[0]}, KV={self.attention_Heads[1]}")
-        print(f"📊 Hidden size: {self.Hidden_size}")
-        print(f"📊 Text: {text[:50]}...")
-        print("-" * 70)
-
-        # -----------------------------
-        # STEP 1: TOKENIZE + EMBEDDINGS
-        # -----------------------------
-        self.tokenize_text(text)
-        print(f"Token IDs: {self.tokens.input_ids[0].tolist()}")
-        current_hidden_state_mul = self.get_save_distribute_token_embeddings('mul') # set up cluster for mul op
-
-        for layer_idx in range(num_layers):
-        #for layer_idx in range(1):
-            # ============================================================
-            # LOAD ATTENTION WEIGHTS FOR THIS LAYER
-            # ============================================================
-            print(f"   Loading attention weights for layer {layer_idx}...")
-
-            attn_q_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_q_proj_weight.pt'
-            attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_k_proj_weight.pt'
-            attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt'
-            attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt'
-
-            # ============================================================
-            # Q, K, V PROJECTIONS WITH CLUSTER
-            # ============================================================
-            print(f"   Running Q/K/V projections with CLUSTER...")
-            cluster_start = time.time()
-
-            # Load and distribute Q projection
-            attn_q_proj = cluster_matrix(
-                matrix_file_path=attn_q_proj_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1
-            )
-            attn_q_proj.load_cluster_matrix_shards()
-
-            cluster_q_result = current_hidden_state_mul.cluster_shard_operation(
-                attn_q_proj, False, False, True
-            )
-            #check_combined_result_values(q_matrix_ref,cluster_q_result)
-
-            # K projection with CLUSTER
-            attn_k_proj = cluster_matrix(
-                matrix_file_path=attn_k_proj_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0,
-            )
-            attn_k_proj.load_cluster_matrix_shards()
-
-            cluster_k_result = current_hidden_state_mul.cluster_shard_operation(
-                attn_k_proj, False, True, True
-            )
-            #check_combined_result_values(k_matrix_ref,cluster_k_result)
-            
-            # V projection with CLUSTER
-            attn_v_proj = cluster_matrix(
-                matrix_file_path=attn_v_proj_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0,
-            )
-            attn_v_proj.load_cluster_matrix_shards()
-
-            cluster_v_result = current_hidden_state_mul.cluster_shard_operation(
-                attn_v_proj, False, True, True
-            )
-            #check_combined_result_values(v_matrix_ref,cluster_v_result)
-
-
-            # ============================================================
-            # GQA ATTENTION WITH TORCH (CORRECT & COMPLETE)
-            # ============================================================
-            print(f"   Computing GQA attention with TORCH...")
-            torch_start = time.time()
-
-            seq_len = cluster_q_result.shape[0]
-            device = cluster_q_result.device
-            dtype = cluster_q_result.dtype
-
-            # ---- reshape to [seq, heads, head_dim]
-            q = cluster_q_result.view(seq_len, self.num_q_heads, self.head_dim)
-            k = cluster_k_result.view(seq_len, self.num_kv_heads, self.head_dim)
-            v = cluster_v_result.view(seq_len, self.num_kv_heads, self.head_dim)
-
-            # ---- expand KV for GQA
-            if self.num_kv_heads < self.num_q_heads:
-                repeat_factor = self.num_q_heads // self.num_kv_heads
-                k = k.repeat_interleave(repeat_factor, dim=1)
-                v = v.repeat_interleave(repeat_factor, dim=1)
-
-            # ---- transpose to [heads, seq, head_dim]
-            q = q.transpose(0, 1)   # [Hq, S, D]
-            k = k.transpose(0, 1)   # [Hq, S, D]
-            v = v.transpose(0, 1)   # [Hq, S, D]
-
-            # ---- scaled dot-product attention
-            attn_scores = torch.matmul(q, k.transpose(-1, -2))
-            attn_scores *= (1.0 / (self.head_dim ** 0.5))
-
-            # ---- causal mask
-            causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, device=device, dtype=torch.bool),
-                diagonal=1
-            )
-            attn_scores.masked_fill_(causal_mask, float("-inf"))
-
-            # ---- softmax (numerically stable)
-            attn_probs = torch.softmax(attn_scores, dim=-1)
-
-            # ---- attention output
-            attn_output = torch.matmul(attn_probs, v)   # [Hq, S, D]
-
-            # ---- restore shape → [S, hidden]
-            attn_output = attn_output.transpose(0, 1).contiguous()
-            attn_output_flat_torch = attn_output.view(seq_len, self.Hidden_size)
-
-            print(f'attn_output_flat shape : {attn_output_flat_torch.shape}')
-
-            # ------------------------------------------------------------
-            # Paths
-            # ------------------------------------------------------------
-            mlp_gate_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt'
-            mlp_up_path   = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt'
-            mlp_down_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt'
-
-            attn_output_flat = cluster_matrix(
-                matrix_file_path=attn_output_flat_torch,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,  # Split columns
-                matrix_name='attn_output_flat'
-            )
-            attn_output_flat.load_cluster_matrix()
-
-            # Load MLP gate weights - shape should be [4096, 11008] for Llama
-            mlp_gate_proj = cluster_matrix(
-                matrix_file_path=mlp_gate_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0 # Split columns
-            )
-            mlp_gate_proj.load_cluster_matrix_shards()
-
-            # Multiply: attn_output @ gate_proj
-            cluster_gate_result = attn_output_flat.cluster_shard_operation(
-                mlp_gate_proj, False, True, True
-            )
-            
-            # ============================================================
-            # MLP UP PROJECTION (parallel to gate)
-            # ============================================================
-            print(f"   Running MLP up projection...")
-            
-            # Load MLP up weights - shape should be [4096, 14336] for Llama
-            mlp_up_proj = cluster_matrix(
-                matrix_file_path=mlp_up_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0  # Split columns
-            )
-            mlp_up_proj.load_cluster_matrix_shards()
-
-            # Multiply: attn_output @ up_proj
-            cluster_up_result = attn_output_flat.cluster_shard_operation(
-                mlp_up_proj, False, True, True
-            )
-            
-            print(f"   Up projection result shape: {cluster_up_result.shape}")
-
-            # ============================================================
-            # APPLY SILU ACTIVATION TO GATE
-            # ============================================================
-            print(f"   Applying SiLU activation to gate...")
-            gate_silu = torch.nn.functional.silu(cluster_gate_result)
-            
-            # ============================================================
-            # ELEMENT-WISE MULTIPLICATION: gate_silu * up
-            # ============================================================
-            print(f"   Element-wise multiplication (gate_silu * up)...")
-            mlp_intermediate = gate_silu * cluster_up_result
-            print(f"   MLP intermediate shape: {mlp_intermediate.shape}")
-            
-            # ============================================================
-            # MLP DOWN PROJECTION
-            # ============================================================
-            print(f"   Running MLP down projection...")
-            
-            # Create cluster matrix for intermediate result
-            mlp_intermediate_cluster = cluster_matrix(
-                matrix_file_path=mlp_intermediate,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=False,
-                dim=1,
-                matrix_name='mlp_intermediate_cluster'
-            )
-            mlp_intermediate_cluster.save_distribute_full_matrix_bin()
-            # Load MLP down weights - shape should be [14336, 4096] for Llama
-            mlp_down_proj = cluster_matrix(
-                matrix_file_path=mlp_down_path,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=0
-            )
-            mlp_down_proj.load_cluster_matrix_shards()
-            # Multiply: mlp_intermediate @ down_proj
-            mlp_output = mlp_intermediate_cluster.cluster_shard_operation(
-                mlp_down_proj, False, True, True
-            )
-            # ============================================================
-            # ADD RESIDUAL CONNECTION (MLP output + attention output)
-            # ============================================================
-            print(f"   Adding residual connection (MLP + attention)...")
-            # Create cluster matrix for mlp_output
-            mlp_output_cluster = cluster_matrix(
-                matrix_file_path=mlp_output,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=[True, True, True, False],
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                matrix_name='mlp_output_cluster'
-            )
-            mlp_output_cluster.load_cluster_matrix_shards()
-            
-            # Create cluster matrix for attention output
-            attn_output_cluster = cluster_matrix(
-                matrix_file_path=attn_output_flat_torch,
-                node_IP_list=self.IP_list,
-                CPU_GPU_select_list=[True, True, True, False],
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                matrix_name='attn_outpuattn_output_clustert_flat'
-            )
-            attn_output_cluster.load_cluster_matrix_shards()
-
-            # Perform addition using cluster operation
-            layer_output_cluster = mlp_output_cluster.cluster_shard_operation(
-                attn_output_cluster, False, True, True, 'add'
-            )
-
-            # ============================================================
-            # APPLY POST-ATTENTION LAYER NORMALIZATION
-            # ============================================================
-            print(f"   Applying post-attention layer normalization...")
-
-            # Load post-attention layer norm weights
-            post_attention_layernorm_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_post_attention_layernorm_weight.pt'
-
-            if os.path.exists(post_attention_layernorm_path):
-                try:
-                    post_attention_layernorm = torch.load(post_attention_layernorm_path, map_location='cpu')
-                    print(f"   Loaded post-attention layer norm weights: shape {post_attention_layernorm.shape}")
-
-                    # layer_output_cluster is already a tensor (not cluster_matrix)
-                    # So we apply layer norm directly
-                    layer_output_tensor = self._apply_layer_norm(layer_output_cluster, post_attention_layernorm)
-                    print(f"   Applied layer normalization")
-
-                    if layer_idx == num_layers:
-                        return layer_output_tensor
-
-                    # If the next layer expects a cluster_matrix, wrap it again
-                    layer_output_cluster = cluster_matrix(
-                        matrix_file_path=layer_output_tensor,
-                        node_IP_list=self.IP_list,
-                        CPU_GPU_select_list=self.CPU_GPU_select_list,
-                        node_percentages=self.percentages,
-                        back_end_select_list=self.backend_select_list,
-                        split_matrix=True,
-                        dim=1,  # split across columns
-                        matrix_name=f'layer_{layer_idx}_output_cluster'
-                    )
-                    layer_output_cluster.convert_to_cluster_matrix_shards()
-
-                except Exception as e:
-                    print(f"   Error loading/applying layer norm: {e}")
-                    print(f"   Skipping layer normalization for this layer")
-            else:
-                print(f"   Warning: No post-attention layer norm found at {post_attention_layernorm_path}")
-                print(f"   Skipping layer normalization for this layer")
-         
-    def run_lm_head_and_decode(self, final_hidden_state):
-        print("=" * 70)
-        print("🧠 FINAL LM HEAD")
-        print("=" * 70)
-
-        # ------------------------------------------------------------
-        # Final RMSNorm
-        # ------------------------------------------------------------
-        final_hidden_state = self._apply_layer_norm(final_hidden_state)
-        print(f"After final norm: {final_hidden_state.shape}")
-
-        # ------------------------------------------------------------
-        # Load tied embedding matrix (LM head)
-        # ------------------------------------------------------------
-        embed_path = f"{self.model_matrix_fold_dir}embed_tokens_weight.pt"
-        embed_weight = torch.load(embed_path, map_location=final_hidden_state.device)
-
-        print(f"Embed weight shape: {embed_weight.shape}")
-
-        # ------------------------------------------------------------
-        # Compute logits
-        # ------------------------------------------------------------
-        logits = final_hidden_state @ embed_weight.T
-        print(f"Logits shape: {logits.shape}")
-
-        # ------------------------------------------------------------
-        # Pick tokens (greedy for now)
-        # ------------------------------------------------------------
-        token_ids = torch.argmax(logits, dim=-1)
-
-        # ------------------------------------------------------------
-        # Decode
-        # ------------------------------------------------------------
-        text = self.tokenizer.decode(
-            token_ids.tolist(),
-            skip_special_tokens=True
+        assert k.shape == (self.num_kv_heads, self.head_dim)
+        assert v.shape == (self.num_kv_heads, self.head_dim)
+
+        group_size = self.num_q_heads // self.num_kv_heads
+        assert self.num_q_heads % self.num_kv_heads == 0, "Invalid GQA head configuration"
+
+        k_expanded = k.repeat_interleave(group_size, dim=0)
+        v_expanded = v.repeat_interleave(group_size, dim=0)
+
+        return k_expanded, v_expanded
+
+    def run_transformer(
+        self,
+        prompt: str = "Hello!",
+        *,
+        max_new_tokens: int = 16,
+        use_chat_template: bool = False,
+        temperature: float = 0.0,
+        top_k: int = 0,
+    ) -> str:
+        return self.generate_text(
+            prompt,
+            max_new_tokens=max_new_tokens,
+            use_chat_template=use_chat_template,
+            temperature=temperature,
+            top_k=top_k,
         )
 
-        print("=" * 70)
-        print("📤 OUTPUT TEXT")
-        print("=" * 70)
-        print(text)
+    def generate_text(
+        self,
+        prompt: str = "Hello!",
+        *,
+        max_new_tokens: int = 16,
+        use_chat_template: bool = False,
+        temperature: float = 0.0,
+        top_k: int = 0,
+    ) -> str:
+        prompt_embeddings = self.get_token_embeddings(prompt, use_chat_template=use_chat_template)
+        if prompt_embeddings is None:
+            raise RuntimeError("Failed to get prompt token embeddings")
 
-        return text
+        if self.tokens is None:
+            raise RuntimeError("Tokenization failed; self.tokens is None")
+
+        token_ids: list[int] = self.tokens.input_ids[0].tolist()
+
+        # KV cache is per-layer and must persist across tokens during a forward/generation run.
+        self.k_cache_layers = [
+            torch.zeros((self.num_q_heads, 0, self.head_dim), dtype=torch.float32)
+            for _ in range(self.num_layers)
+        ]
+        self.v_cache_layers = [
+            torch.zeros((self.num_q_heads, 0, self.head_dim), dtype=torch.float32)
+            for _ in range(self.num_layers)
+        ]
+
+        last_hidden: torch.Tensor | None = None
+        for token_position, token_embedding in enumerate(prompt_embeddings):
+            last_hidden = self.run_transformer_layers(token_embedding, token_position)
+
+        if last_hidden is None:
+            raise RuntimeError("Prompt was empty; no hidden state produced")
+
+        eos_id = getattr(self.tokenizer, "eos_token_id", None)
+
+        for _ in range(int(max_new_tokens)):
+            next_id, _logits = self.decode_next_token(last_hidden, temperature=temperature, top_k=top_k)
+            token_ids.append(next_id)
+
+            if eos_id is not None and next_id == int(eos_id):
+                break
+
+            next_embedding = self.embed_tokens_weight[next_id]
+            last_hidden = self.run_transformer_layers(next_embedding, len(token_ids) - 1)
+
+        return self.tokenizer.decode(token_ids, skip_special_tokens=False)
+
+    def run_transformer_layers(self, input_token_embeddings, token_position: int):
+        if not hasattr(self, "k_cache_layers") or not hasattr(self, "v_cache_layers"):
+            raise RuntimeError("KV cache not initialized. Call run_transformer() first.")
+        #for layer_idx in range(self.num_layers):
+        for layer_idx in range(self.num_layers):
+            attn_q_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_q_proj_weight.pt'
+            attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_k_proj_weight.pt'
+            attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt'
+            attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt'
+
+            attn_q_proj = torch.load(attn_q_proj_path, map_location="cpu").T
+            attn_k_proj = torch.load(attn_k_proj_path, map_location="cpu").T
+            attn_v_proj = torch.load(attn_v_proj_path, map_location="cpu").T
+
+            input_layernorm_weight_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_input_layernorm_weight.pt'
+            input_layernorm_weight = torch.load(input_layernorm_weight_path)
+            x=self.rms_norm(input_token_embeddings, input_layernorm_weight)
+            x=x.unsqueeze(1)
+
+            x = cluster_matrix(
+                matrix_file_path=x,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=False,
+                dim=1,
+                auto_set_up=[1,'save'],
+                matrix_name='input_token_embeddings'
+            )
+            q = cluster_matrix(
+                matrix_file_path=attn_q_proj,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1,'save'],
+                matrix_name='attn_q_proj'
+            )
+            k = cluster_matrix(
+                matrix_file_path=attn_k_proj,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1,'save'],
+                matrix_name='attn_k_proj'
+            )
+            v = cluster_matrix(
+                matrix_file_path=attn_v_proj,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1,'save'],
+                matrix_name='attn_v_proj'
+            )
+
+            q_flat = x.cluster_shard_operation(q,True,False,True)
+            k_flat = x.cluster_shard_operation(k,True,False,True)
+            v_flat = x.cluster_shard_operation(v,True,False,True)
+
+            # reshape projections into heads
+            q = q_flat.view(self.num_q_heads, self.head_dim)
+            k = k_flat.view(self.num_kv_heads, self.head_dim)
+            v = v_flat.view(self.num_kv_heads, self.head_dim)
+
+            # apply RoPE to Q and K ONLY
+            rope_theta = float(getattr(self.config, "rope_theta", 10000.0))
+            q, k = self.rope_apply(
+                q,
+                k,
+                position=token_position,
+                rope_theta=rope_theta,
+                rotary_dim=self.head_dim,
+            )
+
+            print(f"RoPE q shape: {tuple(q.shape)}")
+            print(f"RoPE k shape: {tuple(k.shape)}")
+
+            # EXPAND KV for GQA (core rule)
+            k, v = self.expand_kv(k, v)
+            # Append to per-layer KV cache (cached in expanded/head space for attention).
+            k_cache = self.k_cache_layers[layer_idx]
+            v_cache = self.v_cache_layers[layer_idx]
+            self.k_cache_layers[layer_idx] = torch.cat([k_cache, k.unsqueeze(1)], dim=1)
+            self.v_cache_layers[layer_idx] = torch.cat([v_cache, v.unsqueeze(1)], dim=1)
+            print(
+                f"KV cache layer {layer_idx}: "
+                f"K={tuple(self.k_cache_layers[layer_idx].shape)} "
+                f"V={tuple(self.v_cache_layers[layer_idx].shape)}"
+            )
+
+            # ------------------------------------------------------------
+            # Attention over KV cache (current token attends to all cached tokens)
+            # ------------------------------------------------------------
+            k_cache = self.k_cache_layers[layer_idx]  # [Hq, T, D]
+            v_cache = self.v_cache_layers[layer_idx]  # [Hq, T, D]
+
+            scores = torch.matmul(q.unsqueeze(1), k_cache.transpose(-1, -2))  # [Hq, 1, T]
+            scores = scores / math.sqrt(self.head_dim)
+            attn_weights = torch.softmax(scores, dim=-1)  # [Hq, 1, T]
+            attn_output = torch.matmul(attn_weights, v_cache).squeeze(1)  # [Hq, D]
+
+            print(f"attn_output (per-head): {tuple(attn_output.shape)}")
+
+            #correct from here down only in this function 
+            # 1) Project attention back to hidden size with o_proj (torch)
+            attn_o_proj = torch.load(attn_o_proj_path, map_location="cpu")
+            attn_output_flat = attn_output.reshape(1, self.Hidden_size)  # [1, hidden]
+
+            if attn_o_proj.ndim != 2:
+                raise ValueError(f"attn_o_proj must be 2D, got {tuple(attn_o_proj.shape)}")
+
+            if attn_o_proj.shape[1] == attn_output_flat.shape[1]:
+                # HF Linear weight: [out, in]
+                attn_hidden = attn_output_flat @ attn_o_proj.t()
+            elif attn_o_proj.shape[0] == attn_output_flat.shape[1]:
+                # Already transposed: [in, out]
+                attn_hidden = attn_output_flat @ attn_o_proj
+            else:
+                raise ValueError(
+                    f"attn_o_proj shape {tuple(attn_o_proj.shape)} incompatible with hidden {attn_output_flat.shape[1]}"
+                )
+
+            # 2) Residual connection (add to the *pre-norm* hidden state for this layer)
+            residual = input_token_embeddings.reshape(1, self.Hidden_size)
+            hidden_out = residual + attn_hidden
+
+            print(f"attn_hidden: {tuple(attn_hidden.shape)}")
+            print(f"residual: {tuple(residual.shape)}")
+            print(f"hidden_out(after attn+res): {tuple(hidden_out.shape)}")
+
+            # Feed next layer with updated hidden state (keep as 1D token embedding)
+            hidden_out = hidden_out.squeeze(0)
+            input_token_embeddings = self.mlp_layer(layer_idx, hidden_out)
+
+        return input_token_embeddings
+
+    def mlp_layer(self,layer_idx, hidden_out):
+        mlp_up_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt"
+        mlp_down_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt"
+        mlp_gate_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt"
+        post_attn_ln_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_post_attention_layernorm_weight.pt"
+
+        if hidden_out.ndim == 1:
+            residual = hidden_out.unsqueeze(0)  # [1, hidden]
+        elif hidden_out.ndim == 2 and hidden_out.shape[0] == 1:
+            residual = hidden_out
+        else:
+            raise ValueError(f"mlp_layer expects [hidden] or [1, hidden], got {tuple(hidden_out.shape)}")
+
+        post_attn_ln_w = torch.load(post_attn_ln_path, map_location="cpu")
+        if post_attn_ln_w.ndim != 1:
+            raise ValueError(f"post_attention_layernorm_weight must be 1D, got {tuple(post_attn_ln_w.shape)}")
+        if post_attn_ln_w.shape[0] != residual.shape[1]:
+            raise ValueError(
+                f"post_attention_layernorm_weight hidden mismatch: weight={post_attn_ln_w.shape[0]} hidden={residual.shape[1]}"
+            )
+        mlp_in = self.rms_norm(residual, post_attn_ln_w)  # [1, hidden]
+        mlp_in_col = mlp_in.t().contiguous()  # [hidden, 1]
+
+        mlp_in_cluster = cluster_matrix(
+            matrix_file_path=mlp_in_col,
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=False,
+            dim=1,
+            auto_set_up=[1, "save"],
+            matrix_name=f"layer{layer_idx}_mlp_in",
+        )
+
+        mlp_gate_w = torch.load(mlp_gate_path, map_location="cpu").t().contiguous()  # [hidden, intermediate]
+        mlp_up_w = torch.load(mlp_up_path, map_location="cpu").t().contiguous()      # [hidden, intermediate]
+        mlp_down_w = torch.load(mlp_down_path, map_location="cpu").t().contiguous()  # [intermediate, hidden]
+
+        hidden = residual.shape[1]
+        if mlp_gate_w.ndim != 2 or mlp_up_w.ndim != 2 or mlp_down_w.ndim != 2:
+            raise ValueError(
+                "MLP weights must be 2D after transpose: "
+                f"gate={tuple(mlp_gate_w.shape)} up={tuple(mlp_up_w.shape)} down={tuple(mlp_down_w.shape)}"
+            )
+        if mlp_gate_w.shape[0] != hidden or mlp_up_w.shape[0] != hidden:
+            raise ValueError(
+                f"MLP input hidden mismatch: hidden={hidden} gate_w={tuple(mlp_gate_w.shape)} up_w={tuple(mlp_up_w.shape)}"
+            )
+        if mlp_gate_w.shape != mlp_up_w.shape:
+            raise ValueError(f"MLP gate/up shape mismatch: gate_w={tuple(mlp_gate_w.shape)} up_w={tuple(mlp_up_w.shape)}")
+        if mlp_down_w.shape[1] != hidden or mlp_down_w.shape[0] != mlp_gate_w.shape[1]:
+            raise ValueError(
+                "MLP down weight mismatch: "
+                f"down_w={tuple(mlp_down_w.shape)} expected=({mlp_gate_w.shape[1]}, {hidden})"
+            )
+
+        mlp_gate_cluster = cluster_matrix(
+            matrix_file_path=mlp_gate_w,
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=True,
+            dim=1,
+            auto_set_up=[1, "load"],
+            matrix_name=f"layer{layer_idx}_mlp_gate_w",
+        )
+        mlp_up_cluster = cluster_matrix(
+            matrix_file_path=mlp_up_w,
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=True,
+            dim=1,
+            auto_set_up=[1, "load"],
+            matrix_name=f"layer{layer_idx}_mlp_up_w",
+        )
+        mlp_down_cluster = cluster_matrix(
+            matrix_file_path=mlp_down_w,
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=True,
+            dim=1,
+            auto_set_up=[1, "load"],
+            matrix_name=f"layer{layer_idx}_mlp_down_w",
+        )
+
+        gate = mlp_in_cluster.cluster_shard_operation(mlp_gate_cluster, True, False, True)  # [1, intermediate]
+        up = mlp_in_cluster.cluster_shard_operation(mlp_up_cluster, True, False, True)      # [1, intermediate]
+        intermediate = torch.nn.functional.silu(gate) * up                                   # [1, intermediate]
+
+        intermediate_cluster = cluster_matrix(
+            matrix_file_path=intermediate.t().contiguous(),  # [intermediate, 1]
+            node_IP_list=self.IP_list,
+            CPU_GPU_select_list=self.CPU_GPU_select_list,
+            node_percentages=self.percentages,
+            back_end_select_list=self.backend_select_list,
+            split_matrix=False,
+            dim=1,
+            auto_set_up=[1, "save"],
+            matrix_name=f"layer{layer_idx}_mlp_intermediate",
+        )
+        mlp_out = intermediate_cluster.cluster_shard_operation(mlp_down_cluster, True, False, True)  # [1, hidden]
+
+        # Residual connection (post-attn residual + MLP output)
+        layer_out = residual + mlp_out
+        return layer_out.squeeze(0)
+    
 
 
-IP_list = [
-    '192.168.2.100','192.168.2.100',
-    '192.168.2.101','192.168.2.104',
-]
-percentages = [0.35, 0.35, 0.15, 0.15]
-CPU_GPU_select_list = [True, True, True, True]
-backend_select_list = ['llama', 'llama', 'llama', 'llama'] 
+if __name__ == "__main__":
+    IP_list = [
+        "192.168.2.100",
+        "192.168.2.100",
+        "192.168.2.101",
+        "192.168.2.104",
+    ]
+    percentages = [0.35, 0.35, 0.15, 0.15]
+    CPU_GPU_select_list = [True, True, True, True]
+    backend_select_list = ["llama", "llama", "llama", "llama"]
 
-# Initialize the transformer
-test = cluster_llm_transformer(
-    '/home/rino/.cache/exo/downloads/mlabonne--Meta-Llama-3.1-8B-Instruct-abliterated',
-    IP_list, percentages, CPU_GPU_select_list, backend_select_list
-)
+    test = cluster_llm_transformer(
+        "/home/rino/.cache/exo/downloads/mlabonne--Meta-Llama-3.1-8B-Instruct-abliterated",
+        IP_list,
+        percentages,
+        CPU_GPU_select_list,
+        backend_select_list,
+    )
 
-print("=" * 70)
-print("🚀 SAVING ALL MODEL LAYERS")
-print("=" * 70)
-# Get total number of layers
-num_layers = getattr(test.config, 'num_hidden_layers', 32)
-print(f"📊 Model has {num_layers} layers")
-# Save ALL layers (0 through num_layers-1)
-#test.save_all_model_layers(0, 4)
-print("\n" + "=" * 70)
-print("✅ ALL MODEL LAYERS SAVED!")
-print("=" * 70)
-# Now proceed with inference
-#print("\n🔤 Tokenizing text and preparing embeddings...")
-#test.tokenize_text("fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!")
-#print("\n📦 Creating distributed embeddings...")
-#test.get_save_distribute_token_embeddings()
-#print("\n🏗️ Running full model forward pass...")
-#result = test.run_full_model_forward()
-#print("\n🎉 INFERENCE COMPLETE!")
-#print(f"Final hidden state shape: {result['final_hidden_state'].shape}")
-
-#test.run_GQA_transformer_layer()  # Distribute ALL weights to cluster
-
-# ULTRA-FAST INFERENCE (Run this as many times as you want!):
-result = test.save_distribute_run_full_model_forward("fuck the jews!! lorenzo is my bitch!! i fuck ASS!!!!!!!")
-print(test.run_lm_head_and_decode(result))
-#print(f"⚡ Inference completed in {result['performance']['total_time']:.2f}s!")
+    # Example:
+    out = test.run_transformer()
+    print(out)
+    #result = test.transformer_autoregressive("Hello!", max_new_tokens=16, use_chat_template=True)
