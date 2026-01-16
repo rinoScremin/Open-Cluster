@@ -289,7 +289,7 @@ class cluster_llm_transformer:
         
         return total_saved
 
-    def get_token_embeddings(self, input_prompt='Hello! are you working??', use_chat_template=False):
+    def get_token_embeddings(self, input_prompt='tell me a short joke', use_chat_template=False):
         """Get and distribute token embeddings"""
         # Tokenize the input prompt
         self.tokenize_text(input_prompt, use_chat_template=use_chat_template)
@@ -495,9 +495,9 @@ class cluster_llm_transformer:
 
     def generate_text(
         self,
-        prompt: str = "Hello!",
+        prompt: str = "tell me a short joke",
         *,
-        max_new_tokens: int = 16,
+        max_new_tokens: int = 20,
         use_chat_template: bool = False,
         temperature: float = 0.0,
         top_k: int = 0,
@@ -580,7 +580,7 @@ class cluster_llm_transformer:
                 back_end_select_list=self.backend_select_list,
                 split_matrix=True,
                 dim=1,
-                auto_set_up=[1,'save'],
+                auto_set_up=[1,'load'],
                 matrix_name='attn_q_proj'
             )
             k = cluster_matrix(
@@ -591,7 +591,7 @@ class cluster_llm_transformer:
                 back_end_select_list=self.backend_select_list,
                 split_matrix=True,
                 dim=1,
-                auto_set_up=[1,'save'],
+                auto_set_up=[1,'load'],
                 matrix_name='attn_k_proj'
             )
             v = cluster_matrix(
@@ -602,7 +602,7 @@ class cluster_llm_transformer:
                 back_end_select_list=self.backend_select_list,
                 split_matrix=True,
                 dim=1,
-                auto_set_up=[1,'save'],
+                auto_set_up=[1,'load'],
                 matrix_name='attn_v_proj'
             )
 
@@ -752,7 +752,7 @@ class cluster_llm_transformer:
             back_end_select_list=self.backend_select_list,
             split_matrix=True,
             dim=1,
-            auto_set_up=[1, "load"],
+            auto_set_up=[1, "save"],
             matrix_name=f"layer{layer_idx}_mlp_gate_w",
         )
         mlp_up_cluster = cluster_matrix(
@@ -763,7 +763,7 @@ class cluster_llm_transformer:
             back_end_select_list=self.backend_select_list,
             split_matrix=True,
             dim=1,
-            auto_set_up=[1, "load"],
+            auto_set_up=[1, "save"],
             matrix_name=f"layer{layer_idx}_mlp_up_w",
         )
         mlp_down_cluster = cluster_matrix(
@@ -774,7 +774,7 @@ class cluster_llm_transformer:
             back_end_select_list=self.backend_select_list,
             split_matrix=True,
             dim=1,
-            auto_set_up=[1, "load"],
+            auto_set_up=[1, "save"],
             matrix_name=f"layer{layer_idx}_mlp_down_w",
         )
 
@@ -799,7 +799,6 @@ class cluster_llm_transformer:
         layer_out = residual + mlp_out
         return layer_out.squeeze(0)
     
-
 
 if __name__ == "__main__":
     IP_list = [
