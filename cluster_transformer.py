@@ -77,6 +77,113 @@ class cluster_llm_transformer:
         print(f"🔍 Head dimension: {self.head_dim}")
         print(f"🔍 KV dimension: {self.kv_dim}")
 
+    def transpose_save_matrix(self, layer_path: str) -> int:
+        matrix = torch.load(layer_path, map_location="cpu")
+        if not isinstance(matrix, torch.Tensor):
+            raise TypeError(f"Expected torch.Tensor in {layer_path}, got {type(matrix)}")
+        if matrix.ndim != 2:
+            raise ValueError(f"Expected 2D tensor in {layer_path}, got {tuple(matrix.shape)}")
+        torch.save(matrix.t().contiguous(), layer_path)
+        return 0
+
+    def transpose_mlp_layers(self) -> int:
+        """
+        In-place transpose+contiguous of MLP weight .pt files so runtime doesn't need `.t().contiguous()`.
+
+        After running, files will be:
+          - up/gate: [hidden, intermediate]
+          - down:    [intermediate, hidden]
+        """
+        for layer_index in range(self.num_layers):
+            mlp_up_path = f"{self.model_matrix_fold_dir}layers_{layer_index}_mlp_up_proj_weight.pt"
+            mlp_down_path = f"{self.model_matrix_fold_dir}layers_{layer_index}_mlp_down_proj_weight.pt"
+            mlp_gate_path = f"{self.model_matrix_fold_dir}layers_{layer_index}_mlp_gate_proj_weight.pt"
+            print(f"transposing mlp layers {layer_index}")
+            for path in (mlp_up_path, mlp_down_path, mlp_gate_path):
+                if not os.path.exists(path):
+                    print(f"⚠️  Missing MLP weight (skip): {path}")
+                    continue
+                self.transpose_save_matrix(path)
+        return 0
+
+    def cache_mlp_weight_shards(self, start_layer: int = 0, end_layer: int | None = None) -> int:
+        """
+        One-time cache: distribute transposed MLP weights as cluster shards so `mlp_layer` can `load` instead of `save`.
+        """
+        if end_layer is None:
+            end_layer = self.num_layers - 1
+        for layer_idx in range(int(start_layer), int(end_layer) + 1):
+            hidden = int(self.Hidden_size)
+            mlp_up_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt"
+            mlp_down_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt"
+            mlp_gate_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt"
+
+            mlp_gate_w = torch.load(mlp_gate_path, map_location="cpu")
+            mlp_up_w = torch.load(mlp_up_path, map_location="cpu")
+            mlp_down_w = torch.load(mlp_down_path, map_location="cpu")
+
+            # Backward compatible: if user didn't run transpose_mlp_layers yet, fix orientation here.
+            if mlp_gate_w.ndim != 2 or mlp_up_w.ndim != 2 or mlp_down_w.ndim != 2:
+                raise ValueError(
+                    f"Expected 2D MLP weights at layer {layer_idx}: "
+                    f"gate={tuple(mlp_gate_w.shape)} up={tuple(mlp_up_w.shape)} down={tuple(mlp_down_w.shape)}"
+                )
+            if mlp_gate_w.shape[0] != hidden and mlp_gate_w.shape[1] == hidden:
+                mlp_gate_w = mlp_gate_w.t().contiguous()
+            else:
+                mlp_gate_w = mlp_gate_w.contiguous()
+            if mlp_up_w.shape[0] != hidden and mlp_up_w.shape[1] == hidden:
+                mlp_up_w = mlp_up_w.t().contiguous()
+            else:
+                mlp_up_w = mlp_up_w.contiguous()
+            if mlp_down_w.shape[1] != hidden and mlp_down_w.shape[0] == hidden:
+                mlp_down_w = mlp_down_w.t().contiguous()
+            else:
+                mlp_down_w = mlp_down_w.contiguous()
+
+            cluster_matrix(
+                matrix_file_path=mlp_gate_w,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "save"],
+                matrix_name=f"layer{layer_idx}_mlp_gate_w",
+            )
+            cluster_matrix(
+                matrix_file_path=mlp_up_w,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "save"],
+                matrix_name=f"layer{layer_idx}_mlp_up_w",
+            )
+            cluster_matrix(
+                matrix_file_path=mlp_down_w,
+                node_IP_list=self.IP_list,
+                CPU_GPU_select_list=self.CPU_GPU_select_list,
+                node_percentages=self.percentages,
+                back_end_select_list=self.backend_select_list,
+                split_matrix=True,
+                dim=1,
+                auto_set_up=[1, "save"],
+                matrix_name=f"layer{layer_idx}_mlp_down_w",
+            )
+        return 0
+
+    def _has_weight_shards(self, matrix_name: str) -> bool:
+        local_ram_folder = os.environ.get("LOCAL_RAM_FOLDER", "/dev/shm/matrix_shards/")
+        local_disk_folder = os.environ.get("LOCAL_DISK_FOLDER", "matrix_shards/")
+        local_project_dir = os.environ.get("LOCAL_PROJECT_DIR", self.local_project_dir)
+        ram_path = os.path.join(local_ram_folder, f"{matrix_name}_shard_0.bin")
+        disk_path = os.path.join(local_project_dir, local_disk_folder, f"{matrix_name}_shard_0.bin")
+        return os.path.exists(ram_path) or os.path.exists(disk_path)
+
     def _get_final_norm_weight_path(self) -> str:
         candidates = (
             f"{self.model_matrix_fold_dir}model_norm_weight.pt",
@@ -213,80 +320,174 @@ class cluster_llm_transformer:
             self.tokens = self.tokenizer(text, return_tensors="pt")
         return self.tokens.input_ids
 
-    def save_all_model_layers(self, start_layer=0, end_layer=None, batch_size=4):
+    def save_all_model_layers(
+        self,
+        start_layer: int = 0,
+        end_layer: int | None = None,
+        batch_size: int = 4,
+        *,
+        dtype: str = "float16",
+        overwrite: bool = False,
+        prefer_safetensors: bool = True,
+        allow_full_model_load: bool = False,
+    ) -> int:
         """
-        Save model layers in batches to avoid memory crashes
+        Save the model weights needed by this project to `model_matrixs/` without loading the full model in RAM.
+
+        Notes:
+        - Prefers streaming tensors from `.safetensors` shards (lowest memory).
+        - Falls back to a full model load only if safetensors aren't found (may OOM on large models).
+        - `batch_size` is kept for backward compatibility; streaming mode ignores it.
         """
+        import gc
+        import glob
+        import re
+        import shutil
+        import time
+
         if end_layer is None:
-            end_layer = getattr(self.config, 'num_hidden_layers', 32) - 1
-        
-        print(f"💾 SAVING MODEL LAYERS SAFELY {start_layer} to {end_layer}")
-        print(f"📊 Batch size: {batch_size} layers at a time")
+            end_layer = getattr(self.config, "num_hidden_layers", 32) - 1
+
+        dtype_map = {"float16": torch.float16, "float32": torch.float32, "bf16": torch.bfloat16}
+        if dtype not in dtype_map:
+            raise ValueError(f"Unsupported dtype={dtype!r}. Use one of: {sorted(dtype_map)}")
+        save_dtype = dtype_map[dtype]
+
+        os.makedirs(self.model_matrix_fold_dir, exist_ok=True)
+
+        print(f"💾 SAVING MODEL WEIGHTS SAFELY {start_layer} to {end_layer}")
+        print(f"📦 Output dir: {self.model_matrix_fold_dir}")
+        print(f"🔢 Save dtype: {dtype}")
+        print(f"🧱 Batch size (compat): {batch_size}")
         print("=" * 60)
-        
+
+        allowed_layer_suffixes = {
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+        }
+
+        def key_to_outfile(key: str) -> str | None:
+            if key == "model.embed_tokens.weight":
+                return "embed_tokens_weight.pt"
+            if key == "lm_head.weight":
+                return "lm_head_weight.pt"
+            if key == "model.norm.weight":
+                return "model_norm_weight.pt"
+
+            m = re.match(r"^model\\.layers\\.(\\d+)\\.(.+)$", key)
+            if not m:
+                return None
+            layer_idx = int(m.group(1))
+            if layer_idx < int(start_layer) or layer_idx > int(end_layer):
+                return None
+            suffix = m.group(2)
+            if suffix not in allowed_layer_suffixes:
+                return None
+            # e.g. model.layers.0.self_attn.q_proj.weight -> layers_0_self_attn_q_proj_weight.pt
+            return f"layers_{layer_idx}_{suffix.replace('.', '_')}.pt"
+
         total_saved = 0
-        
-        # Process in batches
-        for batch_start in range(start_layer, end_layer + 1, batch_size):
-            batch_end = min(batch_start + batch_size - 1, end_layer)
-            
-            print(f"\n🔧 Processing layers {batch_start} to {batch_end}...")
-            
-            for layer_idx in range(batch_start, batch_end + 1):
-                print(f"  📁 Layer {layer_idx}...")
-                layer_saved = 0
-                
-                # Save this layer's matrices
-                for name, param in self.model.named_parameters():
-                    name_split = name.split(".")
-                    try:
-                        layer_index = int(name_split[1])
-                        if len(param.shape) == 2 and layer_index == layer_idx:
-                            safe_name = name.replace('.', '_')
-                            path = self.model_matrix_fold_dir + safe_name + '.pt'
-                            torch.save(param.float(), path)
-                            print(f"    ✅ {safe_name}.pt")
-                            layer_saved += 1
-                            total_saved += 1
-                    except (ValueError, IndexError):
-                        continue
-                
-                print(f"    📊 Saved {layer_saved} matrices")
-            
-            # Clear memory after each batch
-            if hasattr(torch, 'cuda'):
-                torch.cuda.empty_cache()
-            
-            # Small delay to let system breathe
-            import time
-            time.sleep(1)
-            print(f"  💤 Batch complete, pausing...")
-        
-        # Save special layers separately
-        print(f"\n📁 Saving special layers...")
-        special_saved = 0
-        special_layers = []
-        
-        # First collect all special layer names
-        for name, param in self.model.named_parameters():
-            if ('norm' in name.lower() and 'weight' in name) or \
-            ('lm_head' in name.lower()) or \
-            ('embed' in name.lower() and len(param.shape) == 2):
-                special_layers.append((name, param))
-        
-        # Save them one by one
-        for name, param in special_layers:
-            safe_name = name.replace('.', '_')
-            path = self.model_matrix_fold_dir + safe_name + '.pt'
-            torch.save(param.float(), path)
-            print(f"  ✅ {safe_name}.pt - Shape: {param.shape}")
-            special_saved += 1
+
+        safetensors_files: list[str] = []
+        if prefer_safetensors:
+            safetensors_files = sorted(glob.glob(os.path.join(self.model_path, "*.safetensors")))
+
+        if safetensors_files:
+            try:
+                from safetensors.torch import safe_open  # type: ignore
+            except Exception as e:
+                raise RuntimeError(
+                    f"Found .safetensors weights but failed to import safetensors: {e}. "
+                    "Install `safetensors` in your env."
+                )
+
+            print(f"✅ Using safetensors streaming from {len(safetensors_files)} file(s)")
+
+            for st_path in safetensors_files:
+                print(f"\n📦 Reading: {st_path}")
+                with safe_open(st_path, framework="pt", device="cpu") as f:
+                    for key in f.keys():
+                        out_name = key_to_outfile(key)
+                        if out_name is None:
+                            continue
+                        out_path = os.path.join(self.model_matrix_fold_dir, out_name)
+                        if (not overwrite) and os.path.exists(out_path):
+                            continue
+
+                        tensor = f.get_tensor(key)
+                        if tensor.dtype != save_dtype:
+                            tensor = tensor.to(dtype=save_dtype)
+                        tensor = tensor.contiguous()
+                        torch.save(tensor, out_path)
+                        total_saved += 1
+
+                        del tensor
+                        gc.collect()
+
+                time.sleep(0.05)
+
+            # Convenience: keep `norm_weight.pt` as a copy if needed by older code.
+            model_norm_path = os.path.join(self.model_matrix_fold_dir, "model_norm_weight.pt")
+            norm_path = os.path.join(self.model_matrix_fold_dir, "norm_weight.pt")
+            if os.path.exists(model_norm_path) and (overwrite or not os.path.exists(norm_path)):
+                shutil.copyfile(model_norm_path, norm_path)
+                total_saved += 1
+
+            print(f"\n🎉 SAFELY SAVED {total_saved} tensors via safetensors")
+            return total_saved
+
+        if not allow_full_model_load:
+            raise RuntimeError(
+                "No `.safetensors` weight shards found in `model_path`, and `allow_full_model_load=False`.\n"
+                "To avoid crashing the PC, this function defaults to safetensors streaming only.\n"
+                "Fix: ensure your model has `*.safetensors` files, or call with `allow_full_model_load=True` "
+                "(may use lots of RAM)."
+            )
+
+        # Fallback: full model load (can OOM on large models).
+        print("⚠️  No .safetensors files found; doing full model load (may use a lot of RAM).")
+        try:
+            from transformers import AutoModelForCausalLM  # type: ignore
+        except Exception as e:
+            raise RuntimeError(f"transformers not available for fallback load: {e}")
+
+        model = AutoModelForCausalLM.from_pretrained(
+            self.model_path,
+            torch_dtype=save_dtype,
+            low_cpu_mem_usage=True,
+            device_map="cpu",
+        )
+        model.eval()
+
+        wanted_files: dict[str, torch.Tensor] = {}
+        state = model.state_dict()
+        for key, tensor in state.items():
+            out_name = key_to_outfile(key)
+            if out_name is None:
+                continue
+            out_path = os.path.join(self.model_matrix_fold_dir, out_name)
+            if (not overwrite) and os.path.exists(out_path):
+                continue
+            wanted_files[out_path] = tensor.detach().to(dtype=save_dtype).contiguous().cpu()
+
+        for out_path, tensor in wanted_files.items():
+            torch.save(tensor, out_path)
             total_saved += 1
-        
-        print(f"\n🎉 SAFELY SAVED {total_saved} matrices")
-        print(f"   • Layers: {end_layer - start_layer + 1}")
-        print(f"   • Special layers: {special_saved}")
-        
+            del tensor
+            gc.collect()
+
+        del state
+        del model
+        gc.collect()
+
+        print(f"\n🎉 SAVED {total_saved} tensors via full-model fallback")
         return total_saved
 
     def get_token_embeddings(self, input_prompt='tell me a short joke', use_chat_template=False):
@@ -326,6 +527,7 @@ class cluster_llm_transformer:
         include_embed_tokens: bool = False,
         include_lm_head: bool = False,
         include_final_norm: bool = False,
+        transpose_for_runtime: bool = True,
     ):
         num_layers = getattr(self.config, "num_hidden_layers", 32)
         print(f"📊 Total layers: {num_layers}")
@@ -390,8 +592,39 @@ class cluster_llm_transformer:
                 if not os.path.exists(weight_path):
                     print(f"⚠️  Missing weight (skip): {weight_path}")
                     continue
+                matrix_name = os.path.basename(weight_path).split(".pt")[0]
+
+                weight = torch.load(weight_path, map_location="cpu")
+                if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
+                    raise ValueError(f"Expected 2D torch.Tensor at {weight_path}, got {type(weight)} {getattr(weight, 'shape', None)}")
+
+                if transpose_for_runtime:
+                    hidden = int(self.hidden_size)
+                    # MLP shapes are non-square; avoid double-transpose if already pre-transposed.
+                    if weight_path.endswith("_mlp_gate_proj_weight.pt") or weight_path.endswith("_mlp_up_proj_weight.pt"):
+                        # desired: [hidden, intermediate]
+                        if weight.shape[0] == hidden:
+                            weight = weight.contiguous()
+                        elif weight.shape[1] == hidden:
+                            weight = weight.t().contiguous()
+                        else:
+                            raise ValueError(f"Unexpected MLP gate/up shape at {weight_path}: {tuple(weight.shape)} (hidden={hidden})")
+                    elif weight_path.endswith("_mlp_down_proj_weight.pt"):
+                        # desired: [intermediate, hidden]
+                        if weight.shape[1] == hidden:
+                            weight = weight.contiguous()
+                        elif weight.shape[0] == hidden:
+                            weight = weight.t().contiguous()
+                        else:
+                            raise ValueError(f"Unexpected MLP down shape at {weight_path}: {tuple(weight.shape)} (hidden={hidden})")
+                    else:
+                        # Attention projections (square): store transposed to match runtime matmul flags.
+                        weight = weight.t().contiguous()
+                else:
+                    weight = weight.contiguous()
+
                 cluster_matrix(
-                    matrix_file_path=weight_path,
+                    matrix_file_path=weight,
                     node_IP_list=self.IP_list,
                     CPU_GPU_select_list=self.CPU_GPU_select_list,
                     node_percentages=self.percentages,
@@ -399,6 +632,7 @@ class cluster_llm_transformer:
                     split_matrix=True,
                     dim=1,
                     auto_set_up=[1, "save"],
+                    matrix_name=matrix_name,
                 )
 
     def rms_norm(self, x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
@@ -552,10 +786,6 @@ class cluster_llm_transformer:
             attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt'
             attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt'
 
-            attn_q_proj = torch.load(attn_q_proj_path, map_location="cpu").T
-            attn_k_proj = torch.load(attn_k_proj_path, map_location="cpu").T
-            attn_v_proj = torch.load(attn_v_proj_path, map_location="cpu").T
-
             input_layernorm_weight_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_input_layernorm_weight.pt'
             input_layernorm_weight = torch.load(input_layernorm_weight_path)
             x=self.rms_norm(input_token_embeddings, input_layernorm_weight)
@@ -573,7 +803,7 @@ class cluster_llm_transformer:
                 matrix_name='input_token_embeddings'
             )
             q = cluster_matrix(
-                matrix_file_path=attn_q_proj,
+                matrix_file_path=attn_q_proj_path,
                 node_IP_list=self.IP_list,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
@@ -581,10 +811,9 @@ class cluster_llm_transformer:
                 split_matrix=True,
                 dim=1,
                 auto_set_up=[1,'load'],
-                matrix_name='attn_q_proj'
             )
             k = cluster_matrix(
-                matrix_file_path=attn_k_proj,
+                matrix_file_path=attn_k_proj_path,
                 node_IP_list=self.IP_list,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
@@ -592,10 +821,9 @@ class cluster_llm_transformer:
                 split_matrix=True,
                 dim=1,
                 auto_set_up=[1,'load'],
-                matrix_name='attn_k_proj'
             )
             v = cluster_matrix(
-                matrix_file_path=attn_v_proj,
+                matrix_file_path=attn_v_proj_path,
                 node_IP_list=self.IP_list,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
@@ -603,7 +831,6 @@ class cluster_llm_transformer:
                 split_matrix=True,
                 dim=1,
                 auto_set_up=[1,'load'],
-                matrix_name='attn_v_proj'
             )
 
             q_flat = x.cluster_shard_operation(q,True,False,True)
@@ -722,59 +949,37 @@ class cluster_llm_transformer:
             matrix_name=f"layer{layer_idx}_mlp_in",
         )
 
-        mlp_gate_w = torch.load(mlp_gate_path, map_location="cpu").t().contiguous()  # [hidden, intermediate]
-        mlp_up_w = torch.load(mlp_up_path, map_location="cpu").t().contiguous()      # [hidden, intermediate]
-        mlp_down_w = torch.load(mlp_down_path, map_location="cpu").t().contiguous()  # [intermediate, hidden]
-
-        hidden = residual.shape[1]
-        if mlp_gate_w.ndim != 2 or mlp_up_w.ndim != 2 or mlp_down_w.ndim != 2:
-            raise ValueError(
-                "MLP weights must be 2D after transpose: "
-                f"gate={tuple(mlp_gate_w.shape)} up={tuple(mlp_up_w.shape)} down={tuple(mlp_down_w.shape)}"
-            )
-        if mlp_gate_w.shape[0] != hidden or mlp_up_w.shape[0] != hidden:
-            raise ValueError(
-                f"MLP input hidden mismatch: hidden={hidden} gate_w={tuple(mlp_gate_w.shape)} up_w={tuple(mlp_up_w.shape)}"
-            )
-        if mlp_gate_w.shape != mlp_up_w.shape:
-            raise ValueError(f"MLP gate/up shape mismatch: gate_w={tuple(mlp_gate_w.shape)} up_w={tuple(mlp_up_w.shape)}")
-        if mlp_down_w.shape[1] != hidden or mlp_down_w.shape[0] != mlp_gate_w.shape[1]:
-            raise ValueError(
-                "MLP down weight mismatch: "
-                f"down_w={tuple(mlp_down_w.shape)} expected=({mlp_gate_w.shape[1]}, {hidden})"
-            )
-
         mlp_gate_cluster = cluster_matrix(
-            matrix_file_path=mlp_gate_w,
+            matrix_file_path=mlp_gate_path,
             node_IP_list=self.IP_list,
             CPU_GPU_select_list=self.CPU_GPU_select_list,
             node_percentages=self.percentages,
             back_end_select_list=self.backend_select_list,
             split_matrix=True,
             dim=1,
-            auto_set_up=[1, "save"],
+            auto_set_up=[1, "load"],
             matrix_name=f"layer{layer_idx}_mlp_gate_w",
         )
         mlp_up_cluster = cluster_matrix(
-            matrix_file_path=mlp_up_w,
+            matrix_file_path=mlp_up_path,
             node_IP_list=self.IP_list,
             CPU_GPU_select_list=self.CPU_GPU_select_list,
             node_percentages=self.percentages,
             back_end_select_list=self.backend_select_list,
             split_matrix=True,
             dim=1,
-            auto_set_up=[1, "save"],
+            auto_set_up=[1, "load"],
             matrix_name=f"layer{layer_idx}_mlp_up_w",
         )
         mlp_down_cluster = cluster_matrix(
-            matrix_file_path=mlp_down_w,
+            matrix_file_path=mlp_down_path,
             node_IP_list=self.IP_list,
             CPU_GPU_select_list=self.CPU_GPU_select_list,
             node_percentages=self.percentages,
             back_end_select_list=self.backend_select_list,
             split_matrix=True,
             dim=1,
-            auto_set_up=[1, "save"],
+            auto_set_up=[1, "load"],
             matrix_name=f"layer{layer_idx}_mlp_down_w",
         )
 
@@ -798,7 +1003,7 @@ class cluster_llm_transformer:
         # Residual connection (post-attn residual + MLP output)
         layer_out = residual + mlp_out
         return layer_out.squeeze(0)
-    
+
 
 if __name__ == "__main__":
     IP_list = [
@@ -819,7 +1024,11 @@ if __name__ == "__main__":
         backend_select_list,
     )
 
+    #test.save_all_model_layers()
+    #test.transpose_mlp_layers()
+    #test.save_distribute_model_matrices()
+
     # Example:
     out = test.run_transformer()
     print(out)
-    #result = test.transformer_autoregressive("Hello!", max_new_tokens=16, use_chat_template=True)
+     
