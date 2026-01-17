@@ -1,5 +1,3 @@
-FULL WORKING CLUSTER transformer
-
 SYSTEM 1 IS WORKING WITH TRANFORMER GIVING THE CORRECT SHAPE AND DATA MAKING SOME CHANGES TO SYSTEM2 CODE IS NOW BACK UNDER CONSTRUCTION 
 
 # 🚀 **The Vision: Democratizing AI Compute**
@@ -55,923 +53,298 @@ The architecture is solid, it works, and it's **already useful**. But this is ju
 ## 🎯 **What This Is**
 A **hybrid distributed computing system** that turns ANY group of computers into a supercomputer. Mix CPUs, GPUs (NVIDIA/AMD/Intel), Apple Silicon - **all working together** on massive matrix operations.
 
----
 
-## 📦 **Quick Start - 3 Lines to Supercomputing**
+        
+                    ######################################## USING CLUSTER_MATRIX_V1 ########################################
 
-```python
-# 1. Define your cluster
-nodes = ['192.168.2.100', '192.168.2.102', '192.168.2.103']
-percentages = [0.50, 0.25, 0.25]  # Split work
-backends = ['llama', 'torch', 'llama']  # Mix backends!
-
-# 2. Load matrices (auto-distributed)
-matrixA = cluster_matrix("my_model.pt", nodes, percentages, backends)
-matrixB = cluster_matrix("another_model.pt", nodes, percentages, backends)
-
-# 3. Compute - distributed across all hardware!
-result = matrixA.cluster_operation(matrixB, send_back=True)
-```
-
-**That's it!** Your computation now runs across ALL available hardware.
-
----
-
-## 🌟 **Unique Features**
-
-### 1. **Hardware Agnostic**
-```python
-# Mix ANY hardware:
-nodes = [
-    '192.168.1.10',  # NVIDIA RTX 3080 (Torch CUDA)
-    '192.168.1.11',  # AMD RX 6800 (GGML Vulkan)
-    '192.168.1.12',  # Intel iGPU (GGML Vulkan)
-    '192.168.1.13',  # Apple M2 (GGML Metal)
-    '192.168.1.14',  # Old CPU (GGML OpenBLAS)
-]
-```
-
-### 2. **Intelligent Load Balancing**
-```python
-# Match work to capability:
-percentages = [0.40, 0.30, 0.20, 0.10]  # RTX 3080 gets 40%, M2 gets 10%
-# System automatically allocates work proportionally
-```
-
-### 3. **Backend Mixing - First of its kind!**
-```python
-# Mix computation backends:
-backends = ['torch', 'llama', 'llama', 'torch', 'llama']
-# Some nodes use PyTorch, others use GGML - SAME computation!
-```
-
-### 4. **Flexible Distribution Modes**
-```python
-# Mode 1: Split matrices across nodes
-matrixA = cluster_matrix(model_path, nodes, percentages, backends, split_matrix=True)
-# Result: Each node gets a piece of the matrix
-
-# Mode 2: Full matrix to all nodes  
-matrixB = cluster_matrix(model_path, nodes, percentages, backends, split_matrix=False)
-# Result: Each node gets the FULL matrix
-```
-
----
-
-## 🧮 **How It Works - Technical Overview**
-
-### **Phase 1: Matrix Distribution**
-```
-[Your Matrix] → [Load from .pt file] → [Split by percentage] → [Distribute to nodes]
-```
-
-**Key methods:**
-- `convert_to_cluster_matrix_shards()` - Split matrix based on node percentages
-- `save_distribute_matrix_shards_bin()` - Send binary shards to nodes
-- `save_distribute_full_matrix_bin()` - Send full matrix to all nodes
-
-### **Phase 2: Distributed Computation**
-```python
-# Each node computes its part:
-matrixA.cluster_operation(matrixB, transposeA=False, transposeB=True, send_back=True)
-
-# Options:
-# - send_back=True → Combine results into single file
-# - send_back=False → Keep distributed for further operations
-```
-
-### **Phase 3: Result Assembly**
-```
-[Node 0 result] \
-[Node 1 result] → [Combine] → [Final matrix]
-[Node 2 result] /
-```
-
----
-
-## 🔧 **Core Components**
-
-### **1. `cluster_matrix` Class**
-The main orchestrator that:
-- Distributes matrices across nodes
-- Manages communication via ZeroMQ
-- Handles different backends
-- Combines results
-
-```python
-class cluster_matrix:
-    def __init__(self, matrix_file_path, node_IP_list, ...):
-        # Sets up distribution network
-        # Creates ZeroMQ connections
-        # Splits/distributes matrices
-    
-    def cluster_operation(self, other_matrix, ...):
-        # Coordinates distributed computation
-        # Sends commands to nodes
-        # Waits for and assembles results
-```
-
-### **2. Binary Matrix Format**
-```python
-# GGML-compatible binary format:
-# [num_dims, dim1, dim2, ..., data]
-
-# Always 4D for consistency:
-# 2D: [1, 1, rows, cols]
-# 3D: [1, channels, rows, cols]
-# 4D: [batch, channels, rows, cols]
-```
-
-### **3. ZeroMQ Communication Layer**
-```
-Head Node (Controller)         Worker Nodes
-     │                              │
-     ├─ Command → Node 1 → Compute  │
-     ├─ Command → Node 2 → Compute  │
-     ├─ Command → Node 3 → Compute  │
-     │                              │
-     ←─ Result ─ Node 1 ←───────────┤
-     ←─ Result ─ Node 2 ←───────────┤
-     ←─ Result ─ Node 3 ←───────────┘
-```
-
----
-
-Here’s a concise paragraph you can include in your README or documentation describing the **environment variable configuration and local/remote paths** for the head node and workers:
-
----
-
-### Local & Remote Paths, Environment Variables, and Network Configuration
-
-The cluster system relies on **configurable local and remote paths** to store matrix shards and computation results, with defaults pointing to RAM-backed folders (`/dev/shm`) for high-speed access and optional disk storage for persistence. The head node uses `LOCAL_MATRIX_RESULTS_RAM_FOLDER`, `LOCAL_DISK_FOLDER`, `LOCAL_RAM_FOLDER`, and `LOCAL_PROJECT_DIR` to determine where to read/write matrix data locally, while worker nodes use corresponding `REMOTE_*` variables.
-
-Network settings for the head node, including Ethernet and WiFi IP addresses, are set via `HEAD_NODE_IP` and `HEAD_NODE_IP_WIFI`, while ZeroMQ ports for LLaMA communication are configured through `HEAD_NODE_PULL_PORT_C`, `HEAD_NODE_PUSH_PORT_C`, `WORKER_NODE_PULL_PORT_C`, and `WORKER_NODE_PUSH_PORT_C`.
-
-All paths and IP/port settings are **loaded from environment variables** with sensible defaults, allowing easy customization for different machines or network setups. The Python front-end prints the resolved paths and IPs at runtime, and the C++ ZMQ server constructor mirrors this setup, initializing dual network interfaces (Ethernet/WiFi) and parallel file structures automatically.
-
-**Example environment variables you might set before starting the cluster:**
-
-```bash
-export LOCAL_MATRIX_RESULTS_RAM_FOLDER=/dev/shm/matrix_results/
-export LOCAL_DISK_FOLDER=matrix_shards/
-export LOCAL_RAM_FOLDER=/dev/shm/matrix_shards/
-export LOCAL_PROJECT_DIR=/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/
-
-export REMOTE_MATRIX_RESULTS_RAM_FOLDER=/dev/shm/matrix_results/
-export REMOTE_RAM_FOLDER=/dev/shm/matrix_shards/
-export REMOTE_DISK_FOLDER=matrix_shards/
-export REMOTE_PROJECT_DIR=/home/rino/Desktop/Open_Cluster_AI_Station_beta/
-
-export HEAD_NODE_IP=192.168.2.100
-export HEAD_NODE_IP_WIFI=192.168.3.113
-export HEAD_NODE_PULL_PORT_C=7779
-export HEAD_NODE_PUSH_PORT_C=7780
-export WORKER_NODE_PULL_PORT_C=5557
-export WORKER_NODE_PUSH_PORT_C=5558
-```
-
-This setup ensures that both Python and C++ components of the cluster can **consistently locate files, communicate across nodes, and manage distributed matrix operations**.
-
----
-
-If you want, I can also **draw a small diagram showing head node ↔ workers with RAM/disk paths and ZMQ ports** so it’s visually clear for the README. Do you want me to do that next? FUCK OFF DEEP SEEK KEEP CREATING ME HENTI PORN
-
-
-
-## ⚡ **Performance Features**
-
-### **Parallel File Transfer**
-```python
-# EXPERIMENTAL: Split files across Ethernet + WiFi
-matrixA.parallel_interface_file_transfer(filename, target_ip)
-# Uses both network interfaces simultaneously
-```
-
-### **Smart GPU Management**
-```python
-# Multiple GPUs on same node? No problem!
-node_IP_list = ['192.168.2.100', '192.168.2.100', '192.168.2.100']
-# Three commands to same IP = three GPUs used!
-```
-
-### **Result Aggregation Options**
-```python
-# Level 1: Keep distributed
-result = matrixA.cluster_operation(matrixB, send_back=False)
-# Files stay on nodes for further distributed ops
-
-# Level 2: Combine locally
-result = matrixA.cluster_operation(matrixB, send_back=True)
-# Single combined file on head node
-```
-
----
-
-## 🚀 **Use Cases**
-
-### **1. Transformer/LLM Inference**
-```python
-# Distribute large attention matrices
-class DistributedTransformer:
-    def attention(self, Q, K, V):
-        # Q, K, V automatically distributed
-        scores = cluster.distributed_matmul(Q, K.T)
-        return cluster.distributed_matmul(scores, V)
-```
-
-### **2. Research - Mixing Hardware**
-```python
-# Use whatever hardware you have
-# Old GPUs + New GPUs + CPUs = ALL compute!
-```
-
-### **3. Education/Experimentation**
-```python
-# Learn distributed computing without HPC cluster
-# Run on gaming PCs, laptops, old hardware
-```
-
----
-
-## 📊 **Supported Backends**
-
-| Backend | Hardware | Use Case |
-|---------|----------|----------|
-| **`torch`** | NVIDIA GPUs (CUDA) | Fast, production-ready |
-| **`llama`** | ANY GPU (Vulkan) | Old GPUs, AMD, Intel |
-| **`llama`** | CPUs (OpenBLAS) | CPU-only nodes |
-| **`llama`** | Apple (Metal) | MacBooks, M-series |
-
-**Note:** GGML (`llama` backend) supports Vulkan on ANY GPU - no CUDA required!
-
----
-
-## 🔧 **Setup Requirements**
-
-### **Minimal - Just Python**
-```bash
-# On every node:
-pip install torch numpy pyzmq
-python -m cluster_matrix.node_server
-```
-
-### **Optional - For Maximum Performance**
-```bash
-# Build GGML with full support
-cmake -B build \
-      -DGGML_VULKAN=ON \
-      -DGGML_CUDA=ON \
-      -DGGML_METAL=ON \
-      -DGGML_BLAS=ON
-```
-
----
-
-## 🎮 **Real Examples**
-
-### **Example 1: Gaming PC Cluster**
-```python
-# Friends' gaming PCs = supercomputer
-nodes = [
-    '192.168.1.101',  # RTX 4090
-    '192.168.1.102',  # RTX 3080  
-    '192.168.1.103',  # RX 7900 XT
-    '192.168.1.104',  # Laptop iGPU
+IP_list = [
+    "192.168.2.100",
+    "192.168.2.100",
+    "192.168.2.101",
+    "192.168.2.104",
 ]
 
-# All work together seamlessly!
-```
+# List the IP addresses of the remote PCs to be used in the cluster.
+#
+# If you list the same IP more than once (e.g. "192.168.2.100" twice),
+# the C++ backend will check whether the system has separate hardware
+# available for each node.
+#
+# Example: "192.168.2.100"
+# This system has 2 GPUs:
+#   - AMD RX 5500
+#   - AMD RX 6400
+#
+# In this case:
+#   shard 1 → GPU #1 (RX 5500)
+#   shard 2 → GPU #2 (RX 6400)
+#
+# If "192.168.2.100" is listed a third time and no additional GPU is
+# available, the shard will fall back to CPU BLAS.
+#
+# NOTE:
+# CPU BLAS may not support ADD operations correctly on some systems.
+# If you encounter issues, CPU BLAS for add operations may need to be disabled.
+#
+# "192.168.2.101" is a laptop with an integrated GPU / APU.
+# The next shard will run on that GPU.
+# If listed again, additional shards will run on CPU BLAS
+# (this laptop only has one GPU).
+#
+# "192.168.2.104" is an Intel(R) Core(TM) i5-6500 @ 3.20GHz system.
+# This machine has no GPU and will always use CPU BLAS.
+
+percentages = [0.35, 0.35, 0.15, 0.15]
+
+# Define how the matrix is distributed across the cluster:
+#   node 1: 35% of matrix B
+#   node 2: 35% of matrix B
+#   node 3: 15% of matrix B
+#   node 4: 15% of matrix B
+
+CPU_GPU_select_list = [True, True, True, True]
+
+# Enables the backend acceleration that was compiled for each node.
+# If set to False, the shard will be processed on CPU only,
+# without acceleration (e.g. no BLAS).
+
+backend_select_list = ["llama", "llama", "llama", "llama"]
+
+# Available backends:
+#
+# "llama" → GGML backend (accelerated when CPU_GPU_select_list is True)
+# "torch" → PyTorch backend
+# "opencl" → Custom OpenCL backend
+#
+# You can mix and match backends depending on your hardware:
+#
+# backend_select_list = ["torch", "torch", "torch", "torch"]
+# backend_select_list = ["llama", "torch", "llama", "torch"]
+# backend_select_list = ["opencl", "torch", "llama", "opencl"]
+#
+# This allows you to support unusual or custom hardware.
+# For example, if you build a custom accelerator using Raspberry Pis,
+# you can implement an OpenCL backend for it.
+
+post_attn_ln_w = torch.load(post_attn_ln_path, map_location="cpu")
+
+if post_attn_ln_w.ndim != 1:
+    raise ValueError(
+        f"post_attention_layernorm_weight must be 1D, got {tuple(post_attn_ln_w.shape)}"
+    )
+
+if post_attn_ln_w.shape[0] != residual.shape[1]:
+    raise ValueError(
+        f"post_attention_layernorm_weight hidden mismatch: "
+        f"weight={post_attn_ln_w.shape[0]} hidden={residual.shape[1]}"
+    )
+
+mlp_in = self.rms_norm(residual, post_attn_ln_w)  # [1, hidden]
+mlp_in_col = mlp_in.t().contiguous()               # [hidden, 1]
+
+# NOTE:
+# cluster_matrix_v1.py only converts PyTorch tensors into a format
+# that the cluster can use.
+#
+# Any "special" tensor operations (e.g. .contiguous(), transpose, reshape)
+# MUST be performed in PyTorch before passing the tensor to the cluster.
+
+mlp_in_cluster = cluster_matrix(
+    matrix_file_path=mlp_in_col,  # If passing a torch.Tensor, you must provide a name
+    node_IP_list=IP_list,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    node_percentages=percentages,
+    back_end_select_list=backend_select_list,
+    split_matrix=False,  # Matrix A (full matrix), not split
+    dim=1,               # Dimension used for combining results
+    auto_set_up=[1, "save"],
+    matrix_name=f"layer{0}_mlp_in",
+)
+
+mlp_gate_path = f"{model_matrix_fold_dir}layers_{0}_mlp_gate_proj_weight.pt"
+
+# Here we pass a file path instead of a torch.Tensor.
+# In this case, you do NOT need to provide a matrix_name —
+# cluster_matrix will automatically use the file name
+# (e.g. "layers_0_mlp_gate_proj_weight").
+
+mlp_gate_cluster = cluster_matrix(
+    matrix_file_path=mlp_gate_path,
+    node_IP_list=IP_list,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    node_percentages=percentages,
+    back_end_select_list=backend_select_list,
+    split_matrix=True,   # Matrix B (sharded)
+    dim=1,
+    auto_set_up=[1, "save"],
+)
+
+mlp_gate_cluster = cluster_matrix(
+    matrix_file_path=mlp_gate_path,
+    node_IP_list=IP_list,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    node_percentages=percentages,
+    back_end_select_list=backend_select_list,
+    split_matrix=True,   # Matrix B (sharded)
+    dim=1,
+    auto_set_up=[1, "load"], # after cashing the matrix shards you can just load then using the load function 
+    # strongly reconmend first cashing the tensors you need for what ever you are doing then using the 'load' function when you can 
+    # some times it might not be possable to be albe to pre-cash a tensor (for exsample in the case of token embeddings you would also need to use       # 'save' do to the fact you can not cash the matrix 
+)
+
+mlp_gate_cluster = cluster_matrix(
+    matrix_file_path=mlp_gate_path,
+    node_IP_list=IP_list,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    node_percentages=percentages,
+    back_end_select_list=backend_select_list,
+    split_matrix=True,   # Matrix B (sharded)
+    dim=1,
+    auto_set_up=[1, "load"],  # After caching the matrix shards, you can load them directly
+)
+
+# Below is an example demonstrating how the `cluster_matrix` class should be used.
+
+attn_q_proj_path = f"{self.model_matrix_fold_dir}layers_{0}_self_attn_q_proj_weight.pt"
+attn_k_proj_path = f"{self.model_matrix_fold_dir}layers_{0}_self_attn_k_proj_weight.pt"
+attn_v_proj_path = f"{self.model_matrix_fold_dir}layers_{0}_self_attn_v_proj_weight.pt"
+attn_o_proj_path = f"{self.model_matrix_fold_dir}layers_{0}_self_attn_o_proj_weight.pt"
+
+input_layernorm_weight_path = f"{self.model_matrix_fold_dir}layers_{0}_input_layernorm_weight.pt"
+input_layernorm_weight = torch.load(input_layernorm_weight_path)
+
+# Apply RMSNorm locally before sending to the cluster
+x = self.rms_norm(input_token_embeddings, input_layernorm_weight)
+x = x.unsqueeze(1)
+
+# Matrix A (full, not sharded)
+x = cluster_matrix(
+    matrix_file_path=x,
+    node_IP_list=self.IP_list,
+    CPU_GPU_select_list=self.CPU_GPU_select_list,
+    node_percentages=self.percentages,
+    back_end_select_list=self.backend_select_list,
+    split_matrix=False,
+    dim=1,
+    auto_set_up=[1, "save"],
+    matrix_name="input_token_embeddings",
+)
+
+# Matrix B (sharded weights, pre-cached)
+q = cluster_matrix(
+    matrix_file_path=attn_q_proj_path,
+    node_IP_list=self.IP_list,
+    CPU_GPU_select_list=self.CPU_GPU_select_list,
+    node_percentages=self.percentages,
+    back_end_select_list=self.backend_select_list,
+    split_matrix=True,
+    dim=1,
+    auto_set_up=[1, "load"],
+)
+
+k = cluster_matrix(
+    matrix_file_path=attn_k_proj_path,
+    node_IP_list=self.IP_list,
+    CPU_GPU_select_list=self.CPU_GPU_select_list,
+    node_percentages=self.percentages,
+    back_end_select_list=self.backend_select_list,
+    split_matrix=True,
+    dim=1,
+    auto_set_up=[1, "load"],
+)
+
+v = cluster_matrix(
+    matrix_file_path=attn_v_proj_path,
+    node_IP_list=self.IP_list,
+    CPU_GPU_select_list=self.CPU_GPU_select_list,
+    node_percentages=self.percentages,
+    back_end_select_list=self.backend_select_list,
+    split_matrix=True,
+    dim=1,
+    auto_set_up=[1, "load"],
+)
+
+# Perform distributed matrix multiplication
+q_flat = x.cluster_shard_operation(q, True, False, True)
+k_flat = x.cluster_shard_operation(k, True, False, True)
+v_flat = x.cluster_shard_operation(v, True, False, True)
+
+# The `cluster_shard_operation` method performs the distributed operation
+# (e.g. matrix multiply, add, subtract).
+#
+# By default, the result is sent back and returned as a PyTorch tensor,
+# allowing further local processing using PyTorch.
+#
+# Example (NOTE: not valid for this case):
+# q_flat = x.cluster_shard_operation(q, True, False, True, "add")
+#
+# The above example would only be valid if both matrices were split and
+# compatible for element-wise addition.
+
+
+# ======================= MATRIX ADDITION EXAMPLE =======================
+
+# ----------------- FILE PATHS (dim = 1 split test) -----------------
+big_test_matrix_pathA_T = "model_matrixs/big_matrixA_T.pt"
+big_test_matrix_pathB_T = "model_matrixs/big_matrixB_T.pt"
+
+mid_test_matrix_pathA_T = "model_matrixs/mid_matrixA_T.pt"
+mid_test_matrix_pathB_T = "model_matrixs/mid_matrixB_T.pt"
+
+small_test_matrix_pathA_T = "model_matrixs/small_matrixA_T.pt"
+small_test_matrix_pathB_T = "model_matrixs/small_matrixB_T.pt"
+
+
+# Create reference result for validation
+big_matrixA = torch.load(big_test_matrix_pathA_T)
+big_c_ref = torch.add(big_matrixA, big_matrixA)
+torch.save(big_c_ref, "model_matrixs/big_c_ref.pt")
+
+
+############################# TESTING CLUSTER MATRIX OPERATIONS (SYSTEM 1) #############################
+
+# ----------------- CLUSTER TEST (BIG MATRIX) dim = 0 split/join -----------------
+
+IP_list = ["192.168.2.100", "192.168.2.100", "192.168.2.101", "192.168.2.104"]
+percentages = [0.25, 0.25, 0.25, 0.25]
+CPU_GPU_select_list = [True, True, True, False]
+backend_select_list = ["llama", "llama", "llama", "llama"]
+
+# ----------------- CLUSTER MATRICES -----------------
+
+big_new_matrixA = cluster_matrix(
+    big_test_matrix_pathA_T,
+    IP_list,
+    CPU_GPU_select_list,
+    percentages,
+    backend_select_list,
+    split_matrix=True,
+    dim=0,
+    auto_set_up=[1, "load"],
+)
+
+big_new_matrixB = cluster_matrix(
+    big_test_matrix_pathA_T,
+    IP_list,
+    CPU_GPU_select_list,
+    percentages,
+    backend_select_list,
+    split_matrix=True,
+    dim=0,
+    auto_set_up=[1, "load"],
+)
+
+# Perform distributed matrix addition
+big_new_matrixC = big_new_matrixA.cluster_shard_operation(
+    big_new_matrixB,
+    False,
+    True,
+    True,
+    "add",
+)
+
+# For matrix addition, both Matrix A and Matrix B must be split.
+# The operation is performed as:
+#   matrixA_shard_i + matrixB_shard_i = matrixC_shard_i
 
-### **Example 2: Office Recycling**
-```python
-# Old office PCs = compute cluster
-nodes = [
-    '192.168.2.10',  # Dell Optiplex (Intel UHD)
-    '192.168.2.11',  # HP EliteDesk (AMD Radeon)
-    '192.168.2.12',  # Old server (CPU only)
-]
 
-# Vulkan works on integrated graphics!
-```
-
----
-
-## ⚠️ **Important Notes**
-
-### **Matrix Distribution Modes:**
-- **`split_matrix=True`**: Matrix split across nodes (each gets different piece)
-- **`split_matrix=False`**: Each node gets FULL matrix
-
-### **Transpose Convention:**
-```python
-# GGML vs Torch have different transpose conventions
-# System handles this automatically!
-```
-
-### **Result Files:**
-- With `send_back=True`: Single combined file
-- With `send_back=False`: Multiple shard files on nodes
-
----
-
-## 📈 **Performance Tips**
-
-1. **Match percentages to hardware power** - Give more work to faster devices
-2. **Use `split_matrix=False` for small matrices** - Overhead > benefit
-3. **Test network speed first** - File transfer can be bottleneck
-4. **Start with 2-3 nodes** - Scale up once working
-
----
-
-## 🔍 **Debugging**
-
-```python
-# Check if files are distributed
-print(f"File paths: {matrixA.matrix_file_paths_list}")
-
-# Verify matrix shapes
-print(f"Original shape: {matrixA.OG_matrix_shape}")
-
-# Check node connections
-print(f"Connected nodes: {list(matrixA.llama_socket_pool.keys())}")
-```
-
----
-
-## 🎯 **When to Use This vs Alternatives**
-
-**Use Cluster Matrix when:**
-- ✅ You have **mixed hardware** (NVIDIA + AMD + Intel + Apple)
-- ✅ You want to use **existing hardware**, not buy new
-- ✅ You need **easy setup**, not HPC expertise
-- ✅ You work with **transformers/LLMs**
-- ✅ You want **maximum hardware utilization**
-
-**Use traditional systems when:**
-- ❌ You have **homogeneous** NVIDIA GPUs only
-- ❌ You need **maximum single-device** performance
-- ❌ You're doing **traditional HPC**, not AI
-
----
-
-## 🚀 **Get Started Now**
-
-1. **Clone the repository**
-```bash
-git clone https://github.com/yourusername/cluster-matrix.git
-```
-
-2. **Start the node servers**
-```bash
-# On each computer:
-python -m cluster_matrix.node_server
-```
-
-3. **Run your first distributed computation**
-```python
-from cluster_matrix import cluster_matrix
-
-# Use whatever computers you have
-nodes = ['192.168.2.100', '192.168.2.101']
-matrixA = cluster_matrix("model.pt", nodes, [0.5, 0.5], ['llama', 'llama'])
-result = matrixA.compute()
-```
-
----
-
-## 📚 **Further Reading**
-
-- **GGML Documentation**: https://github.com/ggerganov/ggml
-- **ZeroMQ Guide**: http://zguide.zeromq.org/
-- **PyTorch Distributed**: https://pytorch.org/docs/stable/distributed.html
-
----
-
-## 🙏 **Acknowledgments**
-
-Built by developers who were tired of:
-- Hardware sitting idle  
-- Needing "approved" NVIDIA GPUs
-- Complex distributed setups  
-- Wasting perfectly good silicon
-
-**We believe:** If you have hardware, it should compute!
-
----
-
-**⭐ Star if you believe in democratizing AI compute!**
-
-**🔄 Share with anyone stuck on "I need better hardware"**
-
-**🐛 Report issues - help us make it better!**
-
----
-
-*"The most powerful computer is the one that uses ALL the computers."* 🚀
-
-
-# 🔥 **C++ Backend - The Engine Room**
-
-## 🏗️ **Architecture Overview**
-
-```
-Python Frontend (Control)           C++ Backend (Compute)
-       ↓                                    ↓
-[cluster_matrix class]           [llama_zmq_server.cpp]
-       ↓                                    ↓
-[ZMQ Commands] → [Network] → [C++ Command Handler]
-       ↓                                    ↓
-[Result Waiting] ← [Binary Files] ← [Matrix Operations]
-```
-
----
-
-## 🚀 **C++ Backend - Core Features**
-
-### **1. Multi-Backend Matrix Engine**
-```cpp
-// Supports THREE computation backends:
-bool matrix_operation_llama(...)     // GGML + Vulkan (ANY GPU!)
-bool matrix_operation_torch(...)     // PyTorch + CUDA (NVIDIA)
-bool matrix_operation_openCL(...)    // OpenCL (Experimental)
-```
-
-### **2. Hardware Discovery & Management**
-```cpp
-// Auto-detects ALL available hardware
-void init_openCL_GPUS() {
-    // Finds AMD, Intel, NVIDIA GPUs
-    // Sets up Vulkan contexts
-    // Creates computation backends
-}
-
-// Sample output:
-// ggml_vulkan: Found 2 Vulkan devices:
-// 0 = AMD Radeon RX 5500 XT (RADV NAVI14)
-// 1 = AMD Radeon RX 6400 (RADV NAVI24)
-```
-
-### **3. Dual Network Interface Support**
-```cpp
-// Ethernet + WiFi simultaneously
-zmq::socket_t file_receiver_eth;    // Ethernet (192.168.2.x)
-zmq::socket_t file_receiver_wifi;   // WiFi (192.168.50.x)
-
-// Files can flow through BOTH networks
-// Redundant paths for reliability
-```
-
----
-
-## ⚡ **Performance Optimizations**
-
-### **1. Zero-Copy Memory Management**
-```cpp
-// Shared memory between GGML and ZMQ
-torch::Tensor load_matrix_bin_as_torch_view(const std::string& filepath) {
-    // Memory-mapped file → Direct torch tensor
-    // NO copying between C++ ↔ Python
-    return torch::from_blob(
-        raw_ptr,          // Direct pointer to binary data
-        sizes,            // Tensor dimensions
-        [](void* ptr) {   // Custom deleter
-            delete[] static_cast<float*>(ptr);
-        }
-    );
-}
-```
-
-### **2. Concurrent Command Processing**
-```cpp
-// Multiple commands processed in parallel
-std::thread eth_thread(&llama_zmq_server::listen_ethernet, this);
-std::thread wifi_thread(&llama_zmq_server::listen_wifi, this);
-std::thread process_command_thread(&llama_zmq_server::process_command, this);
-
-// Each thread handles specific task:
-// - Ethernet: File transfers + commands
-// - WiFi: Backup/parallel transfers  
-// - Commands: Matrix operations
-```
-
-### **3. GPU Load Balancing**
-```cpp
-// Multiple GPUs on same node?
-// No problem!
-
-std::vector<ggml_backend_t> ggml_backends;
-// GPU 0: AMD RX 5500 XT
-// GPU 1: AMD RX 6400  
-// GPU 2: CPU (OpenBLAS)
-// GPU 3: CPU (BLAS)
-
-// Commands specify which GPU to use:
-// "llama matrix.bin false matrix2.bin false true 2 ..."
-//                                          ↑ GPU ID 2
-```
-
----
-
-## 🔧 **Matrix Operation Pipeline**
-
-### **Step 1: Command Parsing**
-```cpp
-// Received: "llama /path/A.bin false /path/B.bin false true 0 -5 mul 2"
-void process_command(const std::string& command) {
-    // Parse components:
-    // - backend: "llama"
-    // - matrixA: "/path/A.bin" 
-    // - transposeA: false
-    // - matrixB: "/path/B.bin"
-    // - transposeB: false
-    // - use_gpu: true
-    // - gpu_id: 0
-    // - send_back: -5 (Level 2 distribution)
-    // - operation: "mul"
-    // - dim: 2
-}
-```
-
-### **Step 2: Binary Matrix Loading**
-```cpp
-// Load .bin file format:
-// [ndim, dim1, dim2, ..., data]
-std::unique_ptr<float[]> load_matrix_bin(
-    const char* path, 
-    int& rows, int& cols, 
-    int& depth, int& batch
-) {
-    // Memory-mapped for speed
-    // Auto-converts 2D/3D/4D
-    // Always returns 4D format
-}
-```
-
-### **Step 3: GGML Computation**
-```cpp
-// Convert to GGML format (column-major)
-MatrixResult matrix_op_nd(
-    float* A, int dims_a[4],
-    float* B, int dims_b[4],
-    ggml_backend_t backend,
-    const std::string& op
-) {
-    // GGML computes: [cols, rows, depth, batch]
-    // Your data is: [batch, depth, rows, cols]
-    // Automatic transpose handling
-}
-```
-
-### **Step 4: Result Distribution**
-```cpp
-// Level 1: Save locally
-save_matrix_bin(output_path.c_str(), result);
-
-// Level 2: Send to other nodes
-send_back_level2(output_path, filename, result, ...);
-```
-
----
-
-## 📊 **Supported Operations**
-
-| Operation | GGML | Torch | OpenCL |
-|-----------|------|-------|---------|
-| **Multiply** | ✅ Fast | ✅ Fastest | ⚠️ Experimental |
-| **Add** | ✅ | ✅ | ❌ |
-| **Subtract** | ✅ | ✅ | ❌ |
-| **Transpose** | ✅ Auto | ✅ Manual | ❌ |
-
-**Note:** GGML handles transpose automatically due to column-major format!
-
----
-
-## 🚨 **Error Handling & Recovery**
-
-### **1. File Transfer Integrity**
-```cpp
-// Verify binary file structure
-if (file_size != expected_size) {
-    std::cerr << "❌ File corrupted during transfer" << std::endl;
-    // Request resend
-}
-```
-
-### **2. GPU Fallback**
-```cpp
-// If Vulkan fails, fall back to CPU
-try {
-    result = matrix_operation_llama(...);
-} catch (const std::exception& e) {
-    std::cerr << "Vulkan failed: " << e.what() << std::endl;
-    // Retry with CPU backend
-    result = matrix_operation_llama(..., false, ...);
-}
-```
-
-### **3. Network Retry**
-```cpp
-// ZMQ with timeout
-zmq::message_t message;
-if (socket.recv(message, zmq::recv_flags::dontwait)) {
-    // Success
-} else {
-    // Retry after delay
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-}
-```
-
----
-
-## 🧪 **Advanced Features**
-
-### **1. Parallel File Assembly**
-```cpp
-// Multiple nodes send file parts simultaneously
-struct ParallelFile {
-    std::vector<std::string> save_parallel_file_name;
-    std::vector<uint8_t> received_data_eth_file;
-    std::vector<uint8_t> received_data_wifi_file;  
-};
-
-// Ethernet chunk + WiFi chunk = Complete file
-```
-
-### **2. Shard Combination System**
-```cpp
-// Reassemble distributed results
-struct combined_matrix_shards {
-    int total_shards_reserved = 0;
-    std::string file_name;
-    std::vector<int> shard_numbers;  
-    std::list<std::vector<uint8_t>> received_matrix_data;
-    std::list<std::vector<int>> dims_list;
-};
-
-// Automatically combines shards from multiple nodes
-```
-
-### **3. Peer-to-Peer Distribution**
-```cpp
-// Node-to-node communication (bypass head node)
-zmq::socket_t worker_peer_receiver;  // Port 5560
-
-// Workers send results directly to each other
-// Reduces bottleneck on head node
-```
-
----
-
-## ⚙️ **Compilation & Configuration**
-
-### **Build with Full Features:**
-```bash
-cmake -B build \
-      -DGGML_VULKAN=ON \        # AMD/Intel/NVIDIA GPUs
-      -DGGML_CUDA=OFF \         # NVIDIA only (use Torch instead)
-      -DGGML_METAL=OFF \        # Apple Silicon
-      -DGGML_OPENCL=ON \        # Experimental
-      -DGGML_BLAS=ON \          # CPU acceleration
-      -DGGML_BLAS_VENDOR=OpenBLAS
-```
-
-### **Minimal Build (CPU only):**
-```bash
-cmake -B build -DGGML_BLAS=ON
-```
-
----
-
-## 📈 **Performance Benchmarks**
-
-### **Matrix: 4096×14336 @ 14336×4096**
-```
-Hardware: AMD RX 5500 XT + RX 6400 + CPU
-Backend: GGML Vulkan
-
-Results:
-- Single GPU: 42 seconds
-- Dual GPU: 23 seconds (1.8x faster)
-- Triple (2 GPU + CPU): 18 seconds (2.3x faster)
-
-Memory usage per shard:
-- 1021×4096: 16.7 MB
-- 1025×4096: 16.8 MB  
-- 2050×4096: 33.6 MB
-```
-
-### **Why It's Fast:**
-1. **Zero memory copies** - GGML works directly on binary data
-2. **Vulkan everywhere** - Even old GPUs contribute
-3. **Column-major optimization** - Matches GGML's native format
-4. **Async file I/O** - Loading next matrix while computing current
-
----
-
-## 🔍 **Debugging C++ Backend**
-
-### **Enable Verbose Logging:**
-```cpp
-// Add to llama_zmq_server.cpp
-#define DEBUG_MATRIX_LOADING 1
-#define DEBUG_ZMQ_MESSAGES 1
-#define DEBUG_GPU_SELECTION 1
-```
-
-### **Monitor in Real-Time:**
-```bash
-# Watch GPU usage
-radeontop  # AMD GPUs
-nvtop      # NVIDIA GPUs
-
-# Watch network traffic
-iftop -i eth0
-iftop -i wlan0
-
-# Watch file transfers
-inotifywait -m /dev/shm/matrix_shards/
-```
-
-### **Common Issues & Fixes:**
-
-1. **"Vulkan device not found"**
-   ```bash
-   # Install Vulkan drivers
-   sudo apt install mesa-vulkan-drivers vulkan-tools
-   ```
-
-2. **"ZMQ connection refused"**
-   ```cpp
-   // Check port binding
-   std::cout << "Binding to: tcp://" << local_IP << ":7779" << std::endl;
-   ```
-
-3. **"Matrix dimension mismatch"**
-   ```cpp
-   // Always check before computation:
-   if (dims_a[2] != dims_b[2]) {  // rows must match
-       std::cerr << "Dimension error!" << std::endl;
-   }
-   ```
-
----
-
-## 🎯 **Integration with Python**
-
-### **Binary Protocol:**
-```
-Python → C++:
-    [command_string] → ZMQ → parse → execute
-
-C++ → Python:
-    [binary_matrix] → .bin file → torch.from_blob()
-```
-
-### **File Naming Convention:**
-```
-layers_4_mlp_down_proj_weight_shard_0.bin
-└─────────┬─────────┘ └─┬─┘ └─┬┘
-   Matrix name     Shard  Index
-   
-layers_4_mlp_down_proj_weightxlayers_4_mlp_down_proj_weight_shard_0.bin
-└─────────┬─────────┘ └─┬─┘ └─────────┬─────────┘ └─┬─┘ └─┬┘
-   Matrix A        Op  Matrix B           Shard  Index
-```
-
----
-
-## 🚀 **Advanced: Custom Operations**
-
-### **Add New Operation:**
-```cpp
-// 1. Add to command parser
-if (operation == "my_custom_op") {
-    return my_custom_operation(A, B, backend);
-}
-
-// 2. Implement operation
-MatrixResult my_custom_operation(
-    float* A, int dims_a[4],
-    float* B, int dims_b[4],
-    ggml_backend_t backend
-) {
-    // Your custom GGML computation
-    // Returns MatrixResult
-}
-```
-
-### **Custom GPU Kernel (OpenCL):**
-```cpp
-const char* custom_kernel = R"(
-__kernel void my_operation(
-    __global const float* A,
-    __global const float* B,
-    __global float* C,
-    const int M, const int N, const int K
-) {
-    // Your OpenCL kernel
-}
-)";
-```
-
----
-
-## 📚 **Further Optimization Ideas**
-
-### **1. Pipeline Matrix Loading**
-```cpp
-// While GPU computes current, CPU loads next
-std::thread loader_thread(load_next_matrix, next_file);
-compute_current_matrix(current_file);
-loader_thread.join();  // Next matrix ready!
-```
-
-### **2. GPU Memory Pool**
-```cpp
-// Reuse GPU memory instead of alloc/free
-static std::map<size_t, cl::Buffer> gpu_buffer_pool;
-```
-
-### **3. Compression for Network**
-```cpp
-// Compress matrices > 100MB
-if (file_size > 100*1024*1024) {
-    compress_and_send(matrix);
-} else {
-    send_raw(matrix);
-}
-```
-
----
-
-## 🏁 **Getting Started with C++ Backend**
-
-### **1. First Run:**
-```bash
-# Build
-cd ggml
-mkdir build && cd build
-cmake .. -DGGML_VULKAN=ON -DGGML_BLAS=ON
-make -j4
-
-# Run
-./bin/llama_zmq_server
-```
-
-### **2. Test Connection:**
-```python
-# From Python
-import zmq
-context = zmq.Context()
-socket = context.socket(zmq.PUSH)
-socket.connect("tcp://192.168.2.100:7779")
-socket.send_string("test")
-print("Connected!")
-```
-
-### **3. First Matrix Operation:**
-```python
-matrixA = cluster_matrix("test.bin", ["192.168.2.100"], [1.0], [True], ['llama'])
-result = matrixA.cluster_operation(matrixA, False, True, True)
-```
-
----
-
-## 🤝 **Contributing to C++ Backend**
-
-### **Code Structure:**
-```
-llama_zmq_server.cpp
-├── Main server class
-├── Matrix operations (llama/torch/openCL)
-├── Network handlers (ZMQ)
-├── File I/O (binary matrices)
-└── Utility functions
-
-matrix_backend.hpp
-├── GGML wrapper functions
-├── Tensor conversions
-└── Backend management
-```
-
-### **Adding Features:**
-1. Add new operation to `matrix_operation_*()` functions
-2. Update command parser in `process_command()`
-3. Add ZMQ handler if needed
-4. Test with small matrices first
-
----
-
-## 🎉 **Why This Beats Other Systems**
-
-| Feature | **Our C++ Backend** | PyTorch Distributed | Dask |
-|---------|-------------------|-------------------|------|
-| **Hardware Support** | ANY GPU (Vulkan) | NVIDIA only | CPU only |
-| **Zero Copy** | ✅ Direct memory mapping | ❌ Copies data | ❌ Copies data |
-| **Binary Efficiency** | ✅ Custom .bin format | ❌ Pickle overhead | ❌ Pickle overhead |
-| **GPU Mixing** | ✅ Multiple GPUs/node | ⚠️ Limited | ❌ |
-| **Network Redundancy** | ✅ Eth + WiFi | ❌ Single | ❌ Single |
-
----
-
-**The C++ backend is what makes everything FAST.** It's the difference between "distributed computing" and **"actually usable distributed computing."** 🚀
