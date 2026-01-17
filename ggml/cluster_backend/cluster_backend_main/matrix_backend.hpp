@@ -1,1087 +1,2112 @@
 #include "ggml.h"
 #include "ggml-backend.h"
-#include "ggml-alloc.h"
-#include "ggml-cpu.h"  // <-- Add this for ggml_backend_cpu_init()
 #include <iostream>
 #include <fstream>
 #include <vector>
 #include <memory>
 #include <cstdlib>
-#include <set>
+#include <string>
 #include <thread>
-#include <torch/torch.h>
-#define CL_HPP_TARGET_OPENCL_VERSION 300
-#include <CL/opencl.hpp>
-#include <atomic>
-#include <unordered_map>
-#include <chrono>
-#include <algorithm>
 #include <mutex>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <zmq.hpp>
+#include <filesystem>
+#include <set>
+#include <array>
+#include <cstdio>
+#include <sstream>
+#include <map>
+#include "matrix_backend.hpp"
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <cmath>
+#include <list>
+#include <cstdint>
+#include <algorithm>
+#include <unordered_map>
+#include <torch/torch.h>
 
 
-
-std::vector<cl::Device> openCL_GPU_select_list;
-
-struct MatrixResult 
-{  
-    std::unique_ptr<float[]> data;  
-    int dims[4]; // ne0, ne1, ne2, ne3  
-};  
-
-// ============================================================================
-// OPENCL KERNELS FOR MATRIX MULTIPLICATION
-// ============================================================================
-// These kernels implement matrix multiplication using OpenCL.
-// 
-// LEGEND HAS IT that OpenCL was conceived during a legendary hackathon
-// where the developers were so high on Adderall and Mountain Dew that
-// they thought "let's make CUDA, but for people who hate themselves."
-// 
-// The design meeting apparently went:
-// "What if we took everything good about CUDA... and removed it?"
-// "Genius! And let's make the API documentation read like IKEA instructions
-//  translated through 5 different languages!"
-// 
-// True story: The first OpenCL compiler was actually just a developer
-// vomiting code into a terminal while his coworkers cheered him on.
-// Every segmentation fault is a tribute to that sacred moment.
-// ============================================================================
-
-// Basic matrix multiplication kernel (naïve implementation)
-// This kernel was written by an intern who'd never seen a GPU before.
-// He was told "make the threads go brrr" and this is what he came up with.
-// It's so inefficient that it actually heats your room in winter.
-const char* openCL_kernel_matmul = R"(
-__kernel void matmul(
-    __global const float* A,
-    __global const float* B,
-    __global float* C,
-    const int M,
-    const int N,
-    const int K)
+struct combined_matrix_shards
 {
-    int row = get_global_id(0); // row index
-    int col = get_global_id(1); // col index
+    int total_shards_reserved = 0;        // Number of shards currently received
+    int number_of_shards_needed = 0;      // Total shards expected for this matrix
+    std::string file_name;                // Base filename (without shard index)
+    
+    std::vector<int> shard_numbers;       // List of received shard indices
+    std::list<std::vector<uint8_t>> received_matrix_data;  // Raw binary data of each shard
+    std::list<std::vector<int>> dims_list;                 // Dimensions of each shard [batch, depth, rows, cols]
+    
 
-    if(row < M && col < N) {
-        float sum = 0.0f;
-        for(int k = 0; k < K; ++k) {
-            sum += A[row*K + k] * B[k*N + col];
-        }
-        C[row*N + col] = sum;
-    }
-}
-)";
+    int join_dim = 0; // << for now you only will join dim=0 but join based off this 
+    // Note: Using std::list for received data allows efficient insertion
+    //       as shards arrive in potentially non-sequential order from workers
+};
 
-// Tiled matrix multiplication kernel (optimized)
-// This kernel was written AFTER the developers took a shower together
-// (platonic, obviously - they high-fived about cache lines, not each other)
-// 
-// The breakthrough happened when Senior Engineer Chad realized:
-// "What if... we used local memory?" 
-// The team erupted in applause. Promotions were handed out on the spot.
-// Someone's mom brought cookies to celebrate.
-const char* openCL_kernel_matmul_tiled = R"(
-__kernel void matmul_tiled(
-    __global const float* A,
-    __global const float* B,
-    __global float* C,
-    const int M,
-    const int N,
-    const int K)
+// Function to execute a shell command and capture its output
+std::string exec_command(const char* cmd)
 {
-    const int TILE_SIZE = 16;
-    __local float A_tile[TILE_SIZE][TILE_SIZE];
-    __local float B_tile[TILE_SIZE][TILE_SIZE];
-
-    int row = get_global_id(0);
-    int col = get_global_id(1);
-
-    float sum = 0.0f;
-
-    for(int t = 0; t < (K + TILE_SIZE - 1)/TILE_SIZE; t++) {
-        int tiled_col = t * TILE_SIZE + get_local_id(1);
-        int tiled_row = t * TILE_SIZE + get_local_id(0);
-
-        // Load tiles into local memory
-        if(row < M && tiled_col < K)
-            A_tile[get_local_id(0)][get_local_id(1)] = A[row*K + tiled_col];
-        else
-            A_tile[get_local_id(0)][get_local_id(1)] = 0.0f;
-
-        if(tiled_row < K && col < N)
-            B_tile[get_local_id(0)][get_local_id(1)] = B[tiled_row*N + col];
-        else
-            B_tile[get_local_id(0)][get_local_id(1)] = 0.0f;
-
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        for(int k = 0; k < TILE_SIZE; k++)
-            sum += A_tile[get_local_id(0)][k] * B_tile[k][get_local_id(1)];
-
-        barrier(CLK_LOCAL_MEM_FENCE);
-    }
-
-    if(row < M && col < N)
-        C[row*N + col] = sum;
-}
-)";
-
-void init_openCL_GPUS() 
-{
-    std::cout << "🎬 SCENE: OPENCL INITIALIZATION - TAKE 47" << std::endl;
-    std::cout << "Our hero (you) attempts to tame the wild OpenCL beast" << std::endl;
-    std::cout << "Spoiler: It doesn't end well" << std::endl << std::endl;
+    // Buffer to store chunks of command output
+    std::array<char, 128> buffer;
+    // String to accumulate the full command output
+    std::string result;
     
-    // Clear the list from previous attempts
-    // Like wiping the whiteboard after a failed math proof
-    openCL_GPU_select_list.clear();
-
-    std::cout << "STEP 1: Query platforms (ask politely for GPUs)" << std::endl;
-    // This is the equivalent of yelling "HELLO?" into a dark cave
-    // Sometimes you get an echo, sometimes you get a bear
-    std::vector<cl::Platform> platforms;
-    cl::Platform::get(&platforms);
-    
-    if(platforms.empty()) {
-        std::cout << "🚨 PLOT TWIST: No OpenCL platforms found!" << std::endl;
-        std::cout << "Your computer is either:" << std::endl;
-        std::cout << "  a) A toaster" << std::endl;
-        std::cout << "  b) Too advanced for this peasant technology" << std::endl;
-        std::cout << "  c) Judging you for even trying" << std::endl;
-        throw std::runtime_error("System has reached maximum disappointment capacity");
-    }
-
-    std::cout << "Found " << platforms.size() 
-              << " platform(s) with names that sound like bad sci-fi movies" << std::endl;
-
-    // The platform discovery loop
-    // Each iteration is like opening a mystery box
-    // Will it contain a shiny GPU? Or another CPU pretending to be special?
-    for(size_t i = 0; i < platforms.size(); i++) {
-        std::string platformName = platforms[i].getInfo<CL_PLATFORM_NAME>();
-        
-        // Platform names usually contain words like:
-        // "Advanced", "Accelerated", "Parallel", "Disappointment"
-        platformName.erase(std::remove(platformName.begin(), platformName.end(), '\n'), platformName.end());
-        platformName.erase(std::remove(platformName.begin(), platformName.end(), '\r'), platformName.end());
-        
-        std::cout << std::endl << "🔍 Investigating Platform " << i << ": \"" 
-                  << platformName << "\"" << std::endl;
-        std::cout << "   (Probably from 2012, judging by the naming convention)" << std::endl;
-
-        // Get devices - this is where the real comedy begins
-        // CL_DEVICE_TYPE_ALL means "give me everything, including the kitchen sink"
-        std::vector<cl::Device> devices;
-        platforms[i].getDevices(CL_DEVICE_TYPE_ALL, &devices);
-        
-        if(devices.empty()) {
-            std::cout << "   💀 Platform is a ghost town. Moving on..." << std::endl;
-            continue;
-        }
-
-        std::cout << "   Found " << devices.size() << " device(s). Let's meet them!" << std::endl;
-
-        // Device introduction ceremony
-        // Each device gets a moment in the spotlight
-        for(size_t j = 0; j < devices.size(); j++) {
-            std::string deviceName = devices[j].getInfo<CL_DEVICE_NAME>();
-            
-            // Clean up the name - GPU vendors love adding "\n" and "\r"
-            // because they think it makes their hardware look fancy
-            deviceName.erase(std::remove(deviceName.begin(), deviceName.end(), '\n'), deviceName.end());
-            deviceName.erase(std::remove(deviceName.begin(), deviceName.end(), '\r'), deviceName.end());
-            
-            std::cout << "   👉 Device " << j << ": \"" << deviceName << "\"";
-            
-            // Check device type for comedy/ tragedy
-            cl_device_type type = devices[j].getInfo<CL_DEVICE_TYPE>();
-            if(type & CL_DEVICE_TYPE_GPU) {
-                std::cout << " [GPU 🎉]";
-                std::cout << " - An actual graphics processor! Praise the silicon gods!";
-            } else if(type & CL_DEVICE_TYPE_CPU) {
-                std::cout << " [CPU 😴]";
-                std::cout << " - Oh look, it's the thing we're already using. How... special.";
-            } else if(type & CL_DEVICE_TYPE_ACCELERATOR) {
-                std::cout << " [ACCELERATOR 🚀]";
-                std::cout << " - Sounds fast! Probably isn't.";
-            } else if(type & CL_DEVICE_TYPE_DEFAULT) {
-                std::cout << " [DEFAULT 🤷]";
-                std::cout << " - The OpenCL equivalent of 'idk, something'";
-            } else {
-                std::cout << " [MYSTERY BOX ❓]";
-                std::cout << " - Could be a GPU, could be a smart fridge. Who knows?";
-            }
-            std::cout << std::endl;
-
-            // Add to global list
-            // This is the "collectible cards" phase of OpenCL programming
-            openCL_GPU_select_list.push_back(devices[j]);
-        }
-    }
-
-    // The moment of truth: did we find anything useful?
-    std::cout << std::endl << "📊 FINAL TALLY:" << std::endl;
-    std::cout << "Total OpenCL devices collected: " << openCL_GPU_select_list.size() << std::endl;
-    
-    if(openCL_GPU_select_list.empty()) {
-        std::cout << "🎭 TRAGEDY: The list is emptier than our protagonist's social life." << std::endl;
-        throw std::runtime_error("No OpenCL devices found. Try sacrificing a goat to the silicon gods.");
-    }
-
-    // Count actual GPUs vs impostors
-    int gpu_count = 0;
-    int cpu_count = 0;
-    int weird_count = 0;
-    
-    for(const auto& device : openCL_GPU_select_list) {
-        cl_device_type type = device.getInfo<CL_DEVICE_TYPE>();
-        if(type & CL_DEVICE_TYPE_GPU) gpu_count++;
-        else if(type & CL_DEVICE_TYPE_CPU) cpu_count++;
-        else weird_count++;
-    }
-    
-    std::cout << "📈 Breakdown:" << std::endl;
-    std::cout << "  Real GPUs: " << gpu_count << " (the good stuff)" << std::endl;
-    std::cout << "  CPUs: " << cpu_count << " (OpenCL's participation trophy)" << std::endl;
-    std::cout << "  Weird stuff: " << weird_count << " (probably FPGAs crying for attention)" << std::endl;
-    
-    if(gpu_count == 0) {
-        std::cout << std::endl << "⚠️  WARNING: No actual GPUs detected!" << std::endl;
-        std::cout << "Your OpenCL experience will be powered by:" << std::endl;
-        std::cout << "  • Wishful thinking" << std::endl;
-        std::cout << "  • The ghosts of forgotten benchmarks" << std::endl;
-        std::cout << "  • Whatever thermal paste is left on your CPU" << std::endl;
-        std::cout << "Good luck! You'll need it." << std::endl;
-    } else {
-        std::cout << std::endl << "🎊 CONGRATULATIONS!" << std::endl;
-        std::cout << "You found " << gpu_count << " GPU(s) that might actually work!" << std::endl;
-        std::cout << "Now the real suffering begins: writing kernels that don't segfault!" << std::endl;
-    }
-    
-    std::cout << std::endl << "🏁 OPENCL INITIALIZATION COMPLETE" << std::endl;
-    std::cout << "Now go take a shower and high-five yourself in the mirror." << std::endl;
-    std::cout << "You've earned it. (The high-five, not the shower.)" << std::endl;
-}
-
-bool save_matrix_bin(const char* path, const MatrixResult& result)    
-{    
-    // Create directory if it doesn't exist    
-    std::string path_str = path;    
-    size_t last_slash = path_str.find_last_of('/');    
-    if (last_slash != std::string::npos)   
-    {    
-        std::string dir_path = path_str.substr(0, last_slash);    
-        std::filesystem::create_directories(dir_path);    
-    }    
-    std::ofstream file(path, std::ios::binary);    
-    if (!file)  
-    {    
-        std::cerr << "Cannot create file: " << path << std::endl;    
-        return false;    
-    }    
-    // FORCE 4D format for consistency with PyTorch backend  
-    int ndim = 4;  
-    // Write dimension count    
-    file.write(reinterpret_cast<const char*>(&ndim), sizeof(int));    
-    // Write ALL 4 dimensions  
-    for (int i = 0; i < ndim; i++)   
-    {  
-        file.write(reinterpret_cast<const char*>(&result.dims[i]), sizeof(int));  
-    }  
-    // Calculate total elements and write data    
-    size_t total_elements = 1;  
-    for (int i = 0; i < ndim; i++)   
-    {  
-        total_elements *= result.dims[i];  
-    }    
-    file.write(reinterpret_cast<const char*>(result.data.get()), sizeof(float) * total_elements);    
-    file.close();      
-    // Print info (matching Python reference)    
-    std::cout << "  Saved to " << path << std::endl;    
-    // Calculate expected file size  
-    size_t file_size = 4 + ndim * 4 + total_elements * 4;  // 4 bytes per int/float        
-    std::cout << "  Shape: (";    
-    for (int i = 0; i < ndim; i++)  
-    {  
-        std::cout << result.dims[i];  
-        if (i < ndim - 1) std::cout << ", ";  
-    }  
-    std::cout << "), Size: " << file_size << " bytes" << std::endl;       
-    return true;    
-}
-
-std::unique_ptr<float[]> load_matrix_bin(const char* path, int& rows, int& cols,   
-                                        int& depth, int& batch)   
-{  
-    std::ifstream file(path, std::ios::binary);  
-    if (!file) 
-    {  
-        std::cerr << "Cannot open file: " << path << std::endl;  
-        return nullptr;  
-    }  
-
-                // Read dimension count  
-    int ndim;  
-    file.read(reinterpret_cast<char*>(&ndim), sizeof(int));  
-                
-    //std::cout << "DEBUG LOADING: File " << path << " has " << ndim << " dimensions\n";
-                
-                // Read dimensions  
-    std::vector<int> dims(ndim);  
-    for (int i = 0; i < ndim; i++) 
-    {  
-        file.read(reinterpret_cast<char*>(&dims[i]), sizeof(int));  
-        std::cout << "  Dim[" << i << "] = " << dims[i] << "\n";
-    }  
-                
-                // Map dimensions correctly based on ndim
-    if (ndim == 2) 
+    // Lambda function to safely close the pipe
+    // Acts as a custom deleter for the unique_ptr
+    auto pipe_closer = [](FILE* pipe) 
     {
-                    // [rows, cols]
-        rows = dims[0];
-        cols = dims[1];
-        depth = 1;
-        batch = 1;
-    } 
-    else if 
-    (ndim == 3) 
-    {
-                    // [batch, rows, cols] 
-        batch = dims[0];   // batch comes first!
-        rows = dims[1];    // then rows
-        cols = dims[2];    // then cols
-        depth = 1;
-    } 
-    else if (ndim == 4) 
-    {
-                    // [outer_batch, inner_batch, rows, cols]
-        batch = dims[0];   // outer_batch
-        depth = dims[1];   // inner_batch
-        rows = dims[2];    // rows
-        cols = dims[3];    // cols
-    } 
-    else
-    {
-        std::cerr << "Error: Unsupported number of dimensions: " << ndim << std::endl;
-        return nullptr;
-    }
-                
-    //std::cout << "DEBUG: Mapped to - batch=" << batch << ", depth=" << depth 
-    //        << ", rows=" << rows << ", cols=" << cols << "\n";
-                
-                // Calculate total elements  
-    size_t total_elements = 1;  
-    for (int dim : dims) 
-    {  
-        total_elements *= dim;  
-    }  
-                
-    //std::cout << "DEBUG: Total elements = " << total_elements << "\n";
-                
-                // Allocate and read data  
-    auto matrix = std::make_unique<float[]>(total_elements);  
-    file.read(reinterpret_cast<char*>(matrix.get()), sizeof(float) * total_elements);  
-                
-                // Print first few values
-    //std::cout << "DEBUG: First 5 values: ";
-    for (int i = 0; i < std::min(5, (int)total_elements); i++) 
-    {
-        std::cout << matrix[i] << " ";
-    }
-    std::cout << "\n";
-                
-    file.close();  
-    return matrix;  
-}
-
-void print_matrix(float* matrix, const int dims[4], int max_print = 4) {
-    if (!matrix) 
-    {
-        std::cout << "Matrix is null!" << std::endl;
-        return;
-    }
-    // Determine actual dimensions (skip trailing ones)
-    int actual_dims = 4;
-    while (actual_dims > 1 && dims[actual_dims-1] == 1) 
-    {
-        actual_dims--;
-    }
-    std::cout << "Shape: (";
-    for (int i = 0; i < actual_dims; i++) 
-    {
-        std::cout << dims[i];
-        if (i < actual_dims - 1) std::cout << "x";
-    }
-    std::cout << ")\n";
-    // Calculate total elements
-    int total = dims[0] * dims[1] * dims[2] * dims[3];
-    // Print first few elements
-    int print_count = std::min(max_print, total);
-    std::cout << "First " << print_count << " values: ";
-    for (int i = 0; i < print_count; i++) 
-    {
-        std::cout << matrix[i] << " ";
-    }
-    std::cout << "\n\n";
-}
-
-torch::Tensor load_matrix_bin_as_torch_view(const std::string& filepath) 
-{  
-    int rows = 0, cols = 0, depth = 1, batch = 1;  
-        
-    auto data = load_matrix_bin(filepath.c_str(), rows, cols, depth, batch);  
-    if (!data) 
-    {  
-        throw std::runtime_error("Failed to load matrix: " + filepath);  
-    }  
-        
-    std::vector<int64_t> sizes;  
-    if (batch > 1 && depth > 1) 
-    {  
-        sizes = {batch, depth, rows, cols};  
-    } 
-    else if (batch > 1)
-    {  
-        sizes = {batch, rows, cols};  
-    }
-    else 
-    {  
-        sizes = {rows, cols};      
-    }  
-        
-    auto options = torch::TensorOptions()  
-        .dtype(torch::kFloat32)  
-        .device(torch::kCPU);  
-        
-            // Release ownership so torch owns it  
-    float* raw_ptr = data.release();  
-        
-    return torch::from_blob(  
-        raw_ptr,  
-        sizes,  
-                // Custom deleter called when tensor is freed  
-        [](void* ptr) {  
-            delete[] static_cast<float*>(ptr);  
-        },  
-        options  
-    );  
-}
-
-// Helper: Convert raw float data into a Torch tensor
-at::Tensor convert_matrix_to_torch(
-    const std::unique_ptr<float[]>& data,
-    const int dims[4])
-{
-    std::vector<int64_t> sizes = {
-        dims[0], dims[1], dims[2], dims[3]
+        if (pipe) pclose(pipe);
     };
-
-    auto options = torch::TensorOptions()
-        .dtype(torch::kFloat32)
-        .device(torch::kCPU);
-
-    return torch::from_blob(
-        data.get(),   // safe: read-only
-        sizes,
-        options
-    );
-}
-
-void print_tensor_start_flat(
-    const torch::Tensor& t,
-    const std::string& name,
-    int64_t count = 100
-) {
-    auto flat = t.reshape({-1}).cpu();
-
-    std::cout << "\n" << name << " - first " << count
-              << " values (flat order):\n";
-
-    for (int64_t i = 0; i < std::min(count, flat.numel()); i++) {
-        std::cout << flat[i].item<float>() << " ";
-    }
-    std::cout << "\n";
-}
-
-int get_physical_cores() {
-    std::ifstream cpuinfo("/proc/cpuinfo");
-    std::string line;
-    std::set<std::string> core_ids;
     
-    while (std::getline(cpuinfo, line)) {
-        if (line.find("core id") != std::string::npos) {
-            size_t pos = line.find(":");
-            if (pos != std::string::npos) {
-                std::string core_id = line.substr(pos + 1);
-                core_id.erase(0, core_id.find_first_not_of(" \t"));
-                core_id.erase(core_id.find_last_not_of(" \t") + 1);
-                core_ids.insert(core_id);
-            }
-        }
+    // Create a unique_ptr with custom deleter to ensure pipe cleanup
+    // popen() opens a process by creating a pipe and forking/executing the command
+    std::unique_ptr<FILE, decltype(pipe_closer)> pipe(popen(cmd, "r"), pipe_closer);
+    
+    // Check if pipe was successfully created
+    if (!pipe) 
+    {
+        throw std::runtime_error("popen() failed!");
     }
     
-    if (!core_ids.empty()) {
-        return core_ids.size();
+    // Read command output chunk by chunk until EOF
+    // fgets reads up to buffer.size()-1 characters or until newline/EOF
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) 
+    {
+        // Append each chunk to the result string
+        result += buffer.data();
     }
     
-    // Simple fallback
-    unsigned int logical_cores = std::thread::hardware_concurrency();
-    if (logical_cores == 0) {
-        return 4;
-    }
-    return logical_cores;
+    // Return the complete command output
+    return result;
 }
 
-class llama_matrix_backend
+// Function to get the local IP address by executing a shell script
+std::string get_local_ip() 
 {
-    public:
-        int number_of_physical_cores; 
-        std::vector<ggml_backend_t> ggml_backends;
-        std::mutex backends_mutex;
-
-        // NEW: persistent per-device GGML contexts and memory buffers
-        std::vector<struct ggml_context*> ggml_ctxs;     // one context per backend/device
-        std::vector<void*> ggml_mem_buffers;             // raw buffer pointers for ggml contexts
-        std::vector<size_t> ggml_mem_sizes;              // sizes of the above buffers
-        std::vector<std::unique_ptr<std::mutex>> device_mutexes;          // per-device mutex to reduce contention
-        std::vector<std::unique_ptr<std::atomic<uint64_t>>> device_load_ptrs;  // simple load counters for scheduling
-
-        // Host-side reusable buffer pool for transposes/results to avoid frequent alloc/free
-        struct HostBufferPool {
-            std::unordered_map<size_t, std::vector<void*>> pool; // keyed by size
-            std::mutex mtx;
-            bool use_pinned = false;
-
-            void* get(size_t size) {
-                std::lock_guard<std::mutex> lk(mtx);
-                auto it = pool.find(size);
-                if (it != pool.end() && !it->second.empty()) {
-                    void* p = it->second.back();
-                    it->second.pop_back();
-                    return p;
-                }
-                // allocate aligned buffer; prefer posix_memalign
-#ifdef _POSIX_C_SOURCE
-                void* ptr = nullptr;
-                if (posix_memalign(&ptr, 64, size) != 0) ptr = nullptr;
-                if (!ptr) ptr = malloc(size);
-#else
-                void* ptr = malloc(size);
-#endif
-                if (use_pinned && ptr) {
-                    // try to mlock for pinned behavior; ignore failures
-                    mlock(ptr, size);
-                }
-                return ptr;
-            }
-
-            void put(void* ptr, size_t size) {
-                if (!ptr) return;
-                std::lock_guard<std::mutex> lk(mtx);
-                pool[size].push_back(ptr);
-            }
-
-            ~HostBufferPool() {
-                for (auto &kv : pool) {
-                    for (void* p : kv.second) free(p);
-                }
-            }
-        } host_pool;
-
-        // Simple instrumentation
-        std::atomic<uint64_t> stat_ops{0};
-        std::atomic<uint64_t> stat_allocs{0};
+    try 
+    {
+        // Execute the shell script that retrieves the LAN interface IP address
+        // The script is expected to return the IP address as a string
+        std::string ip = exec_command("./get_land_interface.sh");
         
-    public: 
-        llama_matrix_backend() : number_of_physical_cores(get_physical_cores()) {
-            Initialize_backend();
-        }
-
-        void Initialize_backend()
+        // Remove trailing newline character if present
+        // Shell commands typically output with a newline at the end
+        if (!ip.empty() && ip[ip.length()-1] == '\n') 
         {
-                // Clear any existing backends
-            ggml_backends.clear();
-            ggml_ctxs.clear();
-            ggml_mem_buffers.clear();
-            ggml_mem_sizes.clear();
-            device_mutexes.clear();
-            device_load_ptrs.clear();
-                
-                // Load all available backends
-            ggml_backend_load_all();
-                
-                // Get count of available devices
-            size_t device_count = ggml_backend_dev_count();  
-            std::cout << "Found " << device_count << " devices:" << std::endl;  
-                
-                // Reserve capacity to avoid reallocations of non-movable types
-            ggml_backends.reserve(device_count + 1);
-            ggml_ctxs.reserve(device_count + 1);
-            ggml_mem_buffers.reserve(device_count + 1);
-            ggml_mem_sizes.reserve(device_count + 1);
-            device_mutexes.reserve(device_count + 1);
-            device_load_ptrs.reserve(device_count + 1);
-
-            // Add all GPU backends to the vector
-            for (size_t i = 0; i < device_count; i++) 
-            {  
-                ggml_backend_dev_t dev = ggml_backend_dev_get(i);  
-                const char* name = ggml_backend_dev_name(dev);  
-                const char* desc = ggml_backend_dev_description(dev);  
-                std::cout << "  Device " << i << ": " << name << " (" << desc << ")" << std::endl;  
-                    
-                    // Initialize and add this backend to the vector
-                    // Reserve a persistent context buffer for each GPU device; size can be tuned
-                    // Increase default to larger value to avoid OOM for large matrix ops.
-                    // Can be overridden per-system via the `GGML_CTX_MEM_MB` env var.
-                    size_t ctx_mb = 512; // default 512MB per device (was 128MB)
-                    const char* env = std::getenv("GGML_CTX_MEM_MB");
-                    if (env) ctx_mb = std::stoul(env);
-
-                    void* mem_buf = malloc(ctx_mb * 1024 * 1024);
-                    if (!mem_buf) {
-                        std::cerr << "Warning: Failed to allocate ggml mem buffer for device " << i << std::endl;
-                    }
-
-                    ggml_init_params params;
-                    params.mem_size = ctx_mb * 1024 * 1024;
-                    params.mem_buffer = mem_buf;
-                    // Use no_alloc=true so backend allocation routines are used
-                    // for persistent contexts (we rely on backend buffers).
-                    params.no_alloc = true;
-                    struct ggml_context* ctx = ggml_init(params);
-
-                    ggml_backend_t backend = ggml_backend_dev_init(dev, NULL);
-                    if (backend) {
-                        ggml_backends.push_back(backend);
-                        ggml_ctxs.push_back(ctx);
-                        ggml_mem_buffers.push_back(mem_buf);
-                        ggml_mem_sizes.push_back(params.mem_size);
-                        device_mutexes.emplace_back(std::make_unique<std::mutex>());
-                        device_load_ptrs.emplace_back(std::make_unique<std::atomic<uint64_t>>(0));
-                        std::cout << "    ✓ Added to backends vector and created persistent context" << std::endl;
-                    } else {
-                        // if backend init failed, free temp ctx/mem
-                        if (ctx) ggml_free(ctx);
-                        if (mem_buf) free(mem_buf);
-                    }
-            }  
-                
-                // Always add CPU backend as fallback
-            ggml_backend_t cpu_backend = ggml_backend_cpu_init();
-            if (cpu_backend) {
-                // Create a persistent context for CPU backend as well
-                // Increase default to reduce chances of running out of CPU context memory.
-                // Can be overridden via `GGML_CPU_CTX_MEM_MB` env var.
-                size_t cpu_ctx_mb = 256; // default 256MB (was 64MB)
-                const char* env_cpu = std::getenv("GGML_CPU_CTX_MEM_MB");
-                if (env_cpu) cpu_ctx_mb = std::stoul(env_cpu);
-                void* cpu_buf = malloc(cpu_ctx_mb * 1024 * 1024);
-                ggml_init_params cpu_params;
-                cpu_params.mem_size = cpu_ctx_mb * 1024 * 1024;
-                cpu_params.mem_buffer = cpu_buf;
-                // For CPU persistent context use no_alloc=true as well
-                cpu_params.no_alloc = true;
-                struct ggml_context* cpu_ctx = ggml_init(cpu_params);
-
-                ggml_backends.push_back(cpu_backend);
-                ggml_ctxs.push_back(cpu_ctx);
-                ggml_mem_buffers.push_back(cpu_buf);
-                ggml_mem_sizes.push_back(cpu_params.mem_size);
-                device_mutexes.emplace_back(std::make_unique<std::mutex>());
-                device_load_ptrs.emplace_back(std::make_unique<std::atomic<uint64_t>>(0));
-
-                std::cout << "✓ Added CPU backend with persistent context" << std::endl;
-            }
-                
-            std::cout << "Total backends initialized: " << ggml_backends.size() << std::endl;
-            // configure host buffer pool behavior from env
-            const char* env_pinned = std::getenv("GGML_USE_PINNED_HOST_MEM");
-            if (env_pinned && std::string(env_pinned) == "1") host_pool.use_pinned = true;
+            ip.erase(ip.length()-1);
         }
+        
+        // Return the cleaned IP address string
+        return ip;
+    } 
+    catch (const std::exception& e) 
+    {
+        // Log error if command execution fails
+        std::cerr << "Error getting local IP: " << e.what() << std::endl;
+        
+        // Return localhost address as fallback in case of failure
+        return "127.0.0.1";
+    }
+}
+
+std::string get_env(const char* env_var, const char* default_val) 
+{
+    const char* env_value = std::getenv(env_var);
+    return env_value ? std::string(env_value) : std::string(default_val);
+}
+
+class llama_zmq_server 
+{       
+    public:   
+        std::string project_folder;
+        std::string matrix_shard_folder;
+        std::string matrix_results_folder;
+        std::string head_node_ip_eth;
+        std::string head_node_ip_wifi;
+        std::string head_node_PULL_port;
+        std::string head_node_PUSH_port;
+        std::string worker_node_PULL_port;
+        std::string worker_node_PUSH_port;
+        
+        std::string local_IP_eth;
+        std::string local_IP_wifi;
+        
+        std::string eth_pull_port;
+        std::string eth_push_port;
+        std::string wifi_pull_port;
+        std::string wifi_push_port;
+        std::string worker_peer_port;
+        
+        zmq::context_t zmq_context;
+        zmq::socket_t file_receiver_eth;
+        zmq::socket_t file_sender_eth;
+        zmq::socket_t file_receiver_wifi;
+        zmq::socket_t file_sender_wifi;
+        zmq::socket_t head_node_sender_eth;
+        zmq::socket_t head_node_sender_wifi;
+        zmq::socket_t ack_sender;  // For sending ACKs to Python front-end
+        zmq::socket_t worker_peer_receiver; // Worker ↔ Worker peer communication
+
+        // Unified reserved file structure to hold incoming files from any interface
+        struct ReservedFiles {
+            std::vector<std::string> save_parallel_file_name; // Filename(s) for parallel or single-file saves (use [0] for single)
+            std::vector<uint8_t> received_data_eth_file;      // Data received via Ethernet interface
+            std::vector<uint8_t> received_data_wifi_file;     // Data received via WiFi interface
+            bool is_parallel = false;                         // True when this ReservedFiles holds ETH+WiFi halves
+            bool processed = false;                           // Marked once processed by save_file_handler
+        };
+
+        // Central list that holds all incoming files (Ethernet, WiFi, parallel)
+        std::vector<ReservedFiles> reserved_files_list;
+
+        std::vector<combined_matrix_shards> combined_matrix_shards_list;
+
+        // In your class member variables:
+        std::vector<std::string> matrix_file_paths;
+
+        std::vector<std::string> received_data_eth_linux_command;
+        std::vector<std::string> received_data_wifi_linux_command;
+        std::vector<std::string> received_data_eth_server_command;
+        std::vector<std::string> received_data_wifi_server_command;
+        
+        // Thread-safe mutexes (ADD THESE)
+        std::mutex linux_commands_mutex;
+        std::mutex server_commands_mutex;
+        std::mutex file_data_mutex;
+        std::mutex wifi_commands_mutex;
+        
+        std::atomic<bool> server_running;
+        llama_matrix_backend matrix_backend_llama;
+
+        int send_back_number_of_shards = 0;
+        std::vector<std::string> worker_ip_list;
+        std::vector<float> worker_percentages;
+
+
+        std::map<std::string, std::vector<std::pair<int, std::vector<uint8_t>>>> pending_shards;  
+        std::map<std::string, std::set<int>> received_shards;  
+        std::mutex shared_memory_mutex;
+        // Fallback shard counters for outputs when inputs have no shard suffix
+        std::map<std::string, int> output_shard_counters;
+        std::mutex output_shard_mutex;
+
+
+    public:            
+        // Constructor - initializes ZMQ server with dual network interfaces
+        llama_zmq_server() : 
+            zmq_context(1),
+            file_receiver_eth(zmq_context, zmq::socket_type::pull),
+            file_sender_eth(zmq_context, zmq::socket_type::push),
+            file_receiver_wifi(zmq_context, zmq::socket_type::pull),
+            file_sender_wifi(zmq_context, zmq::socket_type::push),
+            head_node_sender_eth(zmq_context, zmq::socket_type::push),
+            head_node_sender_wifi(zmq_context, zmq::socket_type::push),
+            worker_peer_receiver(zmq_context, zmq::socket_type::pull),
+            server_running(true)
+        {
+
             
-        // 2D Transpose: ✓ WORKING
-        std::unique_ptr<float[]> transpose_2d(float* matrix, int rows, int cols)  
-        {  
-            // Blocked transpose for better cache locality
-            auto result = std::make_unique<float[]>(rows * cols);
-            const int B = 64; // tile size (tunable)
-            for (int i = 0; i < rows; i += B) {
-                for (int j = 0; j < cols; j += B) {
-                    int ib = std::min(B, rows - i);
-                    int jb = std::min(B, cols - j);
-                    for (int ii = 0; ii < ib; ++ii) {
-                        for (int jj = 0; jj < jb; ++jj) {
-                            result[(j + jj) * rows + (i + ii)] = matrix[(i + ii) * cols + (j + jj)];
+            // Load configuration from environment variables with defaults.
+            // Avoid hardcoding absolute paths; default to current working directory.
+            std::string default_project_folder = std::filesystem::current_path().string();
+            if (!default_project_folder.empty() && default_project_folder.back() != '/') {
+                default_project_folder.push_back('/');
+            }
+            project_folder = get_env("OPEN_CLUSTER_PROJECT_DIRECTORY", default_project_folder.c_str());
+
+
+
+            matrix_shard_folder = get_env("OPEN_CLUSTER_MATRIX_SHARD_DIRECTORY", 
+                                        "/dev/shm/matrix_shards/");
+            matrix_results_folder = get_env("OPEN_CLUSTER_MATRIX_RESULTS_DIRECTORY", 
+                                        "/dev/shm/matrix_results/");
+            
+            head_node_ip_eth = get_env("HEAD_NODE_IP_ETH", "192.168.2.100");
+            head_node_ip_wifi = get_env("HEAD_NODE_IP_WIFI", "192.168.50.113");
+            head_node_PULL_port = get_env("HEAD_NODE_PULL_PORT_C", "7779");
+            head_node_PUSH_port = get_env("HEAD_NODE_PUSH_PORT_C", "7780");
+            worker_node_PULL_port = get_env("WORKER_NODE_PULL_PORT_C", "5557");
+            worker_node_PUSH_port = get_env("WORKER_NODE_PUSH_PORT_C", "5558");
+            
+            // Initialize parallel file structures (now handled via reserved_files_list)
+            
+            // Get local network addresses
+            local_IP_eth = get_local_ip();
+            
+            // Attempt to get WiFi IP address using system command
+            try {
+                local_IP_wifi = exec_command(
+                    "ip -4 addr show $(ip -4 route ls | grep default | grep -o 'dev [^ ]*' "
+                    "| awk '{print $2}') | grep inet | awk '{print $2}' | cut -d'/' -f1"
+                );
+                // Clean up newline from command output
+                if (!local_IP_wifi.empty() && local_IP_wifi[local_IP_wifi.length()-1] == '\n') {
+                    local_IP_wifi.erase(local_IP_wifi.length()-1);
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "Warning: Failed to get WiFi IP: " << e.what() << std::endl;
+                local_IP_wifi = "127.0.0.1";
+            }
+            
+            // Configure network ports based on whether this is head node or worker node
+            if (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi) {
+                // Head node configuration
+                eth_pull_port = "tcp://" + local_IP_eth + ":" + head_node_PULL_port;
+                eth_push_port = "tcp://" + local_IP_eth + ":" + head_node_PUSH_port;
+                wifi_pull_port = "tcp://" + local_IP_wifi + ":" + head_node_PULL_port;
+                wifi_push_port = "tcp://" + local_IP_wifi + ":" + head_node_PUSH_port;
+            } else {
+                // Worker node configuration
+                eth_pull_port = "tcp://" + local_IP_eth + ":" + worker_node_PULL_port;
+                eth_push_port = "tcp://" + local_IP_eth + ":" + worker_node_PUSH_port;
+                wifi_pull_port = "tcp://" + local_IP_wifi + ":" + worker_node_PULL_port;
+                wifi_push_port = "tcp://" + local_IP_wifi + ":" + worker_node_PUSH_port;
+            }
+            
+            // Bind file transfer sockets
+            file_receiver_eth.bind(eth_pull_port);
+            file_sender_eth.bind(eth_push_port);
+            file_receiver_wifi.bind(wifi_pull_port);
+            file_sender_wifi.bind(wifi_push_port);
+            
+            // Connect to head node for coordination
+            head_node_sender_eth.connect("tcp://" + head_node_ip_eth + ":" + head_node_PULL_port);
+            head_node_sender_wifi.connect("tcp://" + head_node_ip_wifi + ":" + head_node_PULL_port);
+            
+            // Setup Python front-end ACK communication
+            std::string python_frontend_ip = get_env("HEAD_NODE_IP", "192.168.2.100");
+            std::string python_frontend_port = get_env("PYTHON_FRONT_END_CLUSTER_PORT", "7790");
+            
+            ack_sender = zmq::socket_t(zmq_context, zmq::socket_type::push);
+            ack_sender.connect("tcp://" + python_frontend_ip + ":" + python_frontend_port);
+            
+            // Worker-to-worker peer communication setup
+            // TODO: Load worker IPs from environment or configuration file
+            worker_ip_list = {
+                "192.168.2.100",
+                "192.168.2.100",  // Experimental: Multiple workers on same machine
+                "192.168.2.100",  // Experimental: For load distribution testing
+                "192.168.2.102",
+                "192.168.2.103"
+            };
+            
+            // Experimental feature - work distribution percentages for heterogeneous nodes
+            // This enables adaptive load balancing based on worker capabilities
+            worker_percentages = {0.45f, 0.35f, 0.10f, 0.05f, 0.05f};  // For experimental feature not yet implemented
+            
+            worker_peer_port = get_env("WORKER_PEER_PORT", "5560");
+            worker_peer_receiver.bind("tcp://" + local_IP_eth + ":" + worker_peer_port);
+            worker_peer_receiver.bind("tcp://" + local_IP_wifi + ":" + worker_peer_port);
+            
+            // Clean console output
+            std::cout << "\n=== ZMQ Server Initialization ===" << std::endl;
+            std::cout << "Network Configuration:" << std::endl;
+            std::cout << "  Ethernet IP: " << local_IP_eth << std::endl;
+            std::cout << "  WiFi IP: " << local_IP_wifi << std::endl;
+            std::cout << "\nPort Bindings:" << std::endl;
+            std::cout << "  Ethernet PULL: " << eth_pull_port << std::endl;
+            std::cout << "  Ethernet PUSH: " << eth_push_port << std::endl;
+            std::cout << "  WiFi PULL: " << wifi_pull_port << std::endl;
+            std::cout << "  WiFi PUSH: " << wifi_push_port << std::endl;
+            std::cout << "  Worker Peer: " << worker_peer_port << std::endl;
+            std::cout << "  Worker IPs configured: " << worker_ip_list.size() << " nodes" << std::endl;
+            
+            // Initialize hardware backends
+            #ifdef GGML_OPENCL
+                std::cout << "\nInitializing OpenCL backends..." << std::endl;
+                init_openCL_GPUS();
+            #else
+                std::cout << "\nOpenCL backend disabled at compile time" << std::endl;
+            #endif
+            
+            std::cout << "\nServer initialization complete" << std::endl;
+            std::cout << "==============================\n" << std::endl;
+        }
+
+        void send_ack(std::string ack_msg = "ACK") 
+        {
+            zmq::message_t ack(ack_msg.data(), ack_msg.size());
+            ack_sender.send(ack, zmq::send_flags::none);
+        }
+
+        void run_server() 
+        {
+            std::cout << "🚀 C++ ZMQ Node Server starting..." << std::endl;
+            
+            // Start network listener threads for dual-interface operation
+            std::thread eth_thread(&llama_zmq_server::listen_interface, this, "Ethernet");
+            std::thread wifi_thread(&llama_zmq_server::listen_interface, this, "WiFi");
+            std::thread process_command_thread(&llama_zmq_server::process_command, this);
+            
+            // Detach threads to run as daemon processes (background services)
+            eth_thread.detach();
+            wifi_thread.detach();
+            process_command_thread.detach();
+            
+            std::cout << "✅ Network listeners started successfully" << std::endl;
+            std::cout << "   • Ethernet interface: Active" << std::endl;
+            std::cout << "   • WiFi interface: Active" << std::endl;
+            std::cout << "   • Command processor: Active" << std::endl;
+            std::cout << "\n📡 Server running. Press Ctrl+C to gracefully shutdown..." << std::endl;
+            
+            try 
+            {
+                // Register signal handler for graceful shutdown on Ctrl+C
+                std::signal(SIGINT, [](int sig) { 
+                    std::cout << "\n🛑 Received shutdown signal (Ctrl+C)" << std::endl;
+                    std::cout << "   Shutting down ZMQ server..." << std::endl;
+                    std::exit(0); 
+                });
+                
+                // Main thread idle loop - keeps the server alive
+                // This allows signal handling and keeps the process running
+                while (server_running) 
+                {
+                    // Sleep to prevent CPU spinning while waiting for shutdown
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+            } 
+            catch (const std::exception& e) 
+            {
+                std::cerr << "\n❌ Critical server error: " << e.what() << std::endl;
+                std::cerr << "   Server shutting down due to exception" << std::endl;
+            }
+            
+            std::cout << "👋 Server shutdown complete" << std::endl;
+        }
+
+        void listen_interface(const std::string& interface_name)
+        {
+            // Determine which socket and which command containers/mutex to use
+            zmq::socket_t* socket_ptr = nullptr;
+            std::vector<std::string>* linux_cmd_ptr = nullptr;
+            std::vector<std::string>* server_cmd_ptr = nullptr;
+            std::mutex* linux_cmd_mutex = nullptr;
+            std::mutex* server_cmd_mutex = nullptr;
+
+            if (interface_name == "Ethernet")
+            {
+                socket_ptr = &file_receiver_eth;
+                linux_cmd_ptr = &received_data_eth_linux_command;
+                server_cmd_ptr = &received_data_eth_server_command;
+                linux_cmd_mutex = &linux_commands_mutex;
+                server_cmd_mutex = &server_commands_mutex;
+            }
+            else if (interface_name == "WiFi")
+            {
+                socket_ptr = &file_receiver_wifi;
+                linux_cmd_ptr = &received_data_wifi_linux_command;
+                server_cmd_ptr = &received_data_wifi_server_command;
+                linux_cmd_mutex = &wifi_commands_mutex;
+                server_cmd_mutex = &server_commands_mutex;
+            }
+            else
+            {
+                std::cerr << "❌ Unknown interface: " << interface_name << std::endl;
+                return;
+            }
+
+            std::cout << "🔌 " << interface_name << " listener thread started" << std::endl;
+
+            while (server_running)
+            {
+                try
+                {
+                    std::vector<zmq::message_t> parts;
+                    bool more_parts = true;
+
+                    // Receive multipart ZMQ message (could be 1 or 2 parts)
+                    while (more_parts && server_running)
+                    {
+                        zmq::message_t message;
+                        auto result = socket_ptr->recv(message, zmq::recv_flags::dontwait);
+
+                        if (result)
+                        {
+                            more_parts = message.more();
+                            parts.push_back(std::move(message));
+                        }
+                        else
+                        {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                            break;
                         }
                     }
+
+                    if (parts.empty()) continue;
+
+                    // Single-part: commands
+                    if (parts.size() == 1)
+                    {
+                        std::string command = parts[0].to_string();
+                        size_t server_cmd_pos = command.find("server_command=");
+
+                        if (server_cmd_pos != std::string::npos)
+                        {
+                            std::string server_cmd = command.substr(server_cmd_pos + 15);
+                            std::lock_guard<std::mutex> lock(*server_cmd_mutex);
+                            server_cmd_ptr->push_back(server_cmd);
+                            std::cout << "📋 " << interface_name << ": Received server command" << std::endl;
+                        }
+                        else
+                        {
+                            std::lock_guard<std::mutex> lock(*linux_cmd_mutex);
+                            linux_cmd_ptr->push_back(command);
+                            std::cout << "💻 " << interface_name << ": Received Linux command" << std::endl;
+                        }
+                    }
+                    // Two-part: file transfer (either full file or parallel half)
+                    else if (parts.size() == 2)
+                    {
+                        std::string filename_header = parts[0].to_string();
+                        size_t parallel_send_pos = filename_header.find("P_SEND_");
+
+                        const uint8_t* data_ptr = static_cast<const uint8_t*>(parts[1].data());
+                        size_t data_size = parts[1].size();
+
+                        if (parallel_send_pos != std::string::npos)
+                        {
+                            // Parallel half (ETH or WiFi)
+                            std::string actual_filename = filename_header.substr(parallel_send_pos + 7);
+
+                            std::lock_guard<std::mutex> lock(file_data_mutex);
+
+                            bool found = false;
+                            for (auto &rf : reserved_files_list)
+                            {
+                                if (!rf.save_parallel_file_name.empty() && rf.save_parallel_file_name[0] == actual_filename)
+                                {
+                                    if (interface_name == "Ethernet")
+                                        rf.received_data_eth_file.assign(data_ptr, data_ptr + data_size);
+                                    else
+                                        rf.received_data_wifi_file.assign(data_ptr, data_ptr + data_size);
+
+                                    rf.is_parallel = true;
+                                    found = true;
+                                    std::cout << "📂 " << interface_name << ": Added to parallel file '" << actual_filename << "'" << std::endl;
+                                    break;
+                                }
+                            }
+
+                            if (!found)
+                            {
+                                ReservedFiles rf;
+                                rf.save_parallel_file_name.push_back(actual_filename);
+                                if (interface_name == "Ethernet")
+                                    rf.received_data_eth_file.assign(data_ptr, data_ptr + data_size);
+                                else
+                                    rf.received_data_wifi_file.assign(data_ptr, data_ptr + data_size);
+
+                                rf.is_parallel = true;
+                                reserved_files_list.push_back(std::move(rf));
+
+                                std::cout << "📂 " << interface_name << ": Started parallel file '" << actual_filename << "' (" << interface_name << " half)" << std::endl;
+                            }
+                        }
+                        else
+                        {
+                            // Full file transfer over single interface
+                            std::string filename = filename_header;
+
+                            std::vector<uint8_t> file_data;
+                            file_data.assign(data_ptr, data_ptr + data_size);
+
+                            {
+                                std::lock_guard<std::mutex> lock(file_data_mutex);
+                                bool found = false;
+                                for (auto &rf : reserved_files_list)
+                                {
+                                    if (!rf.save_parallel_file_name.empty() && rf.save_parallel_file_name[0] == filename)
+                                    {
+                                        if (interface_name == "Ethernet") rf.received_data_eth_file = std::move(file_data);
+                                        else rf.received_data_wifi_file = std::move(file_data);
+                                        found = true;
+                                        break;
+                                    }
+                                }
+
+                                if (!found)
+                                {
+                                    ReservedFiles rf;
+                                    rf.save_parallel_file_name.push_back(filename);
+                                    if (interface_name == "Ethernet") rf.received_data_eth_file = std::move(file_data);
+                                    else rf.received_data_wifi_file = std::move(file_data);
+                                    reserved_files_list.push_back(std::move(rf));
+                                }
+                            }
+
+                            std::cout << "📁 " << interface_name << ": Received file '" << filename << "' (" << data_size << " bytes)" << std::endl;
+                        }
+
+                        // Attempt to process saved files
+                        save_file_handler();
+                    }
+                    else
+                    {
+                        std::cout << "⚠️ " << interface_name << ": Unexpected message format - " << parts.size() << " parts received" << std::endl;
+                    }
+                }
+                catch (const std::exception& e)
+                {
+                    std::cerr << "❌ " << interface_name << " listener error: " << e.what() << std::endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
             }
-            return result;
-        }  
 
-        // 3D Transpose: Transpose each 2D slice (batch, rows, cols) -> (batch, cols, rows)
-        std::unique_ptr<float[]> transpose_3d(float* matrix, int batch, int rows, int cols)  
-        {  
-            auto result = std::make_unique<float[]>(batch * rows * cols);
-            int slice_size = rows * cols;
-            const int B = 64;
-            for (int b = 0; b < batch; b++) {
-                float* src_slice = matrix + b * slice_size;
-                float* dst_slice = result.get() + b * slice_size;
-                for (int i = 0; i < rows; i += B) {
-                    for (int j = 0; j < cols; j += B) {
-                        int ib = std::min(B, rows - i);
-                        int jb = std::min(B, cols - j);
-                        for (int ii = 0; ii < ib; ++ii) {
-                            for (int jj = 0; jj < jb; ++jj) {
-                                dst_slice[(j + jj) * rows + (i + ii)] = src_slice[(i + ii) * cols + (j + jj)];
+            std::cout << "🔌 " << interface_name << " listener thread stopping" << std::endl;
+        }
+
+        void process_command() 
+        {
+            std::cout << "⚙️ Command processor thread started" << std::endl;
+            
+            while (server_running) 
+            {
+                try 
+                {
+                    // --- Process Linux System Commands (Ethernet) ---
+                    if (!received_data_eth_linux_command.empty()) 
+                    {
+                        std::vector<std::string> commands_to_process;
+                        
+                        // Safely copy commands from shared vector under lock
+                        {
+                            std::lock_guard<std::mutex> lock(linux_commands_mutex);
+                            commands_to_process = received_data_eth_linux_command;
+                            received_data_eth_linux_command.clear();  // Clear after copying
+                        }
+                        
+                        std::cout << "\n🔧 Processing " << commands_to_process.size() 
+                                << " Linux command(s)" << std::endl;
+                        
+                        for (const std::string &command : commands_to_process)
+                        {
+                            // Security note: system() calls should be validated in production
+                            std::cout << "   • Executing: " << command << std::endl;
+                            
+                            int result = system(command.c_str());
+                            if (result == 0) {
+                                std::cout << "     ✅ Command completed successfully" << std::endl;
+                            } else {
+                                std::cout << "     ⚠️ Command returned exit code: " << result << std::endl;
                             }
                         }
                     }
+                    
+                    // --- Process Server Control Commands (Ethernet) ---
+                    if (!received_data_eth_server_command.empty()) 
+                    {
+                        std::vector<std::string> server_commands_to_process;
+                        
+                        // Safely copy server commands from shared vector
+                        {
+                            std::lock_guard<std::mutex> lock(server_commands_mutex);
+                            server_commands_to_process = received_data_eth_server_command;
+                            received_data_eth_server_command.clear();  // Clear after copying
+                        }
+                        
+                        std::cout << "\n🎮 Processing " << server_commands_to_process.size() 
+                                << " server control command(s)" << std::endl;
+                        
+                        // Create threads for concurrent server command execution
+                        std::vector<std::thread> command_threads;
+                        
+                        for (const std::string &command : server_commands_to_process)
+                        {
+                            std::cout << "   • Launching command: " 
+                                    << (command.length() > 50 ? command.substr(0, 47) + "..." : command) 
+                                    << std::endl;
+                            
+                            // Launch each server command in its own thread for parallel execution
+                            command_threads.emplace_back([this, command]() {
+                                try {
+                                    run_server_command(command);
+                                } catch (const std::exception& e) {
+                                    std::cerr << "❌ Server command failed: " << e.what() 
+                                            << " (Command: " << command << ")" << std::endl;
+                                }
+                            });
+                        }
+                        
+                        // Detach threads to allow them to run independently
+                        // Note: Using detach() means we don't wait for completion
+                        // Use join() if synchronization is required
+                        for (auto& thread : command_threads) {
+                            thread.detach();
+                        }
+                        
+                        std::cout << "     ✅ " << command_threads.size() 
+                                << " command thread(s) launched" << std::endl;
+                    }
+                    
+                    // Small delay to prevent CPU spinning when no commands are pending
+                    // This also allows other threads to acquire locks
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    
+                } 
+                catch (const std::exception& e) 
+                {
+                    std::cerr << "❌ Command processor thread error: " << e.what() << std::endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 }
             }
-            return result;  
-        }  
+            
+            std::cout << "⚙️ Command processor thread stopping" << std::endl;
+        }
 
+        int run_server_command(const std::string& command) 
+        {
+            try 
+            {
+                std::cout << "🚀 Executing server command" << std::endl;
+                
+                // Tokenize command string into individual arguments
+                std::vector<std::string> command_args;
+                std::istringstream iss(command);
+                std::string token;
+                
+                while (iss >> token) {
+                    command_args.push_back(token);
+                }
 
-        std::unique_ptr<float[]> transpose_4d(float* matrix, int batch, int depth, int rows, int cols)  
-        {  
-            auto result = std::make_unique<float[]>(batch * depth * rows * cols);
-            int depth_size = rows * cols;
-            int batch_size = depth * depth_size;
-            const int B = 64;
+                // Validate minimum command structure
+                if (command_args.empty()) {
+                    std::cerr << "❌ Empty command received" << std::endl;
+                    return -2;
+                }
 
-            for (int b = 0; b < batch; b++) {
-                for (int d = 0; d < depth; d++) {
-                    float* src_slice = matrix + b * batch_size + d * depth_size;
-                    float* dst_slice = result.get() + b * batch_size + d * depth_size;
-                    for (int i = 0; i < rows; i += B) {
-                        for (int j = 0; j < cols; j += B) {
-                            int ib = std::min(B, rows - i);
-                            int jb = std::min(B, cols - j);
-                            for (int ii = 0; ii < ib; ++ii) {
-                                for (int jj = 0; jj < jb; ++jj) {
-                                    dst_slice[(j + jj) * rows + (i + ii)] = src_slice[(i + ii) * cols + (j + jj)];
+                const std::string& command_type = command_args[0];
+
+                // ----------------------------
+                // Matrix Computation Operations
+                // ----------------------------
+                if (command_type == "llama" || command_type == "opencl" || command_type == "torch") 
+                {
+                    // Validate required parameters for matrix operations
+                    if (command_args.size() < 10) {
+                        std::cerr << "❌ Insufficient parameters for " << command_type 
+                                << " operation (expected 10, got " << command_args.size() << ")" << std::endl;
+                        return -3;
+                    }
+
+                    // Parse matrix operation parameters
+                    bool transposeA = (command_args[2] == "true");
+                    bool transposeB = (command_args[4] == "true");
+                    bool use_gpu    = (command_args[5] == "true");
+                    int gpu_id      = std::stoi(command_args[6]);
+                    int send_back   = std::stoi(command_args[7]);  // Number of result shards to return
+                    std::string operation_type = command_args[8];  // e.g., "matmul", "add", etc.
+                    int n_dims      = std::stoi(command_args[9]);  // Matrix dimensions
+                    int shard_index_override = -1;
+                    if (command_args.size() > 10) {
+                        shard_index_override = std::stoi(command_args[10]);
+                    }
+                    std::cout << "**run_server_command** shard_index_override: " << shard_index_override << std::endl;
+                    std::cout << "**run_server_command** send_back: " << send_back << std::endl;
+                    
+                    bool operation_success = false;
+                    std::string backend_name;
+
+                    // Dispatch to unified matrix operation function
+                    
+                    if (command_type == "llama")
+                    {
+                        operation_success = matrix_operation(
+                            command_type,
+                            command_args[3].c_str(),   // Matrix B path
+                            transposeB,
+                            command_args[1].c_str(),   // Matrix A path
+                            transposeA,
+                            use_gpu,
+                            gpu_id,
+                            send_back,
+                            operation_type,
+                            n_dims,
+                            shard_index_override
+                        );
+                    }
+                    else
+                    {
+                        operation_success = matrix_operation(
+                            command_type,
+                            command_args[1].c_str(),   // Matrix A path
+                            transposeA,
+                            command_args[3].c_str(),   // Matrix B path
+                            transposeB,
+                            use_gpu,
+                            gpu_id,
+                            send_back,
+                            operation_type,
+                            n_dims,
+                            shard_index_override
+                        );
+                    }
+                    
+                    if (command_type == "llama")
+                        backend_name = "LLaMA/Vulkan";
+                    else if (command_type == "torch")
+                        backend_name = "PyTorch";
+                    else if (command_type == "opencl")
+                        backend_name = "OpenCL";
+
+                    // Report operation outcome
+                    if (operation_success) {
+                        std::cout << "✅ " << backend_name << " operation completed successfully" << std::endl;
+                        std::cout << "   • Operation: " << operation_type << std::endl;
+                        std::cout << "   • GPU: " << (use_gpu ? "Yes (ID: " + std::to_string(gpu_id) + ")" : "No") << std::endl;
+                        std::cout << "   • Result shards: " << send_back << std::endl;
+                        return 0;
+                    } else {
+                        std::cerr << "❌ " << backend_name << " operation failed: " << operation_type << std::endl;
+                        return -7;
+                    }
+
+                } 
+                else 
+                {
+                    std::cerr << "❌ Unsupported server command type: '" << command_type << "'" << std::endl;
+                    std::cerr << "   Supported commands: llama, opencl, torch" << std::endl;
+                    return -6;
+                }
+
+            } 
+            catch (const std::exception& e) 
+            {
+                std::cerr << "❌ Error executing server command: " << e.what() << std::endl;
+                std::cerr << "   Command: " << command << std::endl;
+                return -1;
+            }
+        }
+
+        std::pair<std::string, int> get_matrix_name_and_shard_number(const std::string& shard_path) 
+        {
+            // Extract just the filename from the full path (remove directory portion)
+            // Example: "/path/to/matrixA_shard_42.bin" -> "matrixA_shard_42.bin"
+            std::string filename = shard_path.substr(shard_path.find_last_of("/") + 1);
+            
+            // Look for the shard pattern in the filename
+            // Shard files follow the naming convention: <matrix_name>_shard_<number>.<extension>
+            auto find_shard_pos = [](const std::string& name) -> std::pair<size_t, size_t> {
+                size_t pos = name.find("_shard_");
+                if (pos != std::string::npos) {
+                    return {pos, 7};  // length of "_shard_"
+                }
+                // Accept legacy/pluralized variant to stay compatible with older runs
+                pos = name.find("_shards_");
+                if (pos != std::string::npos) {
+                    return {pos, 8};  // length of "_shards_"
+                }
+                return {std::string::npos, 0};
+            };
+
+            auto [shard_pos, shard_token_len] = find_shard_pos(filename);
+            
+            if (shard_pos != std::string::npos) {
+                // Extract the base matrix name (everything before the shard token)
+                std::string matrix_name = filename.substr(0, shard_pos);
+                
+                // Extract the shard number portion (everything after the shard token)
+                std::string shard_part = filename.substr(shard_pos + shard_token_len);
+                
+                // Remove file extension if present to isolate just the number
+                // Example: "42.bin" -> "42"
+                size_t dot_pos = shard_part.find_last_of(".");
+                if (dot_pos != std::string::npos) {
+                    shard_part = shard_part.substr(0, dot_pos);
+                }
+                
+                try {
+                    // Convert the shard number string to integer
+                    int shard_number = std::stoi(shard_part);
+                    
+                    // Return both the matrix name and shard number
+                    return {matrix_name, shard_number};
+                } catch (const std::exception& e) {
+                    // Handle parsing errors (e.g., if shard_part contains non-numeric characters)
+                    // Return -1 as invalid shard number to indicate parsing failure
+                    std::cerr << "⚠️ Failed to parse shard number from: '" << shard_part 
+                            << "' in file: " << filename << std::endl;
+                    return {matrix_name, -1};
+                }
+            }
+            
+            // If the filename doesn't match the shard pattern, return the entire filename
+            // as the matrix name and -1 to indicate this is not a shard file
+            // This handles cases like regular matrix files or incorrectly named files
+            return {filename, -1};
+        }
+
+        void save_file_handler()
+        {
+            // Move reserved files to local copy under lock for processing
+            std::vector<ReservedFiles> local_reserved_files;
+
+            {
+                std::lock_guard<std::mutex> lock(file_data_mutex);
+
+                if (reserved_files_list.empty())
+                {
+                    std::cout << "No files to save" << std::endl;
+                    return;
+                }
+
+                local_reserved_files = std::move(reserved_files_list);
+                reserved_files_list.clear();
+
+                std::cout << "Processing: " << local_reserved_files.size() << " reserved file(s)" << std::endl;
+            }
+
+            // Iterate through each reserved file entry and handle cases:
+            // - parallel (ETH + WiFi halves)
+            // - single-interface ETH
+            // - single-interface WiFi
+            for (auto &rf : local_reserved_files)
+            {
+                std::string filename = rf.save_parallel_file_name.empty() ? std::string("unknown") : rf.save_parallel_file_name[0];
+                // Helper lambda to write raw bytes to path
+                auto write_raw = [&](const std::filesystem::path &path, const std::vector<uint8_t> &bytes) -> bool {
+                    std::filesystem::create_directories(path.parent_path());
+                    std::ofstream file(path, std::ios::binary);
+                    if (!file.is_open()) return false;
+                    file.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                    file.close();
+                    return true;
+                };
+
+                // If we have both halves (parallel) -> combine
+                if ((rf.is_parallel) || (!rf.received_data_eth_file.empty() && !rf.received_data_wifi_file.empty()))
+                {
+                    std::vector<uint8_t> combined;
+                    combined.reserve(rf.received_data_eth_file.size() + rf.received_data_wifi_file.size());
+                    combined.insert(combined.end(), rf.received_data_eth_file.begin(), rf.received_data_eth_file.end());
+                    combined.insert(combined.end(), rf.received_data_wifi_file.begin(), rf.received_data_wifi_file.end());
+
+                    size_t sent_back_pos = filename.find("sent_back=");
+                    if (sent_back_pos != std::string::npos)
+                    {
+                        std::string actual_filename = filename.substr(sent_back_pos + 10);
+                        std::filesystem::path save_path = std::filesystem::path(matrix_results_folder) / actual_filename;
+                        if (write_raw(save_path, combined))
+                            std::cout << "PARALLEL saved to RESULTS: " << save_path << " (" << combined.size() << " bytes)" << std::endl;
+                        else
+                            std::cerr << "Failed to save PARALLEL sent_back: " << save_path << std::endl;
+
+                        // Head node-specific processing for combined sent_back (attempt to parse 4D tensor)
+                        if (local_IP_eth == head_node_ip_eth)
+                        {
+                            const uint8_t* p = combined.data();
+                            int ndim = *reinterpret_cast<const int*>(p);
+                            p += sizeof(int);
+                            if (ndim == 4)
+                            {
+                                int dims[4];
+                                for (int i = 0; i < 4; ++i) { dims[i] = *reinterpret_cast<const int*>(p); p += sizeof(int); }
+                                int batch = dims[0];
+                                int depth = dims[1];
+                                int rows = dims[2];
+                                int cols = dims[3];
+                                size_t total_elements = static_cast<size_t>(batch) * depth * rows * cols;
+                                auto shard_data = std::make_unique<float[]>(total_elements);
+                                std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
+
+                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        std::filesystem::path save_path = std::filesystem::path(matrix_shard_folder) / filename;
+                        // Try to validate as 4D binary and save via save_matrix_bin; otherwise write raw
+                        bool saved = false;
+                        if (combined.size() >= static_cast<size_t>(5 * sizeof(int)))
+                        {
+                            const uint8_t* p = combined.data();
+                            int ndim = *reinterpret_cast<const int*>(p);
+                            if (ndim == 4)
+                            {
+                                MatrixResult result;
+                                result.dims[0] = *reinterpret_cast<const int*>(p + sizeof(int));
+                                result.dims[1] = *reinterpret_cast<const int*>(p + 2 * sizeof(int));
+                                result.dims[2] = *reinterpret_cast<const int*>(p + 3 * sizeof(int));
+                                result.dims[3] = *reinterpret_cast<const int*>(p + 4 * sizeof(int));
+                                size_t total_elements = static_cast<size_t>(result.dims[0]) * result.dims[1] * result.dims[2] * result.dims[3];
+                                result.data = std::make_unique<float[]>(total_elements);
+                                std::memcpy(result.data.get(), p + 5 * sizeof(int), total_elements * sizeof(float));
+                                if (save_matrix_bin(save_path.c_str(), result))
+                                {
+                                    saved = true;
+                                    std::cout << "PARALLEL saved to SHARDS: " << save_path << " (" << combined.size() << " bytes)" << std::endl;
                                 }
                             }
                         }
+
+                        if (!saved)
+                        {
+                            if (write_raw(save_path, combined))
+                                std::cout << "PARALLEL saved (raw): " << save_path << " (" << combined.size() << " bytes)" << std::endl;
+                            else
+                                std::cerr << "Failed to save PARALLEL file: " << save_path << std::endl;
+                        }
+                    }
+                }
+                // ETH single-interface file
+                else if (!rf.received_data_eth_file.empty())
+                {
+                    const auto &data = rf.received_data_eth_file;
+                    size_t sent_back_pos = filename.find("sent_back=");
+                    if (sent_back_pos != std::string::npos)
+                    {
+                        std::string actual_filename = filename.substr(sent_back_pos + 10);
+                        std::filesystem::path save_path = std::filesystem::path(matrix_results_folder) / actual_filename;
+                        if (write_raw(save_path, data))
+                            std::cout << "ETH sent_back saved to RESULTS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
+                        else
+                            std::cerr << "Failed to save ETH sent_back: " << save_path << std::endl;
+
+                        // Head node-specific processing for shard combination
+                        if (local_IP_eth == head_node_ip_eth)
+                        {
+                            const uint8_t* p = data.data();
+                            int ndim = *reinterpret_cast<const int*>(p);
+                            p += sizeof(int);
+                            if (ndim == 4)
+                            {
+                                int dims[4];
+                                for (int i = 0; i < 4; ++i) { dims[i] = *reinterpret_cast<const int*>(p); p += sizeof(int); }
+                                int batch = dims[0];
+                                int depth = dims[1];
+                                int rows = dims[2];
+                                int cols = dims[3];
+                                size_t total_elements = static_cast<size_t>(batch) * depth * rows * cols;
+                                auto shard_data = std::make_unique<float[]>(total_elements);
+                                std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
+
+                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        // Regular ETH file: validate 4D and save via save_matrix_bin
+                        std::filesystem::path save_path = std::filesystem::path(matrix_shard_folder) / filename;
+                        if (data.size() >= static_cast<size_t>(5 * sizeof(int)))
+                        {
+                            const uint8_t* p = data.data();
+                            int ndim = *reinterpret_cast<const int*>(p);
+                            if (ndim != 4)
+                            {
+                                std::cerr << "ERROR: Worker sent non-4D tensor: " << filename << " (ndim=" << ndim << ")" << std::endl;
+                            }
+                            else
+                            {
+                                MatrixResult result;
+                                result.dims[0] = *reinterpret_cast<const int*>(p + sizeof(int));
+                                result.dims[1] = *reinterpret_cast<const int*>(p + 2 * sizeof(int));
+                                result.dims[2] = *reinterpret_cast<const int*>(p + 3 * sizeof(int));
+                                result.dims[3] = *reinterpret_cast<const int*>(p + 4 * sizeof(int));
+                                size_t total_elements = static_cast<size_t>(result.dims[0]) * result.dims[1] * result.dims[2] * result.dims[3];
+                                result.data = std::make_unique<float[]>(total_elements);
+                                std::memcpy(result.data.get(), p + 5 * sizeof(int), total_elements * sizeof(float));
+
+                                if (save_matrix_bin(save_path.c_str(), result))
+                                    std::cout << "ETH saved to SHARDS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
+                                else
+                                    std::cerr << "Failed to save ETH file: " << save_path << std::endl;
+                            }
+                        }
+                        else
+                        {
+                            if (write_raw(save_path, data))
+                                std::cout << "ETH saved (raw) to SHARDS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
+                            else
+                                std::cerr << "Failed to save ETH file: " << save_path << std::endl;
+                        }
+                    }
+                }
+                // WiFi single-interface file
+                else if (!rf.received_data_wifi_file.empty())
+                {
+                    const auto &data = rf.received_data_wifi_file;
+                    size_t sent_back_pos = filename.find("sent_back=");
+                    if (sent_back_pos != std::string::npos)
+                    {
+                        std::string actual_filename = filename.substr(sent_back_pos + 10);
+                        std::filesystem::path save_path = std::filesystem::path(matrix_results_folder) / actual_filename;
+                        if (write_raw(save_path, data))
+                            std::cout << "WiFi sent_back saved to RESULTS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
+                        else
+                            std::cerr << "Failed to save WiFi sent_back: " << save_path << std::endl;
+                    }
+                    else
+                    {
+                        std::filesystem::path save_path = std::filesystem::path(matrix_shard_folder) / filename;
+                        if (write_raw(save_path, data))
+                            std::cout << "WiFi saved to SHARDS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
+                        else
+                            std::cerr << "Failed to save WiFi file: " << save_path << std::endl;
+                    }
+                }
+                else
+                {
+                    std::cout << "Skipping empty ReservedFiles entry for: " << filename << std::endl;
+                }
+
+                // Python `cluster_matrix_v1.py` expects the ACK message to match the saved filename
+                // (e.g. `small_matrixA.bin`) for stream transfers.
+                if (local_IP_eth != head_node_ip_eth)
+                {
+                    const bool is_sent_back = filename.rfind("sent_back=", 0) == 0;
+                    if (!is_sent_back)
+                    {
+                        send_ack(filename);
                     }
                 }
             }
+
+            std::cout << "Save file handler completed" << std::endl;
+        }
+
+        bool send_back_file(const std::string& local_file_path,
+                            const std::string& filename,
+                            MatrixResult& save_result,
+                            int total_shards,
+                            const std::string& selected_backend)
+        {
+            std::cout << "SENDING BACK FILE" << std::endl;
+            bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);
+
+            // ============================================================
+            // WORKER NODE → SEND RESULT BACK TO HEAD (HEAD-SEMANTIC FORMAT)
+            // ============================================================
+            if (!is_head_node)
+            {
+                std::string send_back_filename = "sent_back=" + filename;
+                std::cout << "Worker sending result back to head: " << send_back_filename << std::endl;
+
+                std::vector<uint8_t> buffer;
+
+                // Network contract: Always send logical 4D tensor
+                int ndim = 4;
+                buffer.insert(buffer.end(),
+                    reinterpret_cast<uint8_t*>(&ndim),
+                    reinterpret_cast<uint8_t*>(&ndim) + sizeof(int));
+
+                // Normalize dimensions according to backend format
+                int batch, depth, shard_rows, shard_cols;
+                if (selected_backend == "llama")  // for incase things go fucked does nothing
+                {  
+                    // GGML format: {cols, rows, depth, batch}
+                    batch      = save_result.dims[0];  // batch is index 3
+                    depth      = save_result.dims[1];  // depth is index 2
+                    shard_rows = save_result.dims[2];  // rows is index 1
+                    shard_cols = save_result.dims[3];  // cols is index 0
+                }  
+                else if (selected_backend == "torch")  // for incase things go fucked does nothing 
+                {  
+                    // Torch format: {batch, depth, rows, cols}
+                    batch      = save_result.dims[0];
+                    depth      = save_result.dims[1];
+                    shard_rows = save_result.dims[2];
+                    shard_cols = save_result.dims[3];
+                }
+
+                // IMPORTANT: save_result.dims[] must already reflect the logical shape
+                // If not, this indicates a backend issue, not a network issue
+                int dims[4] = { batch, depth, shard_rows, shard_cols };
+
+                // Insert all 4 dimensions into buffer
+                for (int i = 0; i < 4; i++)
+                {
+                    buffer.insert(buffer.end(),
+                        reinterpret_cast<uint8_t*>(&dims[i]),
+                        reinterpret_cast<uint8_t*>(&dims[i]) + sizeof(int));
+                }
+
+                // Calculate and insert data payload
+                size_t total_elements =
+                    static_cast<size_t>(batch) *
+                    static_cast<size_t>(depth) *
+                    static_cast<size_t>(shard_rows) *
+                    static_cast<size_t>(shard_cols);
+
+                buffer.insert(buffer.end(),
+                    reinterpret_cast<uint8_t*>(save_result.data.get()),
+                    reinterpret_cast<uint8_t*>(save_result.data.get()) +
+                    total_elements * sizeof(float));
+
+                // Send data to head node via ZeroMQ
+                zmq::message_t filename_msg(send_back_filename.data(), send_back_filename.size());
+                zmq::message_t data_msg(buffer.data(), buffer.size());
+
+                head_node_sender_eth.send(filename_msg, zmq::send_flags::sndmore);
+                head_node_sender_eth.send(data_msg, zmq::send_flags::none);
+
+                std::cout << "Result sent to head node: "
+                        << send_back_filename << " (" << buffer.size() << " bytes)" << std::endl;
+
+                return true;
+            }
+
+            // ============================================================
+            // HEAD NODE → SAVE FILE + TRACK SHARDS
+            // ============================================================
+            if (is_head_node)
+            {
+                // Extract shard dimensions
+                int shard_rows = save_result.dims[2];
+                int shard_cols = save_result.dims[3];
+                size_t data_size = shard_rows * shard_cols * sizeof(float);
+
+                // Copy data into unique_ptr for shard processing
+                auto shard_data = std::make_unique<float[]>(shard_rows * shard_cols);
+                std::memcpy(shard_data.get(),
+                            save_result.data.get(),
+                            data_size);
+
+
+                std::cout << "**send_back_file** total_shards: " << total_shards;
+                // Process shard through combination handler
+                bool result = handle_combine_matrix_shard_list(
+                    filename,
+                    std::move(shard_data),
+                    shard_rows,
+                    shard_cols,
+                    total_shards
+                );
+
+                std::cout << "Head node processed shard: " << filename 
+                        << " (" << data_size << " bytes)" << std::endl;
+
+                return result;
+            }
+
+            return false;
+        }
+
+	    bool handle_combine_matrix_shard_list(
+	        const std::string& filename,
+	        std::unique_ptr<float[]> data,
+	        int shard_rows,
+	        int shard_cols,
+	        int total_shards
+	    )
+        {
+            // ============================================================
+            // DEBUG: Print incoming parameters
+            // ============================================================
+            std::cout << "DEBUG: handle_combine_matrix_shard_list called" << std::endl;
+            std::cout << "DEBUG: filename='" << filename << "'" << std::endl;
+            std::cout << "DEBUG: shard_rows=" << shard_rows
+                    << ", shard_cols=" << shard_cols << std::endl;
+            std::cout << "DEBUG: total_shards=" << total_shards << std::endl;
+
+            // ============================================================
+            // EXTRACT MATRIX NAME AND SHARD NUMBER
+            // ============================================================
+            auto [matrix_name, shard_num] = get_matrix_name_and_shard_number(filename);
+
+            std::cout << "DEBUG: Extracted matrix_name='"
+                    << matrix_name << "', shard_num=" << shard_num << std::endl;
+
+            // ============================================================
+            // BUILD SHARD BYTES WITH METADATA
+            // ============================================================
+            std::vector<uint8_t> shard_bytes;
+
+            int ndim = 4;
+            shard_bytes.insert(
+                shard_bytes.end(),
+                reinterpret_cast<uint8_t*>(&ndim),
+                reinterpret_cast<uint8_t*>(&ndim) + sizeof(int)
+            );
+
+            int dims[4] = {1, 1, shard_rows, shard_cols};
+            for (int i = 0; i < 4; ++i)
+            {
+                shard_bytes.insert(
+                    shard_bytes.end(),
+                    reinterpret_cast<uint8_t*>(&dims[i]),
+                    reinterpret_cast<uint8_t*>(&dims[i]) + sizeof(int)
+                );
+            }
+
+            size_t data_size = static_cast<size_t>(shard_rows) * shard_cols * sizeof(float);
+            shard_bytes.insert(
+                shard_bytes.end(),
+                reinterpret_cast<uint8_t*>(data.get()),
+                reinterpret_cast<uint8_t*>(data.get()) + data_size
+            );
+
+            std::cout << "DEBUG: Created shard_bytes of size "
+                    << shard_bytes.size() << std::endl;
+
+            // ============================================================
+            // TRACK EXISTING MATRIX
+            // ============================================================
+            std::cout << "DEBUG: Checking "
+                    << combined_matrix_shards_list.size()
+                    << " existing tracking entries" << std::endl;
+
+            for (auto& combined : combined_matrix_shards_list)
+            {
+                auto [combined_name, _] = get_matrix_name_and_shard_number(combined.file_name);
+
+                if (combined_name == matrix_name)
+                {
+                    std::cout << "DEBUG: FOUND MATCH for matrix '"
+                            << matrix_name << "'" << std::endl;
+
+                    // Update shard count if first shard was placeholder
+	                    if (combined.number_of_shards_needed == 0 && total_shards != 0)
+	                    {
+	                        int abs_val = std::abs(total_shards);
+	                        int join_dim = 0;
+	                        int shards_needed = abs_val;
+
+                        if (abs_val >= 10)
+                        {
+                            join_dim = abs_val / 10;
+                            shards_needed = abs_val % 10;
+                        }
+
+	                        combined.join_dim = join_dim;
+	                        // Preserve sign to reliably detect System-2 even if the last shard arrives
+	                        // via the worker receive path (which passes total_shards=0).
+	                        combined.number_of_shards_needed = (total_shards < 0) ? -shards_needed : shards_needed;
+
+                        std::cout << "DEBUG: number_of_shards_needed UPDATED to "
+                                << shards_needed
+                                << ", join_dim=" << join_dim << std::endl;
+                    }
+
+                    combined.total_shards_reserved++;
+                    combined.shard_numbers.push_back(shard_num);
+                    combined.received_matrix_data.push_back(std::move(shard_bytes));
+                    combined.dims_list.push_back({1, 1, shard_rows, shard_cols});
+
+                    std::cout << "DEBUG: Updated shard count to "
+                            << combined.total_shards_reserved
+                            << " of " << combined.number_of_shards_needed
+                            << std::endl;
+
+	                    int needed = std::abs(combined.number_of_shards_needed);
+
+	                    if (needed > 0 && combined.total_shards_reserved == needed)
+	                    {
+	                        // NOTE: Worker→head "sent_back=" deliveries call this handler with total_shards=0.
+	                        // Use the stored sign from the first non-zero shard instead of the current call.
+	                        bool is_system2 = (combined.number_of_shards_needed < 0);
+
+                        std::cout << "DEBUG: ALL SHARDS RECEIVED! Combining..."
+                                << std::endl;
+
+                        MatrixResult full = is_system2
+                            ? combine_matrix_shards_grid_2d(combined)
+                            : combine_matrix_shards_2d(combined);
+
+                        if (full.data)
+                        {
+                            std::string final_path =
+                                std::filesystem::path(matrix_shard_folder) /
+                                (matrix_name + "_combined.bin");
+
+                            save_matrix_bin(final_path.c_str(), full);
+                            send_ack("ACK_combined_matrix_saved");
+
+                            std::cout << "Combined matrix saved: "
+                                    << final_path << std::endl;
+                        }
+                        else
+                        {
+                            std::cerr << "ERROR: Combine failed for "
+                                    << matrix_name << std::endl;
+                        }
+
+                        // Remove completed matrix from tracking
+                        combined_matrix_shards_list.erase(
+                            std::remove_if(
+                                combined_matrix_shards_list.begin(),
+                                combined_matrix_shards_list.end(),
+                                [&](const combined_matrix_shards& c)
+                                {
+                                    auto [n, __] =
+                                        get_matrix_name_and_shard_number(c.file_name);
+                                    return n == matrix_name;
+                                }),
+                            combined_matrix_shards_list.end()
+                        );
+                    }
+
+                    return true;
+                }
+            }
+
+            // ============================================================
+            // FIRST SHARD → CREATE NEW TRACKING ENTRY
+            // ============================================================
+            combined_matrix_shards combined;
+            combined.file_name = matrix_name;
+
+            // ---- Parse send_back encoding
+            int abs_val = std::abs(total_shards);
+            int join_dim = 0;
+            int shards_needed = abs_val;
+
+            if (abs_val >= 10)
+            {
+                join_dim = abs_val / 10;
+                shards_needed = abs_val % 10;
+            }
+
+	            combined.join_dim = join_dim;
+	            // Preserve sign so System-2 combine choice does not depend on which shard arrives last.
+	            combined.number_of_shards_needed = (total_shards < 0) ? -shards_needed : shards_needed;
+	            combined.total_shards_reserved = 1;
+
+            combined.shard_numbers.push_back(shard_num);
+            combined.received_matrix_data.push_back(std::move(shard_bytes));
+            combined.dims_list.push_back({1, 1, shard_rows, shard_cols});
+
+            combined_matrix_shards_list.push_back(std::move(combined));
+
+            std::cout << "Started tracking matrix: "
+                    << matrix_name
+                    << " | shards=" << shards_needed
+                    << " | join_dim=" << join_dim
+                    << " | system=" << (total_shards < 0 ? "2" : "1")
+                    << std::endl;
+
+            return true;
+        }
+
+        MatrixResult combine_matrix_shards_2d(const combined_matrix_shards& combined)
+        {
+            MatrixResult result;
+
+            if (combined.received_matrix_data.empty()) {
+                return result;
+            }
+
+            // ============================================================
+            // STEP 1: SORT SHARDS BY SHARD NUMBER
+            // ============================================================
+            struct ShardEntry {
+                int shard_num;
+                torch::Tensor tensor;
+            };
+
+            std::vector<ShardEntry> shards;
+
+            auto shard_num_it = combined.shard_numbers.begin();
+            auto data_it      = combined.received_matrix_data.begin();
+
+            for (; shard_num_it != combined.shard_numbers.end() &&
+                data_it      != combined.received_matrix_data.end();
+                ++shard_num_it, ++data_it)
+            {
+                // Save shard bytes to temp file OR directly load from memory
+                // You already have bin layout → reuse loader
+                const std::vector<uint8_t>& bytes = *data_it;
+
+                // Write to temp buffer-backed stream
+                std::string tmp_path = "/dev/shm/tmp_shard_" + std::to_string(*shard_num_it) + ".bin";
+                {
+                    std::ofstream f(tmp_path, std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+                }
+
+                torch::Tensor t = load_matrix_bin_as_torch_view(tmp_path);
+
+                shards.push_back({*shard_num_it, t});
+            }
+
+            std::sort(shards.begin(), shards.end(),
+                    [](const ShardEntry& a, const ShardEntry& b) {
+                        return a.shard_num < b.shard_num;
+                    });
+
+            // ============================================================
+            // STEP 2: VALIDATE SHAPES
+            // ============================================================
+            const auto& ref = shards[0].tensor.sizes();
+            int64_t batch = (ref.size() == 4) ? ref[0] : 1;
+            int64_t depth = (ref.size() == 4) ? ref[1] : 1;
+
+            for (const auto& s : shards) {
+                const auto& sz = s.tensor.sizes();
+
+                if (sz.size() != ref.size()) {
+                    throw std::runtime_error("Shard rank mismatch");
+                }
+
+                if (sz.size() == 4) {
+                    if (sz[0] != batch || sz[1] != depth) {
+                        throw std::runtime_error("Batch/depth mismatch between shards");
+                    }
+                }
+            }
+
+            // ============================================================
+            // STEP 3: TORCH CONCAT
+            // ============================================================
+            std::vector<torch::Tensor> tensors;
+            for (auto& s : shards) {
+                tensors.push_back(s.tensor);
+            }
+
+            int torch_join_dim;
+            if (ref.size() == 2) {
+                torch_join_dim = combined.join_dim;
+            } else if (ref.size() == 3) {
+                torch_join_dim = combined.join_dim + 1; // skip batch
+            } else {
+                torch_join_dim = combined.join_dim + 2; // skip batch + depth
+            }
+
+            torch::Tensor combined_tensor = torch::cat(tensors, torch_join_dim);
+
+            // ============================================================
+            // STEP 4: EXPORT BACK TO MatrixResult
+            // ============================================================
+            auto sizes = combined_tensor.sizes();
+
+            result.dims[0] = (sizes.size() == 4) ? sizes[0] : 1;
+            result.dims[1] = (sizes.size() == 4) ? sizes[1] : 1;
+            result.dims[2] = sizes[sizes.size() - 2];
+            result.dims[3] = sizes[sizes.size() - 1];
+
+            size_t total = combined_tensor.numel();
+            result.data = std::make_unique<float[]>(total);
+
+            std::memcpy(
+                result.data.get(),
+                combined_tensor.contiguous().data_ptr<float>(),
+                total * sizeof(float)
+            );
+
+            std::cout << "Torch combine complete → shape ("
+                    << result.dims[2] << " x " << result.dims[3] << ")\n";
+
             return result;
         }
 
-        ggml_backend_t pick_least_loaded_backend() {
-            // return backend with minimal reported load (simple scheduler)
-            size_t best = 0;
-            uint64_t best_load = UINT64_MAX;
-            for (size_t i = 0; i < ggml_backends.size(); ++i) {
-                uint64_t load = 0;
-                if (i < device_load_ptrs.size() && device_load_ptrs[i]) load = device_load_ptrs[i]->load(std::memory_order_relaxed);
-                if (load < best_load) { best_load = load; best = i; }
+        MatrixResult combine_matrix_shards_grid_2d(
+            const combined_matrix_shards& combined
+        )
+        {
+            MatrixResult result;
+
+            if (combined.received_matrix_data.empty()) {
+                return result;
             }
-            return ggml_backends.empty() ? (ggml_backend_t)nullptr : ggml_backends[best];
+
+            // ============================================================
+            // STEP 1: LOAD SHARDS AS TORCH TENSORS (SORTED)
+            // ============================================================
+            struct Shard {
+                int index;
+                torch::Tensor t;
+                int rows;
+                int cols;
+            };
+
+            std::vector<Shard> shards;
+
+            auto n_it = combined.shard_numbers.begin();
+            auto d_it = combined.received_matrix_data.begin();
+            auto s_it = combined.dims_list.begin();
+
+            for (; n_it != combined.shard_numbers.end(); ++n_it, ++d_it, ++s_it) {
+
+                const int shard_index = *n_it;
+                const auto& dims = *s_it;   // [batch, depth, rows, cols]
+
+                const int rows = dims[2];
+                const int cols = dims[3];
+
+                torch::Tensor t = torch::from_blob(
+                    (void*)d_it->data(),
+                    {rows, cols},
+                    torch::kFloat32
+                ).clone();
+
+                shards.push_back({
+                    shard_index,
+                    t,
+                    rows,
+                    cols
+                });
+            }
+
+            std::sort(
+                shards.begin(),
+                shards.end(),
+                [](const Shard& a, const Shard& b) {
+                    return a.index < b.index;
+                }
+            );
+
+            // ============================================================
+            // STEP 2: GRID RECONSTRUCTION
+            // ============================================================
+            int max_row = 0;
+            int max_col = 0;
+
+            for (const auto& shard : shards) {
+                max_row = std::max(max_row, shard.rows);
+                max_col = std::max(max_col, shard.cols);
+            }
+
+            const int grid_dim = static_cast<int>(std::sqrt(shards.size()));
+
+            if (grid_dim * grid_dim != static_cast<int>(shards.size())) {
+                throw std::runtime_error("Shard count is not a perfect square");
+            }
+
+            std::vector<std::vector<torch::Tensor>> grid(
+                grid_dim,
+                std::vector<torch::Tensor>(grid_dim)
+            );
+
+            for (size_t i = 0; i < shards.size(); ++i) {
+                const int r = i / grid_dim;
+                const int c = i % grid_dim;
+                grid[r][c] = shards[i].t;
+            }
+
+            // ============================================================
+            // STEP 3: CONCAT ROWS THEN COLS
+            // ============================================================
+            std::vector<torch::Tensor> rows_concat;
+
+            for (int r = 0; r < grid_dim; ++r) {
+                rows_concat.push_back(torch::cat(grid[r], 1));
+            }
+
+            result.tensor = torch::cat(rows_concat, 0);
+            result.rows = result.tensor.size(0);
+            result.cols = result.tensor.size(1);
+
+            return result;
         }
 
-        MatrixResult matrix_op_nd(  
-            float* matrix_a, const int dims_a[4],  
-            float* matrix_b, const int dims_b[4],  
-            ggml_backend_t backend,  
-            const std::string& op = "mul")  
-        {  
-            stat_ops.fetch_add(1, std::memory_order_relaxed);
-                // Validate dimensions - NO ZERO DIMENSIONS ALLOWED  
-            for (int i = 0; i < 4; i++) {  
-                if (dims_a[i] == 0 || dims_b[i] == 0) {  
-                    std::cerr << "Error: Zero dimension detected at index " << i << std::endl;  
-                    return {nullptr, {0,0,0,0}};  
-                }  
-            }  
-                
-                // Initialize GGML context (use persistent per-device context when available)
-            int backend_index = -1;
-            if (!backend) {
-                backend = pick_least_loaded_backend();
-            }
-            for (size_t bi = 0; bi < ggml_backends.size(); ++bi) {
-                if (ggml_backends[bi] == backend) { backend_index = (int)bi; break; }
-            }
+        bool matrix_operation(
+            const std::string& backend_type,
+            const char* matrix_pathA,
+            bool transposeA,
+            const char* matrix_pathB,
+            bool transposeB,
+            bool use_gpu,
+            int gpu_id,
+            int send_back,
+            const std::string& operation_type,
+            int dim,
+            int shard_index_override
+        )
+        {
+            bool op_success = false;
+            try {
+                std::cout << "🚀 UNIFIED MATRIX OPERATION - Backend: " << backend_type << std::endl;
 
-            struct ggml_context* ctx = nullptr;
-            bool ctx_is_persistent = false;
-            if (backend_index >= 0 && backend_index < (int)ggml_ctxs.size() && ggml_ctxs[backend_index]) {
-                ctx = ggml_ctxs[backend_index];
-                ctx_is_persistent = true;
-            } else {
-                struct ggml_init_params params;
-                params.mem_size = 16 * 1024 * 1024;
-                params.mem_buffer = NULL;
-                // temporary contexts must allow allocations for tensor/back-end work
-                params.no_alloc = false;
-                ctx = ggml_init(params);
-            }
+                // Common setup (all backends)
+                std::string output_filename = get_matrix_output_filename(matrix_pathA, matrix_pathB);
+                if (shard_index_override >= 0)
+                {
+                    // Force shard naming from caller
+                    // Strip existing ".bin" and any trailing "_shard_<n>" before appending
+                    size_t dot_pos = output_filename.rfind(".bin");
+                    std::string base_name = (dot_pos != std::string::npos) ? output_filename.substr(0, dot_pos) : output_filename;
+                    size_t shard_pos = base_name.rfind("_shard_");
+                    if (shard_pos != std::string::npos)
+                    {
+                        base_name = base_name.substr(0, shard_pos);
+                    }
+                    output_filename = base_name + "_shard_" + std::to_string(shard_index_override) + ".bin";
+                }
+                std::string output_path = std::filesystem::path(matrix_shard_folder) / output_filename;
 
-            // RAII: only free ctx if it was a temporary allocation
-            auto ctx_deleter = [&](struct ggml_context* p) { if (p && !ctx_is_persistent) ggml_free(p); };
-            std::unique_ptr<struct ggml_context, decltype(ctx_deleter)> ctx_holder(ctx, ctx_deleter);
-                
-                // Validate dimensions for matrix multiplication  
-                if (op == "mul") {  
-                if (dims_a[0] != dims_b[0]) {  
-                    std::cerr << "Error: For matrix multiplication, dims_a[0] must equal dims_b[0]" << std::endl;  
-                    return {nullptr, {0,0,0,0}};  
-                }  
-                if ((dims_b[2] % dims_a[2] != 0) || (dims_b[3] % dims_a[3] != 0)) {  
-                    std::cerr << "Error: Broadcasting rules violated" << std::endl;  
-                    return {nullptr, {0,0,0,0}};  
-                }  
-            }  
-                
-                // Create tensors (data pointers are NULL at this point)  
-            struct ggml_tensor* a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dims_a[0], dims_a[1], dims_a[2], dims_a[3]);  
-            struct ggml_tensor* b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, dims_b[0], dims_b[1], dims_b[2], dims_b[3]);  
-                
-                // Build computation graph  
-            struct ggml_tensor* result;  
-            if (op == "mul") {  
-                result = ggml_mul_mat(ctx, a, b);  
-            } else if (op == "add") {  
-                result = ggml_add(ctx, a, b);  
-            } else if (op == "sub") {  
-                result = ggml_sub(ctx, a, b);  
-            } else {  
-                return {nullptr, {0,0,0,0}};  
-            }  
-                
-                // Create and build computation graph  
-            struct ggml_cgraph* gf = ggml_new_graph(ctx);  
-            ggml_build_forward_expand(gf, result);  
-                
-                // Allocate tensors on backend FIRST  
-            // Use per-device mutex to serialize allocations/compute per device if available
-            std::unique_lock<std::mutex> device_lock;
-            bool incremented_load = false;
-            if (backend_index >= 0 && backend_index < (int)device_mutexes.size()) {
-                device_lock = std::unique_lock<std::mutex>(*device_mutexes[backend_index]);
-                // increment load counter
-                if (backend_index >= 0 && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {
-                    device_load_ptrs[backend_index]->fetch_add(1, std::memory_order_relaxed);
-                    incremented_load = true;
+                // ============================================================
+                // BACKEND: LLAMA / GGML / VULKAN
+                // ============================================================
+                if (backend_type == "llama")
+                {
+                    std::unique_ptr<float[]> matrix_A = nullptr;
+                    std::unique_ptr<float[]> matrix_B = nullptr;
+                    int rows_A, cols_A, rows_B, cols_B;
+                    int depthA = 1, batchA = 1;
+                    int depthB = 1, batchB = 1;
+
+                    // Load matrices
+                    matrix_A = load_matrix_bin(matrix_pathA, rows_A, cols_A, batchA, depthA);
+                    matrix_B = load_matrix_bin(matrix_pathB, rows_B, cols_B, batchB, depthB);
+                    
+                    if (!matrix_A || !matrix_B) {
+                        std::cerr << "❌ Failed to load input matrices" << std::endl;
+                        return false;
+                    }
+
+                    // Apply transposes
+                    if (transposeA) {
+                        matrix_A = (depthA > 1 || batchA > 1)
+                            ? matrix_backend_llama.transpose_4d(matrix_A.get(), batchA, depthA, rows_A, cols_A)
+                            : matrix_backend_llama.transpose_2d(matrix_A.get(), rows_A, cols_A);
+                        std::swap(rows_A, cols_A);
+                    }
+                    
+                    if (transposeB) {
+                        matrix_B = (depthB > 1 || batchB > 1)
+                            ? matrix_backend_llama.transpose_4d(matrix_B.get(), batchB, depthB, rows_B, cols_B)
+                            : matrix_backend_llama.transpose_2d(matrix_B.get(), rows_B, cols_B);
+                        std::swap(rows_B, cols_B);
+                    }
+
+                    // GGML format: {cols, rows, depth, batch}
+                    int dims_a[4] = { cols_A, rows_A, depthA, batchA };
+                    int dims_b[4] = { cols_B, rows_B, depthB, batchB };
+
+                    // Only lock long enough to read the backend vector; release before compute
+                    ggml_backend_t backend;
+                    {
+                        std::lock_guard<std::mutex> lock(matrix_backend_llama.backends_mutex);
+                        backend =
+                            (use_gpu && gpu_id >= 0 &&
+                            gpu_id < (int)matrix_backend_llama.ggml_backends.size())
+                            ? matrix_backend_llama.ggml_backends[gpu_id]
+                            : matrix_backend_llama.ggml_backends.back();
+                    }
+
+                    // Execute
+                    MatrixResult result = matrix_backend_llama.matrix_op_nd(
+                        matrix_A.get(), dims_a,
+                        matrix_B.get(), dims_b,
+                        backend, operation_type
+                    );
+
+                    if (result.dims[0] == 0 && result.dims[1] == 0) {
+                        result.dims[0] = 1;
+                        result.dims[1] = 1;
+                    }
+
+                    if (!result.data) {
+                        std::cerr << "❌ LLAMA operation failed" << std::endl;
+                        op_success = false;
+                    } else {
+                        // Common save/send_back
+                        if (!save_matrix_bin(output_path.c_str(), result)) {
+                            std::cerr << "❌ Failed to save result" << std::endl;
+                            op_success = false;
+                        } else {
+                            if (send_back > 0 || send_back < 0)
+                            {
+                                std::cout << "**matrix_operation** send_back: " << send_back << std::endl;
+                                send_back_file(output_path, output_filename, result, send_back, "llama");
+                            }
+                            
+                            op_success = true;
+                        }
+                    }
+                }
+
+                // ============================================================
+                // BACKEND: PYTORCH / TORCH
+                // ============================================================
+                else if (backend_type == "torch")
+                {
+                    // GPU availability check
+                    bool torch_gpu_available = false;
+                    #ifdef USE_CUDA
+                    torch_gpu_available = torch::cuda::is_available();
+                    #endif
+                    
+                    if (use_gpu && !torch_gpu_available) {
+                        std::cout << "⚠️  GPU requested but unavailable. Using CPU." << std::endl;
+                    }
+
+                    // Load tensors
+                    torch::Tensor A = load_matrix_bin_as_torch_view(matrix_pathA);
+                    torch::Tensor B = load_matrix_bin_as_torch_view(matrix_pathB);
+                    
+                    if (!A.defined() || !B.defined()) {
+                        std::cerr << "❌ Failed to load matrices" << std::endl;
+                        op_success = false;
+                        throw std::runtime_error("load fail");
+                    }
+
+                    // Apply transposes (last 2 dims)
+                    if (transposeA)
+                        A = A.transpose(-2, -1).contiguous();
+                    if (transposeB)
+                        B = B.transpose(-2, -1).contiguous();
+
+                    // Select device
+                    torch::Device device = torch::kCPU;
+                    if (use_gpu && torch_gpu_available) {
+                        device = torch::Device(torch::kCUDA, gpu_id);
+                    }
+                    A = A.to(device);
+                    B = B.to(device);
+
+                    // Execute
+                    torch::Tensor C;
+                    if (operation_type == "mul") {
+                        C = torch::matmul(A, B);
+                    } else if (operation_type == "add") {
+                        C = A + B;
+                    } else if (operation_type == "sub") {
+                        C = A - B;
+                    } else {
+                        std::cerr << "❌ Unknown op: " << operation_type << std::endl;
+                        return false;
+                    }
+
+                    C = C.contiguous().to(torch::kCPU);
+
+                    // Convert to MatrixResult
+                    MatrixResult result;
+                    auto sizes = C.sizes();
+                    int ndim = sizes.size();
+                    int batch = 1, depth = 1, rows = 1, cols = 1;
+                    
+                    if (ndim == 2) {
+                        rows = sizes[0]; cols = sizes[1];
+                    } else if (ndim == 3) {
+                        batch = sizes[0]; rows = sizes[1]; cols = sizes[2];
+                    } else if (ndim == 4) {
+                        batch = sizes[0]; depth = sizes[1]; rows = sizes[2]; cols = sizes[3];
+                    } else {
+                        std::cerr << "❌ Unsupported rank: " << ndim << std::endl;
+                        return false;
+                    }
+
+                    result.dims[0] = batch;
+                    result.dims[1] = depth;
+                    result.dims[2] = rows;
+                    result.dims[3] = cols;
+
+                    int64_t total = C.numel();
+                    result.data = std::make_unique<float[]>(total);
+                    memcpy(result.data.get(), C.data_ptr<float>(), total * sizeof(float));
+
+                    // Common save/send_back
+                    if (!save_matrix_bin(output_path.c_str(), result)) {
+                        std::cerr << "❌ Failed to save result" << std::endl;
+                        op_success = false;
+                    } else {
+                        if (send_back > 0)
+                            
+                            send_back_file(output_path, output_filename, result, send_back, "torch");
+                        op_success = true;
+                    }
+                }
+
+                // ============================================================
+                // BACKEND: OPENCL
+                // ============================================================
+                else if (backend_type == "opencl")
+                {
+                    if (gpu_id < 0 || gpu_id >= (int)openCL_GPU_select_list.size()) {
+                        std::cerr << "❌ Invalid OpenCL GPU ID" << std::endl;
+                        return false;
+                    }
+
+                    // Load via Torch (I/O only)
+                    torch::Tensor tensorA = load_matrix_bin_as_torch_view(matrix_pathA);
+                    torch::Tensor tensorB = load_matrix_bin_as_torch_view(matrix_pathB);
+
+                    if (!tensorA.defined() || !tensorB.defined()) {
+                        std::cerr << "❌ Failed to load matrices" << std::endl;
+                        return false;
+                    }
+
+                    // Apply transposes
+                    if (transposeA)
+                        tensorA = tensorA.transpose(-2, -1).contiguous();
+                    if (transposeB)
+                        tensorB = tensorB.transpose(-2, -1).contiguous();
+
+                    float* A_ptr = tensorA.data_ptr<float>();
+                    float* B_ptr = tensorB.data_ptr<float>();
+                    int M = tensorA.size(-2);
+                    int K = tensorA.size(-1);
+                    int N = tensorB.size(-1);
+
+                    if (K != tensorB.size(-2)) {
+                        std::cerr << "❌ Dimension mismatch" << std::endl;
+                        return false;
+                    }
+
+                    // OpenCL execution
+                    cl::Device device = openCL_GPU_select_list[gpu_id];
+                    cl::Context context(device);
+                    cl::CommandQueue queue(context, device);
+                    
+                    cl::Buffer bufA(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 
+                                   sizeof(float) * tensorA.numel(), A_ptr);
+                    cl::Buffer bufB(context, CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, 
+                                   sizeof(float) * tensorB.numel(), B_ptr);
+                    cl::Buffer bufC(context, CL_MEM_WRITE_ONLY, sizeof(float) * M * N);
+                    
+                    cl::Program program(context, openCL_kernel_matmul);
+                    program.build({device});
+                    cl::Kernel kernel(program, "matmul");
+
+                    kernel.setArg(0, bufA);
+                    kernel.setArg(1, bufB);
+                    kernel.setArg(2, bufC);
+                    kernel.setArg(3, M);
+                    kernel.setArg(4, N);
+                    kernel.setArg(5, K);
+
+                    queue.enqueueNDRangeKernel(kernel, cl::NullRange, cl::NDRange(M, N), cl::NDRange(16, 16));
+                    queue.finish();
+
+                    // Prepare result
+                    MatrixResult result;
+                    result.dims[0] = 1;
+                    result.dims[1] = 1;
+                    result.dims[2] = M;
+                    result.dims[3] = N;
+                    result.data = std::make_unique<float[]>(M * N);
+                    queue.enqueueReadBuffer(bufC, CL_TRUE, 0, sizeof(float) * M * N, result.data.get());
+
+                    // Common save/send_back
+                    if (!save_matrix_bin(output_path.c_str(), result)) {
+                        std::cerr << "❌ Failed to save result" << std::endl;
+                        op_success = false;
+                    } else {
+                        if (send_back > 0)
+                            send_back_file(output_path, output_filename, result, send_back, "opencl");
+                        op_success = true;
+                    }
+                }
+
+                else {
+                    std::cerr << "❌ Unknown backend: " << backend_type << std::endl;
+                    op_success = false;
                 }
             }
-
-            // Allocate backend buffers for this graph. If allocation fails, return early.
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx, backend);  
-            if (!buf) {  
-                if (incremented_load && backend_index >= 0 && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {
-                    device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);
-                }
-                return {nullptr, {0,0,0,0}};  
-            }  
-                
-                // Calculate total elements for data transfer  
-            int64_t total_a = dims_a[0] * dims_a[1] * dims_a[2] * dims_a[3];  
-            int64_t total_b = dims_b[0] * dims_b[1] * dims_b[2] * dims_b[3];  
-                
-                // NOW copy data to tensors using backend functions  
-            ggml_backend_tensor_set(a, matrix_a, 0, sizeof(float) * total_a);  
-            ggml_backend_tensor_set(b, matrix_b, 0, sizeof(float) * total_b);  
-                
-                // Execute computation  
-            ggml_backend_graph_compute(backend, gf);  
-                
-                // Extract result data using backend function  
-            MatrixResult output;  
-            int64_t total_result = result->ne[0] * result->ne[1] * result->ne[2] * result->ne[3];  
-            output.data = std::make_unique<float[]>(total_result);  
-
-            
-            // CORRECT - Keep dimensions as-is  
-            output.dims[0] = result->ne[3]; // batch  
-            output.dims[1] = result->ne[2]; // depth    
-            output.dims[2] = result->ne[1]; // rows  
-            output.dims[3] = result->ne[0]; // cols
-
-                
-            ggml_backend_tensor_get(result, output.data.get(), 0, sizeof(float) * total_result);  
-            // so i can just change this to get the correct formaty>
-            //make it so the tensor matchs the torch format after the mul so c1=c2
-
-            // Cleanup
-            ggml_backend_buffer_free(buf);
-            if (incremented_load && backend_index >= 0 && backend_index < (int)device_load_ptrs.size() && device_load_ptrs[backend_index]) {
-                device_load_ptrs[backend_index]->fetch_sub(1, std::memory_order_relaxed);
+            catch (const std::exception& e) {
+                std::cerr << "❌ Exception: " << e.what() << std::endl;
+                op_success = false;
             }
-            if (device_lock.owns_lock()) device_lock.unlock();
 
-            stat_allocs.fetch_add(1, std::memory_order_relaxed);
-
-            return output;  
+            try { send_ack("ACK_matrixOp_complete"); } catch (...) {}
+            return op_success;
         }
+
+        // OLD FUNCTIONS REMOVED - Now using unified matrix_operation() for all backends
+        std::string get_matrix_output_filename(
+            const std::string& matrix_pathA,
+            const std::string& matrix_pathB
+        )
+        {
+            // Extract filenames only
+            std::string a_filename =
+                std::filesystem::path(matrix_pathA).filename().string();
+            std::string b_filename =
+                std::filesystem::path(matrix_pathB).filename().string();
+
+            // -------------------------------
+            // Remove ".bin" if present
+            // -------------------------------
+            auto strip_bin = [](std::string& name)
+            {
+                size_t pos = name.rfind(".bin");
+                if (pos != std::string::npos)
+                    name = name.substr(0, pos);
+            };
+
+            strip_bin(a_filename);
+            strip_bin(b_filename);
+
+            // -------------------------------
+            // Extract shard numbers
+            // -------------------------------
+            auto [matrix_nameA, shard_numA] =
+                get_matrix_name_and_shard_number(a_filename);
+            auto [matrix_nameB, shard_numB] =
+                get_matrix_name_and_shard_number(b_filename);
+
+            // -------------------------------
+            // Remove any lingering "_shard_X"
+            // -------------------------------
+            auto strip_shard = [](std::string& name)
+            {
+                size_t pos = name.find("_shard_");
+                if (pos != std::string::npos)
+                    name = name.substr(0, pos);
+            };
+
+            strip_shard(matrix_nameA);
+            strip_shard(matrix_nameB);
+
+            // -------------------------------
+            // Determine shard number
+            // -------------------------------
+            int shard_num = -1;
+            if (shard_numA != -1)
+                shard_num = shard_numA;
+            else if (shard_numB != -1)
+                shard_num = shard_numB;
+
+            // -------------------------------
+            // Build output filename
+            // -------------------------------
+            std::string output_filename =
+                matrix_nameA + "x" + matrix_nameB;
+
+            // If no shard number could be inferred, assign a sequential shard index per output base
+            if (shard_num == -1) {
+                std::lock_guard<std::mutex> lock(output_shard_mutex);
+                shard_num = output_shard_counters[output_filename]++;
+            }
+
+            if (shard_num != -1)
+                output_filename += "_shard_" + std::to_string(shard_num);
+
+            output_filename += ".bin";
+
+            return output_filename;
+        }
+
 };
 
-/*
-int main() 
+int main()
 {
-    std::cout << "Testing GGML matrix loading..." << std::endl;
-    
-    // 2D test files
-    const char* test_2d_a = "/dev/shm/matrix_shards/test_2d_a.bin";
-    const char* test_2d_b = "/dev/shm/matrix_shards/test_2d_b.bin";
-    
-    // 3D test files
-    const char* test_3d_a = "/dev/shm/matrix_shards/test_3d_a.bin";
-    const char* test_3d_b = "/dev/shm/matrix_shards/test_3d_b.bin";
-    
-    // 4D test files
-    const char* test_4d_a = "/dev/shm/matrix_shards/test_4d_a.bin";
-    const char* test_4d_b = "/dev/shm/matrix_shards/test_4d_b.bin";
-    
+    llama_zmq_server server;
+    server.run_server();
+}
+
+/*
+int main()
+{
+    const char* path_to_A = "/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/matrix_shards/test_2d_a.bin";
+    const char* path_to_B = "/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/matrix_shards/test_2d_a.bin";
+
+    llama_zmq_server server;
+    /*
+    // ==========================================
+    // Torch timing
+    // ==========================================
+    auto torch_start = std::chrono::high_resolution_clock::now();
+
+    server.matrix_operation_torch(
+        path_to_A,
+        false,          // transposeA
+        path_to_B,
+        true,           // transposeB
+        false,          // use_gpu
+        0,              // gpu_id
+        false,          // send_back
+        "mul"
+    );
+
+    auto torch_end = std::chrono::high_resolution_clock::now();
+    auto torch_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            torch_end - torch_start
+        ).count();
+
+    std::cout << "🔥 Torch took "
+              << torch_us << " µs ("
+              << torch_us / 1e6 << " s)\n";
+
+
+    // ==========================================
+    // GGML timing per backend
+    // ==========================================
+    for (int gpu_id = 0; gpu_id <= 2; gpu_id++) {
+
+        auto start = std::chrono::high_resolution_clock::now();
+
+        server.matrix_operation_llama(
+            path_to_A,
+            true,           // transposeA
+            path_to_B,
+            true,           // transposeB
+            true,           // use_gpu
+            gpu_id,         // gpu_id
+            false,          // send_back
+            "mul",
+            2               // dim
+        );
+
+        auto end = std::chrono::high_resolution_clock::now();
+        auto us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                end - start
+            ).count();
+
+        std::cout << "⚙️  GGML gpu_id " << gpu_id
+                  << " took " << us << " µs ("
+                  << us / 1e6 << " s)\n";
+    }
+
+}
+*/
+
+/*
+int main()
+{
+    const char* path_to_B_shard_1 = "/dev/shm/matrix_shards/test_2d_a_shard_1.bin";
+    const char* path_to_A        = "/dev/shm/matrix_shards/test_2d_a.bin";
+    const char* path_to_B        = "/dev/shm/matrix_shards/test_2d_a.bin";
+
     llama_matrix_backend server;
-    
-    // =========================================================================
-    // 2D MATRIX MULTIPLICATION TEST
-    // =========================================================================
-    //std::cout << "\n" << "="*60 << std::endl;
-    std::cout << "2D MATRIX MULTIPLICATION TEST" << std::endl;
-    //std::cout << "="*60 << std::endl;
-    
     {
         std::unique_ptr<float[]> matrix_A = nullptr;
         std::unique_ptr<float[]> matrix_B = nullptr;
-        int rows_A, cols_A, rows_B, cols_B, depthA=0, batchA=0, depthB=0, batchB=0;  
-        
-        matrix_A = server.load_matrix_bin(test_2d_a, rows_A, cols_A, batchA, depthA);   
-        matrix_B = server.load_matrix_bin(test_2d_b, rows_B, cols_B, batchB, depthB);  
-        
-        if (!matrix_A || !matrix_B) {
-            std::cerr << "Failed to load 2D matrices" << std::endl;
-        } else {
-            // Transpose B for GGML convention
-            auto matrix_B_T = server.transpose_2d(matrix_B.get(), rows_B, cols_B);
-            int rows_B_T = cols_B;
-            int cols_B_T = rows_B;
-            
-            std::cout << "Original A: " << rows_A << "x" << cols_A << std::endl;
-            std::cout << "Original B: " << rows_B << "x" << cols_B << std::endl;
-            std::cout << "Transposed B: " << rows_B_T << "x" << cols_B_T << std::endl;
-            
-            int dims2d_a[4] = {cols_A, rows_A, 1, 1};
-            int dims2d_b_T[4] = {rows_B, cols_B, 1, 1};
-            
-            std::cout << "\nMatrix A:" << std::endl;
-            server.print_matrix(matrix_A.get(), dims2d_a, 20);
-            std::cout << "Matrix B (transposed):" << std::endl;
-            server.print_matrix(matrix_B_T.get(), dims2d_b_T, 15);
-            
-            llama_matrix_backend::MatrixResult result = server.matrix_op_nd(
-                matrix_A.get(), dims2d_a, 
-                matrix_B_T.get(), dims2d_b_T, 
+        std::unique_ptr<float[]> matrix_B_shard_1 = nullptr;
+
+        int rows_A, cols_A;
+        int rows_B, cols_B;
+        int rows_B_shard_1, cols_B_shard_1;
+
+        int depthA = 0, batchA = 0;
+        int depthB = 0, batchB = 0;
+        int depthB_s = 0, batchB_s = 0;
+
+        matrix_A = load_matrix_bin(path_to_A, rows_A, cols_A, batchA, depthA);
+        matrix_B = load_matrix_bin(path_to_B, rows_B, cols_B, batchB, depthB);
+        matrix_B_shard_1 = load_matrix_bin(
+            path_to_B_shard_1,
+            rows_B_shard_1, cols_B_shard_1,
+            batchB_s, depthB_s
+        );
+
+        // GGML dims: [cols, rows, depth, batch]
+        int dims2d_a[4] = { cols_A, rows_A, 1, 1 };
+        int dims2d_b[4] = { cols_B, rows_B, 1, 1 };
+        int dims2d_b_shard_1[4] = { cols_B_shard_1, rows_B_shard_1, 1, 1 };
+
+        std::cout << "Original A: " << rows_A << "x" << cols_A << std::endl;
+        std::cout << "Original B (full): " << rows_B << "x" << cols_B << std::endl;
+        std::cout << "Original B (shard_1): " << rows_B_shard_1 << "x" << cols_B_shard_1 << std::endl;
+
+        //print_bin_from_torch("/dev/shm/matrix_shards/test_2d_a_shard_1.bin",10,10);
+        //print_bin_from_torch("/dev/shm/matrix_shards/test_2d_a.bin",10,10);
+
+
+
+        // ---- A @ B (shard_1) ----
+        {
+            MatrixResult r = server.matrix_op_nd(
+                matrix_A.get(), dims2d_a,
+                matrix_B_shard_1.get(), dims2d_b_shard_1,
                 server.ggml_backends[0], "mul"
             );
-            
-            std::cout << "2D Result (A @ B):" << std::endl;
-            server.print_matrix(result.data.get(), result.dims, 12);
+            save_matrix_bin("/dev/shm/matrix_shards/shard_AB_out.bin",r);
+            torch::Tensor shard_AB = load_matrix_bin_as_torch_view("/dev/shm/matrix_shards/shard_AB_out.bin");
+            std::cout << "\nSHARD A@B flat:\n";
+            print_tensor_start_flat(shard_AB, "fuck" ,40);
         }
+        
     }
-    
-    // =========================================================================
-    // 3D MATRIX MULTIPLICATION TEST
-    // =========================================================================
-    //std::cout << "\n" << "="*60 << std::endl;
-    std::cout << "3D MATRIX MULTIPLICATION TEST" << std::endl;
-    //std::cout << "="*60 << std::endl;
-    
-    {
-        std::unique_ptr<float[]> matrix_A = nullptr;
-        std::unique_ptr<float[]> matrix_B = nullptr;
-        int rows_A, cols_A, rows_B, cols_B, depthA=0, batchA=0, depthB=0, batchB=0;  
-        
-        matrix_A = server.load_matrix_bin(test_3d_a, rows_A, cols_A, batchA, depthA);   
-        matrix_B = server.load_matrix_bin(test_3d_b, rows_B, cols_B, batchB, depthB);  
-        
-        if (!matrix_A || !matrix_B) {
-            std::cerr << "Failed to load 3D matrices" << std::endl;
-        } else {
-            std::cout << "Original A: batch=" << batchA << ", rows=" << rows_A << ", cols=" << cols_A << std::endl;
-            std::cout << "Original B: batch=" << batchB << ", rows=" << rows_B << ", cols=" << cols_B << std::endl;
-            
-            // Transpose each batch in B for GGML convention
-            auto matrix_B_T = server.transpose_3d(matrix_B.get(), batchB, rows_B, cols_B);
-            
-            // For GGML: dims = [cols, rows, 1, batch]
-            int dims3d_a[4] = {cols_A, rows_A, 1, batchA};
-            int dims3d_b_T[4] = {rows_B, cols_B, 1, batchB};  // B is transposed
-            
-            std::cout << "\nMatrix A (first batch):" << std::endl;
-            server.print_matrix(matrix_A.get(), dims3d_a, 6);
-            std::cout << "Matrix B transposed (first batch):" << std::endl;
-            server.print_matrix(matrix_B_T.get(), dims3d_b_T, 6);
-            
-            llama_matrix_backend::MatrixResult result = server.matrix_op_nd(
-                matrix_A.get(), dims3d_a, 
-                matrix_B_T.get(), dims3d_b_T, 
-                server.ggml_backends[0], "mul"
-            );
-            
-            std::cout << "3D Result (batch matmul):" << std::endl;
-            server.print_matrix(result.data.get(), result.dims, std::min(12, result.dims[0]*result.dims[1]*result.dims[2]*result.dims[3]));
-        }
-    }
-    
-    // =========================================================================
-    // 4D MATRIX MULTIPLICATION TEST
-    // =========================================================================
-    //std::cout << "\n" << "="*60 << std::endl;
-    std::cout << "4D MATRIX MULTIPLICATION TEST" << std::endl;
-    //std::cout << "="*60 << std::endl;
-    
-    {
-        std::unique_ptr<float[]> matrix_A = nullptr;
-        std::unique_ptr<float[]> matrix_B = nullptr;
-        int rows_A, cols_A, rows_B, cols_B, depthA=0, batchA=0, depthB=0, batchB=0;  
-        
-        matrix_A = server.load_matrix_bin(test_4d_a, rows_A, cols_A, batchA, depthA);   
-        matrix_B = server.load_matrix_bin(test_4d_b, rows_B, cols_B, batchB, depthB);  
-        
-        if (!matrix_A || !matrix_B) {
-            std::cerr << "Failed to load 4D matrices" << std::endl;
-        } else {
-            std::cout << "Original A: batch=" << batchA << ", depth=" << depthA 
-                      << ", rows=" << rows_A << ", cols=" << cols_A << std::endl;
-            std::cout << "Original B: batch=" << batchB << ", depth=" << depthB 
-                      << ", rows=" << rows_B << ", cols=" << cols_B << std::endl;
-            
-            // Transpose each 2D slice in B for GGML convention
-            auto matrix_B_T = server.transpose_4d(matrix_B.get(), batchB, depthB, rows_B, cols_B);
-            
-            // For GGML: dims = [cols, rows, depth, batch]
-            int dims4d_a[4] = {cols_A, rows_A, depthA, batchA};
-            int dims4d_b_T[4] = {rows_B, cols_B, depthB, batchB};  // B is transposed
-            
-            std::cout << "\nMatrix A (first batch, first depth):" << std::endl;
-            server.print_matrix(matrix_A.get(), dims4d_a, 4);
-            std::cout << "Matrix B transposed (first batch, first depth):" << std::endl;
-            server.print_matrix(matrix_B_T.get(), dims4d_b_T, 4);
-            
-            llama_matrix_backend::MatrixResult result = server.matrix_op_nd(
-                matrix_A.get(), dims4d_a, 
-                matrix_B_T.get(), dims4d_b_T, 
-                server.ggml_backends[2], "mul"
-            );
-            
-            std::cout << "4D Result (batch of batch matmul):" << std::endl;
-            server.print_matrix(result.data.get(), result.dims, std::min(8, result.dims[0]*result.dims[1]*result.dims[2]*result.dims[3]));
-        }
-    }
-    
-    //std::cout << "\n" << "="*60 << std::endl;
-    std::cout << "ALL TESTS COMPLETED" << std::endl;
-    //std::cout << "="*60 << std::endl;
-    
+
     return 0;
 }
 */
