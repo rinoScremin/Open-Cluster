@@ -342,13 +342,4 @@ This is **real distributed systems work**, not a toy wrapper.
 
 ---
 
-If you want next:
-
-* 🔥 A **minimal quick-start section**
-* 📊 A **performance comparison**
-* 🧠 A **LLM-specific flow diagram**
-* 📦 A **Ray-based execution mode**
-
-Just say the word.
-
 
