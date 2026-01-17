@@ -68,6 +68,8 @@ class cluster_matrix:
                 node_IP_list, CPU_GPU_select_list, node_percentages=[], back_end_select_list=[],
                 split_matrix=False, dim=0 , matrix_name='', matrix_labeling='', auto_set_up=[]):
         
+        if matrix_labeling != '' and len(node_percentages) == 0:
+            node_percentages = [0] * len(node_IP_list)
         
         print("=" * 70)
         print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
@@ -335,7 +337,7 @@ class cluster_matrix:
                 self.convert_to_cluster_matrix_grid()
                 self.save_distribute_matrix_shards_bin()
             if auto_set_up[0] == 2 and auto_set_up[1] == 'load' and self.matrix_labeling == 'b':
-                self.load_cluster_matrix_shards()   
+                self.load_cluster_matrixB_grid()   
                      
     def send_ack_confirmation(self, ack_msg="ACK"):    
         """    
@@ -1386,6 +1388,52 @@ class cluster_matrix:
         """
                 
         print(f"\n📥 Loading Matrix A grid shards from disk to RAM")
+
+        # System 2 sizing: expand the provided compute slots to the derived op_slots so that
+        # `cluster_shard_operation` runs the correct number of grid operations (8 for up to 8
+        # compute slots, then 12/16/...).
+        if not hasattr(self, "_sys2_original_slot_lists"):
+            self._sys2_original_slot_lists = {
+                "node_IP_list": list(self.node_IP_list),
+                "CPU_GPU_select_list": list(self.CPU_GPU_select_list),
+                "back_end_select_list": list(self.back_end_select_list),
+                "node_percentages": list(self.node_percentages),
+            }
+
+        original_node_IP_list = self._sys2_original_slot_lists["node_IP_list"]
+        original_cpu_gpu = self._sys2_original_slot_lists["CPU_GPU_select_list"]
+        original_backend = self._sys2_original_slot_lists["back_end_select_list"]
+        original_percentages = self._sys2_original_slot_lists["node_percentages"]
+
+        compute_slots = len(original_node_IP_list)
+        if compute_slots < 1:
+            raise ValueError("System 2 requires at least 1 slot")
+
+        base_slots = max(4, 2 * math.ceil(compute_slots / 4))
+        op_slots = base_slots * 2
+
+        def _cycle_to_length(items, n):
+            if not items:
+                raise ValueError("System 2 slot lists must be non-empty")
+            return [items[i % len(items)] for i in range(n)]
+
+        self.node_IP_list = _cycle_to_length(original_node_IP_list, op_slots)
+        self.CPU_GPU_select_list = _cycle_to_length(original_cpu_gpu, op_slots)
+        self.back_end_select_list = _cycle_to_length(original_backend, op_slots)
+        self.node_percentages = (
+            _cycle_to_length(original_percentages, op_slots)
+            if original_percentages
+            else [0.0] * op_slots
+        )
+        self._sys2_round_robin_expanded = True
+        self._sys2_compute_slots = compute_slots
+        self._sys2_base_slots = base_slots
+        self._sys2_op_slots = op_slots
+
+        print(
+            f"   System 2 slots: compute_slots={compute_slots}, "
+            f"base_slots={base_slots}, op_slots={op_slots}"
+        )
         
         # Initialize the file paths list
         self.matrix_file_paths_list = []
@@ -1482,6 +1530,121 @@ class cluster_matrix:
         
         return True
 
+    def load_cluster_matrixB_grid(self):
+        """
+        System 2 (grid) Matrix B loader.
+
+        Loads the required B shards from local disk into RAM and prepares
+        `matrix_file_paths_list` for `cluster_shard_operation` using the same
+        op-slot sizing rule as `convert_to_cluster_matrix_grid`.
+
+        This is System 2 only and does not change System 1 behavior.
+        """
+        if self.matrix_labeling != 'b':
+            raise ValueError(
+                "load_cluster_matrixB_grid is only valid for System 2 Matrix B "
+                "(matrix_labeling='b')."
+            )
+
+        print(f"\n📥 Loading Matrix B grid shards from disk to RAM")
+
+        # Preserve the original (unexpanded) slot lists so sizing is stable across calls.
+        if not hasattr(self, "_sys2_original_slot_lists"):
+            self._sys2_original_slot_lists = {
+                "node_IP_list": list(self.node_IP_list),
+                "CPU_GPU_select_list": list(self.CPU_GPU_select_list),
+                "back_end_select_list": list(self.back_end_select_list),
+                "node_percentages": list(self.node_percentages),
+            }
+
+        original_node_IP_list = self._sys2_original_slot_lists["node_IP_list"]
+        original_cpu_gpu = self._sys2_original_slot_lists["CPU_GPU_select_list"]
+        original_backend = self._sys2_original_slot_lists["back_end_select_list"]
+        original_percentages = self._sys2_original_slot_lists["node_percentages"]
+
+        compute_slots = len(original_node_IP_list)
+        if compute_slots < 1:
+            raise ValueError("System 2 requires at least 1 slot")
+
+        base_slots = max(4, 2 * math.ceil(compute_slots / 4))
+        op_slots = base_slots * 2
+
+        def _cycle_to_length(items, n):
+            if not items:
+                raise ValueError("System 2 slot lists must be non-empty")
+            return [items[i % len(items)] for i in range(n)]
+
+        # Expand compute slots to exactly op_slots (wrap-around).
+        self.node_IP_list = _cycle_to_length(original_node_IP_list, op_slots)
+        self.CPU_GPU_select_list = _cycle_to_length(original_cpu_gpu, op_slots)
+        self.back_end_select_list = _cycle_to_length(original_backend, op_slots)
+        self.node_percentages = (
+            _cycle_to_length(original_percentages, op_slots)
+            if original_percentages
+            else [0.0] * op_slots
+        )
+
+        self._sys2_round_robin_expanded = True
+        self._sys2_compute_slots = compute_slots
+        self._sys2_base_slots = base_slots
+        self._sys2_op_slots = op_slots
+
+        print(
+            f"   System 2 slots: compute_slots={compute_slots}, "
+            f"base_slots={base_slots}, op_slots={op_slots}"
+        )
+
+        # Initialize the file paths list (must be length op_slots).
+        self.matrix_file_paths_list = []
+
+        # In System 2, Matrix B shard files are saved per *operation slot* index
+        # (e.g. ..._shard_0.bin .. ..._shard_{op_slots-1}.bin) on the node that executed that
+        # slot during the save path. During load we:
+        # - copy local-slot shards from local disk -> local RAM
+        # - instruct remote nodes to copy their shard from remote disk -> remote RAM
+        processed_remote_pairs = set()  # (node_ip, op_index)
+        ok = True
+
+        for op_index, node_IP in enumerate(self.node_IP_list):
+            shard_filename = f"{self.matrix_name}_shard_{op_index}.bin"
+
+            local_disk_path = os.path.join(
+                self.local_project_dir, self.local_DISK_folder, shard_filename
+            )
+            local_ram_path = os.path.join(self.local_RAM_folder, shard_filename)
+            remote_disk_path = os.path.join(self.remote_DISK_folder, shard_filename)
+            remote_ram_path = os.path.join(self.remote_RAM_folder, shard_filename)
+
+            # Track per-slot RAM path (must align with the slot's node assignment).
+            if node_IP == self.IP:
+                self.matrix_file_paths_list.append(local_ram_path)
+            else:
+                self.matrix_file_paths_list.append(remote_ram_path)
+
+            if node_IP == self.IP:
+                if not os.path.exists(local_ram_path):
+                    if not os.path.exists(local_disk_path):
+                        print(f"❌ Error: local shard not found at: {local_disk_path}")
+                        ok = False
+                        continue
+                    copy_cmd = f'cp "{local_disk_path}" "{local_ram_path}"'
+                    subprocess.run(copy_cmd, shell=True, check=True)
+            else:
+                if (node_IP, op_index) in processed_remote_pairs:
+                    continue
+                remote_copy_command = (
+                    f'cp "{self.remote_project_dir}{remote_disk_path}" '
+                    f'"{remote_ram_path}"'
+                )
+                self.zmq_send_command(node_IP, remote_copy_command)
+                processed_remote_pairs.add((node_IP, op_index))
+
+        print(f"\n✅ Matrix B grid loading complete")
+        print(f"   File paths tracked: {len(self.matrix_file_paths_list)}")
+        if not ok:
+            print("⚠️  One or more local shards were missing; regenerate with auto_set_up=[2,'save'].")
+        return ok
+
     def cluster_shard_operation(self, cluster_matrixB, TransposeA=False, TransposeB=False, send_back_result=True, operation='mul'):
         """
         Perform a distributed matrix operation across the cluster.
@@ -1507,14 +1670,12 @@ class cluster_matrix:
         print(f"Transpose A: {TransposeA}, Transpose B: {TransposeB}")
         print(f"Send back result: {send_back_result}")
         print(f"Number of shards: {len(self.node_IP_list)}")
-        start_time = time.time()
         
         # ===== TRACK GPU USAGE PER NODE =====
         # This ensures multiple GPUs on the same node get used properly
         node_gpu_counters = {}
         
         print(f"\n📤 DISTRIBUTING OPERATIONS TO NODES")
-        print(f"{'-'*40}")
         
         # Send operation commands to each node for its assigned shard
         for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix) in enumerate(zip(
@@ -1604,12 +1765,8 @@ class cluster_matrix:
         expected_acks = len(self.node_IP_list)  # one ACK per shard/operation
         print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
         self.wait_for_acks(expected_acks, "ACK_matrixOp_complete")
-        #self.send_ack_confirmation("ACK_can_receive")
         # ===== OPERATION COMPLETE =====
-        print(f"\n{'='*60}")
         print(f"✅ CLUSTER OPERATION COMPLETE")
-        print(f"{'='*60}")
-        print(f"Operation time: {time.time() - start_time:.2f} seconds")
 
         # When keep-distributed, return a cluster_matrix wired to the shard outputs
         # ===== SETUP RESULT FILENAMES =====
