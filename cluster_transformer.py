@@ -712,20 +712,26 @@ class cluster_llm_transformer:
 
     def run_transformer(
         self,
-        prompt: str = "Hello!",
+        prompt: str,
         *,
         max_new_tokens: int = 16,
         use_chat_template: bool = False,
         temperature: float = 0.0,
         top_k: int = 0,
+        print_output: bool = True,
     ) -> str:
-        return self.generate_text(
+        out = self.generate_text(
             prompt,
             max_new_tokens=max_new_tokens,
             use_chat_template=use_chat_template,
             temperature=temperature,
             top_k=top_k,
         )
+        if print_output:
+            print("\n=== model output ===\n")
+            print(out)
+            print("\n====================\n")
+        return out
 
     def generate_text(
         self,
@@ -1029,6 +1035,5 @@ if __name__ == "__main__":
     #test.save_distribute_model_matrices()
 
     # Example:
-    out = test.run_transformer()
-    print(out)
+    test.run_transformer('tell me a joke', max_new_tokens=20)
      
