@@ -324,6 +324,18 @@ class cluster_matrix:
                 self.save_distribute_matrix_shards_bin()
             if auto_set_up[0] == 1 and auto_set_up[1] == 'load' and self.split_matrix:
                 self.load_cluster_matrix_shards()    
+
+            if auto_set_up[0] == 2 and auto_set_up[1] == 'save' and self.matrix_labeling == 'a':
+                self.convert_to_cluster_matrix_grid()
+                self.save_distribute_matrixA_grid_bin()
+            if auto_set_up[0] == 2 and auto_set_up[1] == 'load' and self.matrix_labeling == 'a':
+                self.load_cluster_matrixA_grid()
+
+            if auto_set_up[0] == 2 and auto_set_up[1] == 'save' and self.matrix_labeling == 'b':
+                self.convert_to_cluster_matrix_grid()
+                self.save_distribute_matrix_shards_bin()
+            if auto_set_up[0] == 2 and auto_set_up[1] == 'load' and self.matrix_labeling == 'b':
+                self.load_cluster_matrix_shards()   
                      
     def send_ack_confirmation(self, ack_msg="ACK"):    
         """    
@@ -500,103 +512,84 @@ class cluster_matrix:
 
     def convert_to_cluster_matrix_grid(self):
         """
-        Split matrix according to System 2 pattern using self.dim.
-        Matrix A (label='a'): should use dim=1 (split by columns)
-        Matrix B (label='b'): should use dim=0 (split by rows)
-        """
-        full_matrix = torch.load(self.matrix_file_path)
-        self.OG_matrix_shape = list(full_matrix.shape)
-        
-        split_dim = self.dim  # Always use self.dim
-        
-        if self.matrix_labeling == 'a':  # Matrix A
-            # For System 2: Matrix A should be split into 2 equal parts
-            dim_size = full_matrix.size(split_dim)
-            split_size = dim_size // 2
-            
-            # Use torch.split to get the 2 shards
-            shards = torch.split(full_matrix, split_size, dim=split_dim)
-            
-            # torch.split returns a tuple, convert to list
-            self.node_matrices = list(shards)
-            
-            print(f"✅ Matrix A: {full_matrix.shape} → [{shards[0].shape}, {shards[1].shape}] (split along dim={split_dim})")
+        System 2 (round-robin / block-tiling):
 
-        elif self.matrix_labeling == 'b':  # Matrix B for GEMM
-            # Get total size along the specified dimension
-            dim_size = full_matrix.size(split_dim)
-            total_nodes = len(self.node_IP_list)
-            unique_B_shards = total_nodes // 2
-            
-            # Validate we have enough nodes
-            if total_nodes < 2:
-                raise ValueError(f"System 2 requires at least 2 nodes, got {total_nodes}")
-            if total_nodes % 2 != 0:
-                raise ValueError(f"System 2 requires even number of nodes, got {total_nodes}")
-            
-            # Use sys2_split_percentages if provided
-            if hasattr(self, 'sys2_split_percentages') and self.sys2_split_percentages is not None:
-                # Validate percentages
-                if len(self.sys2_split_percentages) != unique_B_shards:
-                    raise ValueError(
-                        f"sys2_split_percentages must have length {unique_B_shards} "
-                        f"(total_nodes//2), got {len(self.sys2_split_percentages)}"
-                    )
-                
-                if abs(sum(self.sys2_split_percentages) - 1.0) > 0.01:
-                    raise ValueError(
-                        f"sys2_split_percentages must sum to 1.0, got {sum(self.sys2_split_percentages)}"
-                    )
-                
-                print(f"✅ Matrix B: {full_matrix.shape} → splitting into {unique_B_shards} shards using percentages {self.sys2_split_percentages}")
-                
-                # Calculate split sizes based on percentages
-                split_sizes = []
-                
-                for i in range(unique_B_shards - 1):
-                    size = int(dim_size * self.sys2_split_percentages[i])
-                    split_sizes.append(size)
-                
-                # Last shard gets remaining rows
-                allocated = sum(split_sizes)
-                last_size = dim_size - allocated
-                split_sizes.append(last_size)
-                
-                # Validate sizes
-                if sum(split_sizes) != dim_size:
-                    split_sizes[-1] = dim_size - sum(split_sizes[:-1])
-                
-            else:
-                # Default: equal split
-                print(f"✅ Matrix B: {full_matrix.shape} → splitting into {unique_B_shards} equal shards")
-                
-                base_chunk_size = dim_size // unique_B_shards
-                remainder = dim_size % unique_B_shards
-                
-                split_sizes = [base_chunk_size] * unique_B_shards
-                for i in range(remainder):
-                    split_sizes[i] += 1
-            
-            print(f"Split sizes for {unique_B_shards} unique shards along dim={split_dim}: {split_sizes}")
-            print(f"Sum check: {sum(split_sizes)} = {dim_size} {'✓' if sum(split_sizes) == dim_size else '✗'}")
-            
-            # Split B into unique shards along the specified dimension
-            B_unique_chunks = torch.split(full_matrix, split_sizes, dim=split_dim)
-            
-            # Create base repeating pattern
-            base_pattern = []
-            for i in range(total_nodes):
-                shard_index = i % unique_B_shards
-                base_pattern.append(B_unique_chunks[shard_index])
-            
-            self.node_matrices = base_pattern
-            
-            print(f"✅ Created {total_nodes} B shards (before reordering):")
-            for i, chunk in enumerate(self.node_matrices):
-                shard_num = i % unique_B_shards
-                print(f"  Node {i} (original): gets B{shard_num} {chunk.shape}")
-        
-        return self.node_matrices
+        - Matrix A (matrix_labeling='a'): split into 2 shards along `self.dim`.
+          These two shards are broadcast by `save_distribute_matrixA_grid_bin` across the
+          operation slots (first half gets shard_0, second half gets shard_1).
+
+        - Matrix B (matrix_labeling='b'): split into `base_slots` shards along `self.dim`,
+          then repeat that list twice so the shard list length equals `op_slots = base_slots * 2`.
+
+        This enables `op_slots` independent GEMMs where:
+          shard_i uses A_shard = (i < base_slots ? A0 : A1)
+          shard_i uses B_shard = B_{i % base_slots}
+
+        NOTE: We expand the node slot lists (node_IP_list, CPU/GPU, backend, percentages) to
+        `op_slots` so `cluster_shard_operation` can dispatch all blocks in one call.
+        """
+        if torch.is_tensor(self.matrix_file_path):
+            full_matrix = self.matrix_file_path
+        else:
+            full_matrix = torch.load(self.matrix_file_path, map_location="cpu")
+
+        self.OG_matrix_shape = list(full_matrix.shape)
+        split_dim = int(self.dim)
+
+        base_slots = len(self.node_IP_list)
+        if base_slots < 1:
+            raise ValueError("System 2 requires at least 1 slot")
+        op_slots = base_slots * 2
+
+        # Expand slot lists so `cluster_shard_operation` can dispatch `op_slots` blocks.
+        if getattr(self, "_sys2_round_robin_expanded", False) is False:
+            self.node_IP_list = list(self.node_IP_list) * 2
+            self.CPU_GPU_select_list = list(self.CPU_GPU_select_list) * 2
+            self.back_end_select_list = list(self.back_end_select_list) * 2
+            self.node_percentages = list(self.node_percentages) * 2
+            self._sys2_round_robin_expanded = True
+
+        if self.matrix_labeling == 'a':
+            # A: split into 2 shards along split_dim (views, no copy).
+            dim_size = int(full_matrix.size(split_dim))
+            s0 = dim_size // 2
+            s1 = dim_size - s0
+            self.node_matrices = [
+                full_matrix.narrow(split_dim, 0, s0),
+                full_matrix.narrow(split_dim, s0, s1),
+            ]
+            print(
+                f"✅ Matrix A: {tuple(full_matrix.shape)} → "
+                f"[{tuple(self.node_matrices[0].shape)}, {tuple(self.node_matrices[1].shape)}] "
+                f"(split along dim={split_dim})"
+            )
+            return self.node_matrices
+
+        if self.matrix_labeling == 'b':
+            # B: split into `base_slots` shards along split_dim, then repeat twice to match `op_slots`.
+            dim_size = int(full_matrix.size(split_dim))
+            if dim_size < base_slots:
+                raise ValueError(f"Cannot split size {dim_size} into {base_slots} non-empty shards")
+
+            base = dim_size // base_slots
+            rem = dim_size % base_slots
+            sizes = [base + (1 if i < rem else 0) for i in range(base_slots)]
+
+            chunks: list[torch.Tensor] = []
+            start = 0
+            for sz in sizes:
+                chunks.append(full_matrix.narrow(split_dim, start, sz))
+                start += sz
+
+            # Order: B0..B{n-1}, then B0..B{n-1}
+            self.node_matrices = chunks + chunks
+            print(
+                f"✅ Matrix B: {tuple(full_matrix.shape)} → {op_slots} shards "
+                f"(split {base_slots} then repeat; split along dim={split_dim})"
+            )
+            return self.node_matrices
+
+        raise ValueError(f"Unknown matrix_labeling={self.matrix_labeling!r} for System 2 grid")
 
     def convert_to_cluster_matrix_shards(self):
 
