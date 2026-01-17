@@ -1,5 +1,3 @@
-SYSTEM 1 IS WORKING WITH TRANFORMER GIVING THE CORRECT SHAPE AND DATA MAKING SOME CHANGES TO SYSTEM2 CODE IS NOW BACK UNDER CONSTRUCTION 
-
 # 🚀 **The Vision: Democratizing AI Compute**
 
 **We built this because we were tired of seeing perfectly good hardware collecting dust.** The AI revolution shouldn't require $10,000 GPUs and HPC expertise. **This system proves you can run massive models on whatever hardware you already have** - gaming PCs, old laptops, office workstations, even integrated graphics.
