@@ -55,9 +55,9 @@ A **hybrid distributed computing system** that turns ANY group of computers into
 
 ---
 
-# USING `cluster_matrix_v1`
+# USING `cluster_matrix_v1 system #1`
 
-This document demonstrates how to use `cluster_matrix_v1` for **distributed matrix operations** across multiple machines, GPUs, and backends, including **LLM inference workloads** (e.g. attention + MLP layers).
+This document demonstrates how to use `cluster_matrix_v1` system #1 for **distributed matrix operations** across multiple machines, GPUs, and backends, including **LLM inference workloads** (e.g. attention + MLP layers).
 
 ---
 
