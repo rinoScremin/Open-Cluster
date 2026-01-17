@@ -320,7 +320,7 @@ big_new_matrixA = cluster_matrix(
     backend_select_list,
     split_matrix=True,
     dim=0,
-    auto_set_up=[1, "load"],
+    auto_set_up=[1, "save"],
 )
 
 big_new_matrixB = cluster_matrix(
@@ -331,7 +331,7 @@ big_new_matrixB = cluster_matrix(
     backend_select_list,
     split_matrix=True,
     dim=0,
-    auto_set_up=[1, "load"],
+    auto_set_up=[1, "save"],
 )
 
 # Perform distributed matrix addition
@@ -346,5 +346,52 @@ big_new_matrixC = big_new_matrixA.cluster_shard_operation(
 # For matrix addition, both Matrix A and Matrix B must be split.
 # The operation is performed as:
 #   matrixA_shard_i + matrixB_shard_i = matrixC_shard_i
+
+
+# You can also use `cluster_matrix` on a single PC with a single GPU.
+#
+# This is useful if:
+# - You do not have CUDA
+# - You only have one GPU
+# - The GPU supports Vulkan / Metal / OpenCL (via the GGML backend)
+
+big_new_matrixA = cluster_matrix(
+    matrix_file_path=big_test_matrix_pathA_T,
+    node_IP_list="192.168.2.100",
+    CPU_GPU_select_list=True,
+    node_percentages=[1],
+    back_end_select_list=["llama"],
+    split_matrix=False,  # Single-matrix operation; do not split
+    dim=0,
+    auto_set_up=[1, "save"],
+)
+
+big_new_matrixB = cluster_matrix(
+    matrix_file_path=big_test_matrix_pathA_T,
+    node_IP_list="192.168.2.100",
+    CPU_GPU_select_list=True,
+    node_percentages=[1],
+    back_end_select_list=["llama"],
+    split_matrix=False,  # Single-matrix operation; do not split
+    dim=0,
+    auto_set_up=[1, "save"],
+)
+
+# Perform matrix addition
+big_new_matrixC = big_new_matrixA.cluster_shard_operation(
+    big_new_matrixB,
+    False,
+    True,
+    False,  # No combine step and no send-back required
+)
+
+# Convert the result back into a PyTorch tensor
+#
+# After the operation completes, the result is stored as a binary file
+# in `/dev/shm/matrix_shards/`. in .bin format 
+#
+# Use `convert_bin_matrix_to_pt()` to convert the result back into a
+# PyTorch tensor so it can be used with normal PyTorch workflows.
+big_new_matrixC.convert_bin_matrix_to_pt("path/to/output_file.bin")
 
 
