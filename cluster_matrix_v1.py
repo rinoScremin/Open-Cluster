@@ -514,7 +514,7 @@ class cluster_matrix:
         """
         System 2 (round-robin / block-tiling):
 
-        - Matrix A (matrix_labeling='a'): split into 2 shards along `self.dim`.
+        - Matrix A (matrix_labeling='a'): split into 2 shards along `self.dim` (50/50).
           These two shards are broadcast by `save_distribute_matrixA_grid_bin` across the
           operation slots (first half gets shard_0, second half gets shard_1).
 
@@ -525,8 +525,13 @@ class cluster_matrix:
           shard_i uses A_shard = (i < base_slots ? A0 : A1)
           shard_i uses B_shard = B_{i % base_slots}
 
-        NOTE: We expand the node slot lists (node_IP_list, CPU/GPU, backend, percentages) to
-        `op_slots` so `cluster_shard_operation` can dispatch all blocks in one call.
+        Slot sizing rule (requested):
+        - Treat the passed-in lists as "compute slots" (may contain repeated IPs).
+        - Keep `op_slots` at 8 (base_slots=4) until compute slots exceed 8.
+        - When compute slots exceed 8, grow `op_slots` in steps of 4: 8, 12, 16, ...
+
+        NOTE: In System 2 we ignore `node_percentages` for B chunk sizing and do an even split.
+        We still expand `node_percentages` to match `op_slots` to keep list lengths consistent.
         """
         if torch.is_tensor(self.matrix_file_path):
             full_matrix = self.matrix_file_path
@@ -536,18 +541,45 @@ class cluster_matrix:
         self.OG_matrix_shape = list(full_matrix.shape)
         split_dim = int(self.dim)
 
-        base_slots = len(self.node_IP_list)
-        if base_slots < 1:
+        # Preserve the original (unexpanded) slot lists so this function is idempotent.
+        if not hasattr(self, "_sys2_original_slot_lists"):
+            self._sys2_original_slot_lists = {
+                "node_IP_list": list(self.node_IP_list),
+                "CPU_GPU_select_list": list(self.CPU_GPU_select_list),
+                "back_end_select_list": list(self.back_end_select_list),
+                "node_percentages": list(self.node_percentages),
+            }
+
+        original_node_IP_list = self._sys2_original_slot_lists["node_IP_list"]
+        original_cpu_gpu = self._sys2_original_slot_lists["CPU_GPU_select_list"]
+        original_backend = self._sys2_original_slot_lists["back_end_select_list"]
+        original_percentages = self._sys2_original_slot_lists["node_percentages"]
+
+        compute_slots = len(original_node_IP_list)
+        if compute_slots < 1:
             raise ValueError("System 2 requires at least 1 slot")
+
+        # Determine the grid width (base_slots) from the compute slots. This keeps the math and
+        # server-side behavior identical to the 4-slot case (8 ops) for up to 8 compute slots.
+        base_slots = max(4, 2 * math.ceil(compute_slots / 4))
         op_slots = base_slots * 2
 
-        # Expand slot lists so `cluster_shard_operation` can dispatch `op_slots` blocks.
-        if getattr(self, "_sys2_round_robin_expanded", False) is False:
-            self.node_IP_list = list(self.node_IP_list) * 2
-            self.CPU_GPU_select_list = list(self.CPU_GPU_select_list) * 2
-            self.back_end_select_list = list(self.back_end_select_list) * 2
-            self.node_percentages = list(self.node_percentages) * 2
-            self._sys2_round_robin_expanded = True
+        def _cycle_to_length(items, n):
+            if not items:
+                raise ValueError("System 2 slot lists must be non-empty")
+            return [items[i % len(items)] for i in range(n)]
+
+        # Expand slot lists so `cluster_shard_operation` can dispatch exactly `op_slots` blocks.
+        # This is round-robin "wrap-around" over the provided compute slots.
+        self.node_IP_list = _cycle_to_length(original_node_IP_list, op_slots)
+        self.CPU_GPU_select_list = _cycle_to_length(original_cpu_gpu, op_slots)
+        self.back_end_select_list = _cycle_to_length(original_backend, op_slots)
+        self.node_percentages = _cycle_to_length(original_percentages, op_slots) if original_percentages else [0.0] * op_slots
+        self._sys2_round_robin_expanded = True
+
+        self._sys2_compute_slots = compute_slots
+        self._sys2_base_slots = base_slots
+        self._sys2_op_slots = op_slots
 
         if self.matrix_labeling == 'a':
             # A: split into 2 shards along split_dim (views, no copy).
@@ -563,10 +595,14 @@ class cluster_matrix:
                 f"[{tuple(self.node_matrices[0].shape)}, {tuple(self.node_matrices[1].shape)}] "
                 f"(split along dim={split_dim})"
             )
+            print(
+                f"   System 2 slots: compute_slots={compute_slots}, base_slots={base_slots}, op_slots={op_slots}"
+            )
             return self.node_matrices
 
         if self.matrix_labeling == 'b':
-            # B: split into `base_slots` shards along split_dim, then repeat twice to match `op_slots`.
+            # B: split into `base_slots` shards along split_dim (even split), then repeat twice
+            # to match `op_slots`.
             dim_size = int(full_matrix.size(split_dim))
             if dim_size < base_slots:
                 raise ValueError(f"Cannot split size {dim_size} into {base_slots} non-empty shards")
@@ -586,6 +622,9 @@ class cluster_matrix:
             print(
                 f"✅ Matrix B: {tuple(full_matrix.shape)} → {op_slots} shards "
                 f"(split {base_slots} then repeat; split along dim={split_dim})"
+            )
+            print(
+                f"   System 2 slots: compute_slots={compute_slots}, base_slots={base_slots}, op_slots={op_slots}"
             )
             return self.node_matrices
 
