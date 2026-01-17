@@ -302,8 +302,8 @@ Useful if:
 ```python
 big_new_matrixA = cluster_matrix(
     matrix_file_path=big_test_matrix_pathA_T,
-    node_IP_list="192.168.2.100",
-    CPU_GPU_select_list=True,
+    node_IP_list=["192.168.2.100"],
+    CPU_GPU_select_list=[True],
     node_percentages=[1],
     back_end_select_list=["llama"],
     split_matrix=False,
