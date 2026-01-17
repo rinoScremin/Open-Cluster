@@ -330,16 +330,4 @@ big_new_matrixC.convert_bin_matrix_to_pt("path/to/output_file.bin")
 
 ---
 
-## ✅ Summary
-
-* Supports **layer parallelism** and **tensor parallelism**
-* Works across **mixed hardware**
-* Allows **CPU, GPU, OpenCL, and GGML backends**
-* Can run **entire LLM layers without CUDA**
-* Supports **single-node fallback**
-
-This is **real distributed systems work**, not a toy wrapper.
-
----
-
 
