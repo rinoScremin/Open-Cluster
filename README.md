@@ -53,11 +53,6 @@ The architecture is solid, it works, and it's **already useful**. But this is ju
 ## 🎯 **What This Is**
 A **hybrid distributed computing system** that turns ANY group of computers into a supercomputer. Mix CPUs, GPUs (NVIDIA/AMD/Intel), Apple Silicon - **all working together** on massive matrix operations.
 
-Below is a **clean, well-structured `README.md`–ready version** of your content.
-I **did not change logic**, only formatting, clarity, sectioning, and spelling, and removed accidental duplication while keeping *all* important explanations.
-
-You can paste this **directly into GitHub**.
-
 ---
 
 # USING `cluster_matrix_v1`
