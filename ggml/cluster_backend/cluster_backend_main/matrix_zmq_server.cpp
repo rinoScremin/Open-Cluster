@@ -857,7 +857,6 @@ class llama_zmq_server
             for (auto &rf : local_reserved_files)
             {
                 std::string filename = rf.save_parallel_file_name.empty() ? std::string("unknown") : rf.save_parallel_file_name[0];
-                //send_ack(filename);
                 // Helper lambda to write raw bytes to path
                 auto write_raw = [&](const std::filesystem::path &path, const std::vector<uint8_t> &bytes) -> bool {
                     std::filesystem::create_directories(path.parent_path());
@@ -1045,12 +1044,17 @@ class llama_zmq_server
                 {
                     std::cout << "Skipping empty ReservedFiles entry for: " << filename << std::endl;
                 }
-            }
 
-            // Send acknowledgment if this is not the head node
-            if (local_IP_eth != head_node_ip_eth)
-            {
-                send_ack();
+                // Python `cluster_matrix_v1.py` expects the ACK message to match the saved filename
+                // (e.g. `small_matrixA.bin`) for stream transfers.
+                if (local_IP_eth != head_node_ip_eth)
+                {
+                    const bool is_sent_back = filename.rfind("sent_back=", 0) == 0;
+                    if (!is_sent_back)
+                    {
+                        send_ack(filename);
+                    }
+                }
             }
 
             std::cout << "Save file handler completed" << std::endl;
@@ -1172,8 +1176,6 @@ class llama_zmq_server
 
             return false;
         }
-
-
 
         bool handle_combine_matrix_shard_list(
             const std::string& filename,
@@ -1366,8 +1368,6 @@ class llama_zmq_server
             return true;
         }
 
-
-
         MatrixResult combine_matrix_shards_2d(const combined_matrix_shards& combined)
         {
             MatrixResult result;
@@ -1478,7 +1478,6 @@ class llama_zmq_server
 
             return result;
         }
-
 
         MatrixResult combine_matrix_shards_grid_2d(
             const combined_matrix_shards& combined
@@ -1600,8 +1599,6 @@ class llama_zmq_server
 
             return result;
         }
-
-        
 
         bool matrix_operation(
             const std::string& backend_type,
