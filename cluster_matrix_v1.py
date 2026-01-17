@@ -63,16 +63,6 @@ def check_combined_result_values(c_ref_path, combined):
             f"({(num_different / total_elements * 100):.2f}%)"
         )
 
-def print_matrix_sections(matrix, name, n_elements=100):
-    flat = matrix.flatten()
-    mid = flat.shape[0] // 2
-
-    print(f"\n{name} — first {n_elements} elements of first half:")
-    print(flat[:n_elements])
-
-    print(f"\n{name} — first {n_elements} elements of second half:")
-    print(flat[mid:mid + n_elements])
-
 class cluster_matrix:
     def __init__(self, matrix_file_path,
                 node_IP_list, CPU_GPU_select_list, node_percentages=[], back_end_select_list=[],
@@ -138,7 +128,11 @@ class cluster_matrix:
         self.local_matrix_results_RAM_folder = os.environ.get('LOCAL_MATRIX_RESULTS_RAM_FOLDER', '/dev/shm/matrix_results/')
         self.local_DISK_folder = os.environ.get('LOCAL_DISK_FOLDER', 'matrix_shards/')
         self.local_RAM_folder = os.environ.get('LOCAL_RAM_FOLDER', '/dev/shm/matrix_shards/')
-        self.local_project_dir = os.environ.get('LOCAL_PROJECT_DIR', '/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/')
+
+        default_project_dir = os.path.dirname(os.path.abspath(__file__)) + os.sep
+        self.local_project_dir = os.environ.get('LOCAL_PROJECT_DIR', default_project_dir)
+        if not self.local_project_dir.endswith(os.sep):
+            self.local_project_dir += os.sep
         
         print(f"   Local Paths:")
         print(f"     - RAM Results: {self.local_matrix_results_RAM_folder}")
@@ -150,7 +144,9 @@ class cluster_matrix:
         self.remote_DISK_folder = os.environ.get('REMOTE_DISK_FOLDER', 'matrix_shards/')
         self.remote_RAM_folder = os.environ.get('REMOTE_RAM_FOLDER', '/dev/shm/matrix_shards/')
         self.remote_matrix_results_RAM_folder = os.environ.get('REMOTE_MATRIX_RESULTS_RAM_FOLDER', '/dev/shm/matrix_results/')
-        self.remote_project_dir = os.environ.get('REMOTE_PROJECT_DIR', '/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/')
+        self.remote_project_dir = os.environ.get('REMOTE_PROJECT_DIR', default_project_dir)
+        if not self.remote_project_dir.endswith(os.sep):
+            self.remote_project_dir += os.sep
         
         print(f"   Remote Paths:")
         print(f"     - Disk Folder: {self.remote_DISK_folder}")
@@ -411,7 +407,7 @@ class cluster_matrix:
             ])
             print(f"📤 Sent file {filename_only} to {worker_ip}")
         
-    def stream_matrix_binary_CPU(self, worker_ip, matrix, save_name):
+    def stream_matrix_binary(self, worker_ip, matrix, save_name):
         """
         Stream a matrix as binary data directly to a remote node without saving locally.
         Creates the binary file data in memory and sends it via ZeroMQ.
@@ -421,206 +417,79 @@ class cluster_matrix:
             worker_ip: IP address of the target worker node
             save_name: Filename to use for the streamed file
         """
-        print(f"📤 Streaming matrix to {worker_ip} as {save_name}")
+        verbose = os.environ.get("STREAM_MATRIX_BINARY_VERBOSE", "1") == "1"
+        if verbose:
+            print(f"📤 Streaming matrix to {worker_ip} as {save_name}")
         
         if worker_ip not in self.llama_socket_pool:
             print(f"  ERROR: No socket connection to {worker_ip}")
             return
         
         socket_eth = self.llama_socket_pool[worker_ip]
-        
-        # ===== CREATE BINARY FILE DATA IN MEMORY =====
-        print("  Creating binary file data in memory...")
-        
-        # Convert to numpy if needed
+
+        # ===== CREATE BINARY FILE DATA IN MEMORY (FAST PATH) =====
+        if verbose:
+            print("  Creating binary file data in memory...")
+
         if isinstance(matrix, torch.Tensor):
-            print(f"    Input is PyTorch tensor: shape={matrix.shape}")
-            matrix_float = matrix.float().cpu()
-            matrix_np = matrix_float.detach().numpy()
-        elif isinstance(matrix, np.ndarray):
-            print(f"    Input is numpy array: shape={matrix.shape}")
-            matrix_np = matrix.astype('float32')
-        else:
-            error_msg = f"Unsupported matrix type: {type(matrix)}"
-            print(f"  ERROR: {error_msg}")
-            raise ValueError(error_msg)
-        
-        # Ensure float32 dtype
-        matrix_np = matrix_np.astype('float32')
-        print(f"    Converted to numpy: shape={matrix_np.shape}, dtype={matrix_np.dtype}")
-        
-        # ===== CONVERT TO 4D FORMAT =====
-        # Follow the same format as save_matrix_binary
-        original_shape = matrix_np.shape
-        
-        if len(matrix_np.shape) == 2:
-            # 2D matrix -> reshape to (1, 1, height, width)
-            new_shape = (1, 1, matrix_np.shape[0], matrix_np.shape[1])
-            matrix_np = matrix_np.reshape(new_shape)
-            print(f"    2D {original_shape} -> 4D {new_shape}")
-        elif len(matrix_np.shape) == 3:
-            # 3D matrix -> reshape to (1, channels, height, width)
-            new_shape = (1, matrix_np.shape[0], matrix_np.shape[1], matrix_np.shape[2])
-            matrix_np = matrix_np.reshape(new_shape)
-            print(f"    3D {original_shape} -> 4D {new_shape}")
-        elif len(matrix_np.shape) == 4:
-            # Already 4D
-            print(f"    Already 4D format: {matrix_np.shape}")
-        else:
-            error_msg = f"Unsupported number of dimensions: {len(matrix_np.shape)}"
-            print(f"  ERROR: {error_msg}")
-            raise ValueError(error_msg)
-        
-        # ===== CREATE COMPLETE BINARY DATA =====
-        # Create header: [num_dims, dim1, dim2, dim3, dim4]
-        ndim = 4
-        
-        # Build the binary data
-        binary_data = bytearray()
-        
-        # Add number of dimensions
-        binary_data.extend(struct.pack('i', ndim))
-        
-        # Add all 4 dimensions
-        for i, dim in enumerate(matrix_np.shape):
-            binary_data.extend(struct.pack('i', dim))
-            if i == 0:
-                print(f"    Dimensions: {dim}", end="")
+            t = matrix.detach()
+            if t.device.type != "cpu":
+                t = t.cpu()
+            if t.dtype != torch.float32:
+                t = t.float()
+            if t.ndim == 2:
+                t = t.reshape(1, 1, t.shape[0], t.shape[1])
+            elif t.ndim == 3:
+                t = t.reshape(1, t.shape[0], t.shape[1], t.shape[2])
+            elif t.ndim == 4:
+                pass
             else:
-                print(f" × {dim}", end="")
-        print()  # New line after dimensions
-        
-        # Add matrix data
-        binary_data.extend(matrix_np.tobytes())
-        
-        # Convert to bytes
-        file_data = bytes(binary_data)
-        
-        # Calculate size info
-        expected_size = 4 + ndim * 4 + matrix_np.size * 4
-        actual_size = len(file_data)
-        
-        print(f"  Binary data size: {actual_size:,} bytes")
-        print(f"  Expected size: {expected_size:,} bytes")
-        print(f"  Memory usage: {actual_size/(1024*1024):.2f} MB")
-        
-        if actual_size == expected_size:
-            print(f"  ✓ Binary data verification passed")
+                raise ValueError(f"Unsupported number of dimensions: {t.ndim}")
+            if not t.is_contiguous():
+                t = t.contiguous()
+            matrix_np = t.numpy()  # zero-copy view on CPU
+        elif isinstance(matrix, np.ndarray):
+            matrix_np = matrix
+            if matrix_np.dtype != np.float32 or not matrix_np.flags.get("C_CONTIGUOUS", False):
+                matrix_np = np.asarray(matrix_np, dtype=np.float32, order="C")
+            if matrix_np.ndim == 2:
+                matrix_np = matrix_np.reshape(1, 1, matrix_np.shape[0], matrix_np.shape[1])
+            elif matrix_np.ndim == 3:
+                matrix_np = matrix_np.reshape(1, matrix_np.shape[0], matrix_np.shape[1], matrix_np.shape[2])
+            elif matrix_np.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Unsupported number of dimensions: {matrix_np.ndim}")
         else:
-            print(f"  ⚠️  Binary data size mismatch")
+            raise ValueError(f"Unsupported matrix type: {type(matrix)}")
+
+        b, c, h, w = (int(x) for x in matrix_np.shape)
+        header_size = 4 + 4 * 4  # ndim + 4 dims
+        payload_size = header_size + matrix_np.size * 4
+        payload = bytearray(payload_size)
+        struct.pack_into("iiiii", payload, 0, 4, b, c, h, w)
+
+        # Fill the payload data area as float32 without creating an intermediate `tobytes()` copy.
+        out_view = np.frombuffer(payload, dtype=np.float32, offset=header_size, count=matrix_np.size).reshape(matrix_np.shape)
+        out_view[...] = matrix_np
+
+        if verbose:
+            print(f"  Dimensions: {b} × {c} × {h} × {w}")
+            print(f"  Binary data size: {payload_size:,} bytes ({payload_size/(1024*1024):.2f} MB)")
         
         # ===== SEND VIA ZMQ =====
         # Use the exact same pattern as zmq_send_file
         try:
-            socket_eth.send_multipart([
-                save_name.encode(),
-                file_data
-            ])
-            
-            print(f"  ✓ Matrix streamed to {worker_ip}")
-            print(f"  Sent: {save_name} ({actual_size:,} bytes)")
-            
+            # Zero-copy into ZMQ when possible (pyzmq will hold a reference to the bytearray buffer).
+            socket_eth.send_multipart([save_name.encode(), payload], copy=False)
+            if verbose:
+                print(f"  ✓ Matrix streamed to {worker_ip}")
+                print(f"  Sent: {save_name} ({payload_size:,} bytes)")
         except Exception as e:
             print(f"  ERROR streaming matrix to {worker_ip}: {e}")
             raise
         
-        return actual_size
-
-    def stream_matrix_binary(self, worker_ip, matrix, save_name, ctx=None, queue=None):
-        """
-        Stream a matrix as binary data via ZMQ using OpenCL device memory.
-        Binary format is IDENTICAL to save_matrix_binary / stream_matrix_binary.
-        """
-
-        print(f"📤 Streaming matrix (OpenCL) to {worker_ip} as {save_name}")
-
-        if worker_ip not in self.llama_socket_pool:
-            print(f"  ERROR: No socket connection to {worker_ip}")
-            return
-
-        socket_eth = self.llama_socket_pool[worker_ip]
-
-        # ===== OPENCL SETUP =====
-        if ctx is None or queue is None:
-            ctx = cl.create_some_context(interactive=False)
-            queue = cl.CommandQueue(ctx)
-
-        # ===== CONVERT INPUT TO NUMPY =====
-        if isinstance(matrix, torch.Tensor):
-            matrix_np = matrix.float().cpu().detach().numpy()
-            print(f"    Input PyTorch tensor -> numpy {matrix_np.shape}")
-        elif isinstance(matrix, np.ndarray):
-            matrix_np = matrix.astype(np.float32)
-            print(f"    Input numpy array {matrix_np.shape}")
-        else:
-            raise ValueError(f"Unsupported matrix type: {type(matrix)}")
-
-        # ===== CONVERT TO 4D =====
-        original_shape = matrix_np.shape
-
-        if matrix_np.ndim == 2:
-            matrix_np = matrix_np.reshape(1, 1, matrix_np.shape[0], matrix_np.shape[1])
-            print(f"    2D {original_shape} -> 4D {matrix_np.shape}")
-        elif matrix_np.ndim == 3:
-            matrix_np = matrix_np.reshape(1, matrix_np.shape[0],
-                                        matrix_np.shape[1], matrix_np.shape[2])
-            print(f"    3D {original_shape} -> 4D {matrix_np.shape}")
-        elif matrix_np.ndim == 4:
-            print(f"    Already 4D format: {matrix_np.shape}")
-        else:
-            raise ValueError(f"Unsupported number of dimensions: {matrix_np.ndim}")
-
-        matrix_np = matrix_np.astype(np.float32)
-
-        # ===== OPENCL BUFFER =====
-        mf = cl.mem_flags
-        buffer_size = matrix_np.nbytes
-
-        cl_buffer = cl.Buffer(
-            ctx,
-            mf.READ_ONLY | mf.COPY_HOST_PTR,
-            hostbuf=matrix_np
-        )
-
-        # ===== COPY BACK FROM DEVICE =====
-        matrix_out = np.empty_like(matrix_np)
-        cl.enqueue_copy(queue, matrix_out, cl_buffer)
-        queue.finish()
-
-        # ===== BUILD BINARY DATA IN MEMORY =====
-        ndim = 4
-        binary_data = bytearray()
-
-        binary_data.extend(struct.pack('i', ndim))
-        for dim in matrix_out.shape:
-            binary_data.extend(struct.pack('i', dim))
-
-        binary_data.extend(matrix_out.tobytes())
-        file_data = bytes(binary_data)
-
-        expected_size = 4 + ndim * 4 + matrix_out.size * 4
-        actual_size = len(file_data)
-
-        print(f"  Binary size: {actual_size:,} bytes")
-        print(f"  Expected:   {expected_size:,} bytes")
-
-        if actual_size != expected_size:
-            print("  ⚠️  Size mismatch detected")
-        else:
-            print("  ✓ Binary data verified")
-
-        # ===== STREAM VIA ZMQ =====
-        try:
-            socket_eth.send_multipart([
-                save_name.encode(),
-                file_data
-            ])
-            print(f"  ✓ Streamed to {worker_ip}")
-        except Exception as e:
-            print(f"  ERROR streaming to {worker_ip}: {e}")
-            raise
-
-        return actual_size
+        return payload_size
 
     def cleanup(self):
         for socket in self.llama_socket_pool.values():
@@ -1008,7 +877,7 @@ class cluster_matrix:
 
         return self.matrix_file_paths_list
 
-    def save_matrix_binary_CPU(self, matrix, filename):
+    def save_matrix_binary(self, matrix, filename):
         """
         Save a PyTorch tensor or numpy array as a binary file.
         
@@ -1021,121 +890,72 @@ class cluster_matrix:
             matrix: PyTorch tensor or numpy array to save
             filename: Path where the binary file will be saved
         """
-        print(f"Saving matrix to binary file: {filename}")
-        
-        # ===== CONVERT INPUT TO NUMPY ARRAY =====
-        # Handle both PyTorch tensors and numpy arrays
+        verbose = os.environ.get("SAVE_MATRIX_BINARY_VERBOSE", "1") == "1"
+        if verbose:
+            print(f"Saving matrix to binary file: {filename}")
+
+        parent = os.path.dirname(filename)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        # ===== FAST CPU SAVE PATH =====
+        # Avoid `.tobytes()` (copies the whole buffer). Use ndarray.tofile(...) instead.
         if isinstance(matrix, torch.Tensor):
-            matrix_float = matrix.float().cpu()
-            matrix_np = matrix_float.detach().numpy()
-        elif isinstance(matrix, np.ndarray):
-            matrix_np = matrix.astype('float32')
-        else:
-            raise ValueError("error!!")
-        
-        # Ensure float32 dtype
-        #matrix_np = matrix_np.astype('float32')
-        
-        # ===== CONVERT TO 4D FORMAT =====
-        # Always convert to 4D format for consistency (batch, channel, height, width)
-        original_shape = matrix_np.shape
-        print(f"  Converting to 4D format...")
-        
-        if len(matrix_np.shape) == 2:
-            # 2D matrix -> reshape to (1, 1, height, width)
-            new_shape = (1, 1, matrix_np.shape[0], matrix_np.shape[1])
-            matrix_np = matrix_np.reshape(new_shape)
-            print(f"    2D {original_shape} -> 4D {new_shape}")
-        elif len(matrix_np.shape) == 3:
-            # 3D matrix -> reshape to (1, channels, height, width)
-            new_shape = (1, matrix_np.shape[0], matrix_np.shape[1], matrix_np.shape[2])
-            matrix_np = matrix_np.reshape(new_shape)
-            print(f"    3D {original_shape} -> 4D {new_shape}")
-        elif len(matrix_np.shape) == 4:
-            # Already 4D
-            print(f"    Already 4D format: {matrix_np.shape}")
-        else:
-            raise ValueError('some thing fucked!!')
-        
-        # ===== WRITE BINARY FILE =====
-        print(f"  Writing binary file...")
+            t = matrix.detach()
+            if t.device.type != "cpu":
+                t = t.cpu()
+            if t.dtype != torch.float32:
+                t = t.float()
 
-        with open(filename, 'wb') as f:
-            # Write number of dimensions (always 4 for consistency)
-            ndim = 4
-            f.write(struct.pack('i', ndim))
-            # Write all 4 dimensions
-            for i, dim in enumerate(matrix_np.shape):
-                f.write(struct.pack('i', dim))
-            # Write the actual data
-            f.write(matrix_np.tobytes())
-    
-    def save_matrix_binary(self, matrix, filename, ctx=None, queue=None):
-        """
-        Save a matrix using OpenCL device memory before writing to disk.
+            if t.ndim == 2:
+                t = t.reshape(1, 1, t.shape[0], t.shape[1])
+            elif t.ndim == 3:
+                t = t.reshape(1, t.shape[0], t.shape[1], t.shape[2])
+            elif t.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Invalid tensor dimensionality: {t.ndim}")
 
-        Binary format:
-        [num_dims, dim1, dim2, dim3, dim4, data]
-        Always saved as float32 and 4D.
-        """
+            if not t.is_contiguous():
+                t = t.contiguous()
 
-        print(f"Saving matrix to binary file (OpenCL): {filename}")
+            shape = tuple(int(x) for x in t.shape)
+            if verbose:
+                print(f"Original shape: {tuple(matrix.shape)}")
+                print(f"Converted to 4D: {shape}")
+                print("Writing binary file...")
 
-        # ===== OPENCL SETUP =====
-        if ctx is None or queue is None:
-            ctx = cl.create_some_context(interactive=False)
-            queue = cl.CommandQueue(ctx)
+            with open(filename, "wb") as f:
+                f.write(struct.pack("iiiii", 4, shape[0], shape[1], shape[2], shape[3]))
+                t.numpy().tofile(f)
+            return
 
-        # ===== CONVERT INPUT TO NUMPY =====
-        if isinstance(matrix, torch.Tensor):
-            matrix_np = matrix.float().cpu().detach().numpy()
-        elif isinstance(matrix, np.ndarray):
-            matrix_np = matrix.astype(np.float32)
-        else:
-            raise ValueError("Unsupported input type")
+        if isinstance(matrix, np.ndarray):
+            arr = matrix
+            if arr.dtype != np.float32 or not arr.flags.get("C_CONTIGUOUS", False):
+                arr = np.asarray(arr, dtype=np.float32, order="C")
 
-        original_shape = matrix_np.shape
-        print(f"Original shape: {original_shape}")
+            if arr.ndim == 2:
+                arr = arr.reshape(1, 1, arr.shape[0], arr.shape[1])
+            elif arr.ndim == 3:
+                arr = arr.reshape(1, arr.shape[0], arr.shape[1], arr.shape[2])
+            elif arr.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Invalid array dimensionality: {arr.ndim}")
 
-        # ===== CONVERT TO 4D =====
-        if matrix_np.ndim == 2:
-            matrix_np = matrix_np.reshape(1, 1, matrix_np.shape[0], matrix_np.shape[1])
-        elif matrix_np.ndim == 3:
-            matrix_np = matrix_np.reshape(1, matrix_np.shape[0],
-                                        matrix_np.shape[1], matrix_np.shape[2])
-        elif matrix_np.ndim == 4:
-            pass
-        else:
-            raise ValueError("Invalid tensor dimensionality")
+            shape = tuple(int(x) for x in arr.shape)
+            if verbose:
+                print(f"Original shape: {tuple(matrix.shape)}")
+                print(f"Converted to 4D: {shape}")
+                print("Writing binary file...")
 
-        print(f"Converted to 4D: {matrix_np.shape}")
+            with open(filename, "wb") as f:
+                f.write(struct.pack("iiiii", 4, shape[0], shape[1], shape[2], shape[3]))
+                arr.tofile(f)
+            return
 
-        # ===== OPENCL BUFFER =====
-        mf = cl.mem_flags
-        buffer_size = matrix_np.nbytes
-
-        cl_buffer = cl.Buffer(
-            ctx,
-            mf.READ_ONLY | mf.COPY_HOST_PTR,
-            hostbuf=matrix_np
-        )
-
-        # ===== READ BACK FROM DEVICE =====
-        matrix_out = np.empty_like(matrix_np)
-        cl.enqueue_copy(queue, matrix_out, cl_buffer)
-        queue.finish()
-
-        # ===== WRITE BINARY FILE =====
-        print("Writing binary file...")
-
-        with open(filename, "wb") as f:
-            ndim = 4
-            f.write(struct.pack("i", ndim))
-            for dim in matrix_out.shape:
-                f.write(struct.pack("i", dim))
-            f.write(matrix_out.tobytes())
-
-        print("Done.")
+        raise ValueError("Unsupported input type for save_matrix_binary")
 
     def remote_save_distribute_matrix_shards_bin(self):
         """Save matrix shards as binary files and distribute to appropriate nodes."""
@@ -1313,42 +1133,55 @@ class cluster_matrix:
         Returns:  
             PyTorch tensor  
         """  
-        with open(filename, 'rb') as f:  
-            # Read number of dimensions  
-            ndim_bytes = f.read(4)  
-            if len(ndim_bytes) < 4:  
-                raise ValueError("File too short to read ndim")  
-            ndim = struct.unpack('i', ndim_bytes)[0]  
-    
-            # Read dimensions  
-            dims_bytes = f.read(ndim * 4)  
-            if len(dims_bytes) < ndim * 4:  
-                raise ValueError("File too short to read dimensions")  
-            dims = list(struct.unpack('i' * ndim, dims_bytes))  
-    
-            # Read data  
-            num_elements = np.prod(dims)  
-            data_bytes = f.read(num_elements * 4)  
-            if len(data_bytes) < num_elements * 4:  
-                raise ValueError(f"File too short to read {num_elements} floats")  
-            data_np = np.frombuffer(data_bytes, dtype=np.float32).copy()  # ensure writable  
-    
-        # Reshape  
-        tensor_np = data_np.reshape(dims)  
+        # Fast path: mmap + frombuffer avoids copying file payload into Python bytes.
+        # We still detach into a normal (owned) tensor at the end so callers can delete the file safely.
+        with open(filename, 'rb') as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            offset = 0
+            if mm.size() < 4:
+                raise ValueError("File too short to read ndim")
+            ndim = struct.unpack_from('i', mm, offset)[0]
+            offset += 4
+
+            header_bytes = ndim * 4
+            if mm.size() < offset + header_bytes:
+                raise ValueError("File too short to read dimensions")
+            dims = list(struct.unpack_from('i' * ndim, mm, offset))
+            offset += header_bytes
+
+            num_elements = int(np.prod(dims, dtype=np.int64))
+            data_bytes_needed = num_elements * 4
+            if mm.size() < offset + data_bytes_needed:
+                raise ValueError(f"File too short to read {num_elements} floats")
+
+            data_np = np.frombuffer(mm, dtype=np.float32, count=num_elements, offset=offset)
+            tensor_np = data_np.reshape(dims)
+        finally:
+            # `tensor_np` is a view over `mm`; we will detach below, so it's safe to close here.
+            try:
+                mm.close()
+            except Exception:
+                pass
     
         # Optionally flatten batch*depth*rows -> 2D for LLAMA-like 4D tensors  
         if force_2d and ndim == 4:  
             batch, depth, rows, cols = dims  
             tensor_np = tensor_np.reshape(batch * depth * rows, cols)  
     
-        # Convert to PyTorch tensor  
-        tensor_pt = torch.from_numpy(tensor_np).float()  
+        # Convert to PyTorch tensor (detach from mm-backed buffer)
+        # NOTE: `tensor_np` is float32 already; avoid an extra `.float()` copy.
+        tensor_pt = torch.from_numpy(np.array(tensor_np, copy=True, dtype=np.float32))
     
         # Info  
         print(f"✅ Loaded {filename}")  
         print(f"  Original dims: {dims}")  
         print(f"  Result tensor shape: {tensor_pt.shape}, size: {tensor_pt.numel()*4:,} bytes")  
-        print(f"  Data range: [{tensor_pt.min().item():.6f}, {tensor_pt.max().item():.6f}]")  
+        stats_max_elems = int(os.environ.get("CONVERT_BIN_STATS_MAX_ELEMS", "2000000"))
+        if tensor_pt.numel() <= stats_max_elems:
+            print(f"  Data range: [{tensor_pt.min().item():.6f}, {tensor_pt.max().item():.6f}]")
+        else:
+            print(f"  Data range: [skipped; numel={tensor_pt.numel():,} > {stats_max_elems:,}]")
     
         return tensor_pt
 
