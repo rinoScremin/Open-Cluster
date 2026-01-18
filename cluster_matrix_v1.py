@@ -554,8 +554,6 @@ class cluster_matrix:
             t = matrix.detach()
             if t.device.type != "cpu":
                 t = t.cpu()
-            if t.dtype != torch.float32:
-                t = t.float()
             if t.ndim == 2:
                 t = t.reshape(1, 1, t.shape[0], t.shape[1])
             elif t.ndim == 3:
@@ -813,8 +811,8 @@ class cluster_matrix:
                 print(f"  Head node: Saving to RAM={save_file_path_RAM}")
                 
                 # Save tensor to binary file in both locations
-                self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_DISK)
-                self.save_matrix_binary(self.node_matrices[shard_index].float(), save_file_path_RAM)
+                self.save_matrix_binary(self.node_matrices[shard_index], save_file_path_DISK)
+                self.save_matrix_binary(self.node_matrices[shard_index], save_file_path_RAM)
                 
                 # Store RAM path for later access
                 self.matrix_file_paths_list.append(save_file_path_RAM)
@@ -825,7 +823,7 @@ class cluster_matrix:
                 save_name += '.bin'
                 print(f"  Remote node {node_IP}: Beginning distribution")
 
-                self.stream_matrix_binary(node_IP, self.node_matrices[shard_index].float(), save_name)
+                self.stream_matrix_binary(node_IP, self.node_matrices[shard_index], save_name)
 
                 self.wait_for_acks(1,save_name)
                 # Step 3: Tell remote node to copy from RAM to DISK
@@ -864,8 +862,8 @@ class cluster_matrix:
         
         # Save to binary format locally
         print("Saving to local storage...")
-        self.save_matrix_binary(full_matrix.float(), save_file_path_DISK)
-        self.save_matrix_binary(full_matrix.float(), local_save_file_path_RAM)
+        self.save_matrix_binary(full_matrix, save_file_path_DISK)
+        self.save_matrix_binary(full_matrix, local_save_file_path_RAM)
 
         # Define remote paths (absolute disk path)
         remote_disk_dir_full = os.path.join(self.remote_project_dir, self.remote_DISK_folder)
@@ -1048,9 +1046,6 @@ class cluster_matrix:
             t = matrix.detach()
             if t.device.type != "cpu":
                 t = t.cpu()
-            if t.dtype != torch.float32:
-                t = t.float()
-
             if t.ndim == 2:
                 t = t.reshape(1, 1, t.shape[0], t.shape[1])
             elif t.ndim == 3:
@@ -1169,8 +1164,8 @@ class cluster_matrix:
                             print(f"  Head node: Saving to RAM={save_file_path_RAM}")
                             
                             # Save the full matrix (node_matrices[0]) to this shard file
-                            self.save_matrix_binary(self.node_matrices[0].float(), save_file_path_DISK)
-                            self.save_matrix_binary(self.node_matrices[0].float(), save_file_path_RAM)
+                            self.save_matrix_binary(self.node_matrices[0], save_file_path_DISK)
+                            self.save_matrix_binary(self.node_matrices[0], save_file_path_RAM)
                             
                             # Store RAM path for later access
                             self.matrix_file_paths_list.append(save_file_path_RAM)
@@ -1187,8 +1182,8 @@ class cluster_matrix:
                             print(f"  Head node: Saving to RAM={save_file_path_RAM}")
                             
                             # Save tensor to binary file in both locations
-                            self.save_matrix_binary(self.node_matrices[unique_shard_index].float(), save_file_path_DISK)
-                            self.save_matrix_binary(self.node_matrices[unique_shard_index].float(), save_file_path_RAM)
+                            self.save_matrix_binary(self.node_matrices[unique_shard_index], save_file_path_DISK)
+                            self.save_matrix_binary(self.node_matrices[unique_shard_index], save_file_path_RAM)
                             
                             # Store RAM path for later access
                             self.matrix_file_paths_list.append(save_file_path_RAM)
@@ -1314,7 +1309,6 @@ class cluster_matrix:
             tensor_np = tensor_np.reshape(batch * depth * rows, cols)  
     
         # Convert to PyTorch tensor (detach from mm-backed buffer)
-        # NOTE: `tensor_np` is float32 already; avoid an extra `.float()` copy.
         tensor_pt = torch.from_numpy(np.array(tensor_np, copy=True, dtype=np.float32))
     
         # Info  
