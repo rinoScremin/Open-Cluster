@@ -1,6 +1,7 @@
 import os
 from transformers import AutoModel, AutoTokenizer, AutoConfig
 from cluster_matrix_v1 import cluster_matrix
+from cluster_matrix_v1 import cluster_zmq
 import torch
 import time
 import math
@@ -49,6 +50,7 @@ class cluster_llm_transformer:
         # CLUSTER CONFIG
         # --------------------------------------------------
         self.IP_list = IP_list
+        self.cluster_zmq_object = cluster_zmq(self.IP_list)
         self.percentages = percentages
         self.CPU_GPU_select_list = CPU_GPU_select_list
         self.backend_select_list = backend_select_list
@@ -143,7 +145,7 @@ class cluster_llm_transformer:
 
             cluster_matrix(
                 matrix_file_path=mlp_gate_w,
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -154,7 +156,7 @@ class cluster_llm_transformer:
             )
             cluster_matrix(
                 matrix_file_path=mlp_up_w,
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -165,7 +167,7 @@ class cluster_llm_transformer:
             )
             cluster_matrix(
                 matrix_file_path=mlp_down_w,
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -236,7 +238,7 @@ class cluster_llm_transformer:
             # Cluster decode is optional; local decode is the default for correctness.
             hidden_cluster = cluster_matrix(
                 matrix_file_path=hidden_norm.unsqueeze(1).contiguous(),  # [hidden, 1]
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -247,7 +249,7 @@ class cluster_llm_transformer:
             )
             lm_head_w_t_cluster = cluster_matrix(
                 matrix_file_path=lm_head_w.t().contiguous(),  # [hidden, vocab]
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -552,7 +554,7 @@ class cluster_llm_transformer:
                 continue
             cluster_matrix(
                 matrix_file_path=extra_path,
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -625,7 +627,7 @@ class cluster_llm_transformer:
 
                 cluster_matrix(
                     matrix_file_path=weight,
-                    node_IP_list=self.IP_list,
+                    cluster_zmq_object=self.cluster_zmq_object,
                     CPU_GPU_select_list=self.CPU_GPU_select_list,
                     node_percentages=self.percentages,
                     back_end_select_list=self.backend_select_list,
@@ -799,7 +801,7 @@ class cluster_llm_transformer:
 
             x = cluster_matrix(
                 matrix_file_path=x,
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -810,7 +812,7 @@ class cluster_llm_transformer:
             )
             q = cluster_matrix(
                 matrix_file_path=attn_q_proj_path,
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -820,7 +822,7 @@ class cluster_llm_transformer:
             )
             k = cluster_matrix(
                 matrix_file_path=attn_k_proj_path,
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -830,7 +832,7 @@ class cluster_llm_transformer:
             )
             v = cluster_matrix(
                 matrix_file_path=attn_v_proj_path,
-                node_IP_list=self.IP_list,
+                cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
@@ -945,7 +947,7 @@ class cluster_llm_transformer:
 
         mlp_in_cluster = cluster_matrix(
             matrix_file_path=mlp_in_col,
-            node_IP_list=self.IP_list,
+            cluster_zmq_object=self.cluster_zmq_object,
             CPU_GPU_select_list=self.CPU_GPU_select_list,
             node_percentages=self.percentages,
             back_end_select_list=self.backend_select_list,
@@ -957,7 +959,7 @@ class cluster_llm_transformer:
 
         mlp_gate_cluster = cluster_matrix(
             matrix_file_path=mlp_gate_path,
-            node_IP_list=self.IP_list,
+            cluster_zmq_object=self.cluster_zmq_object,
             CPU_GPU_select_list=self.CPU_GPU_select_list,
             node_percentages=self.percentages,
             back_end_select_list=self.backend_select_list,
@@ -968,7 +970,7 @@ class cluster_llm_transformer:
         )
         mlp_up_cluster = cluster_matrix(
             matrix_file_path=mlp_up_path,
-            node_IP_list=self.IP_list,
+            cluster_zmq_object=self.cluster_zmq_object,
             CPU_GPU_select_list=self.CPU_GPU_select_list,
             node_percentages=self.percentages,
             back_end_select_list=self.backend_select_list,
@@ -979,7 +981,7 @@ class cluster_llm_transformer:
         )
         mlp_down_cluster = cluster_matrix(
             matrix_file_path=mlp_down_path,
-            node_IP_list=self.IP_list,
+            cluster_zmq_object=self.cluster_zmq_object,
             CPU_GPU_select_list=self.CPU_GPU_select_list,
             node_percentages=self.percentages,
             back_end_select_list=self.backend_select_list,
@@ -995,7 +997,7 @@ class cluster_llm_transformer:
 
         intermediate_cluster = cluster_matrix(
             matrix_file_path=intermediate.t().contiguous(),  # [intermediate, 1]
-            node_IP_list=self.IP_list,
+            cluster_zmq_object=self.cluster_zmq_object,
             CPU_GPU_select_list=self.CPU_GPU_select_list,
             node_percentages=self.percentages,
             back_end_select_list=self.backend_select_list,
