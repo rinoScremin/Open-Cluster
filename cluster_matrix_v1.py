@@ -20,6 +20,7 @@ import sys
 import io
 import pyopencl as cl
 
+
 def check_combined_result_values(c_ref_path, combined):
     c_ref = torch.load(c_ref_path)
     if c_ref.shape != combined.shape:
@@ -63,49 +64,64 @@ def check_combined_result_values(c_ref_path, combined):
             f"({(num_different / total_elements * 100):.2f}%)"
         )
 
-class cluster_matrix:
-    def __init__(self, matrix_file_path,
-                node_IP_list, CPU_GPU_select_list, node_percentages=[], back_end_select_list=[],
-                split_matrix=False, dim=0 , matrix_name='', matrix_labeling='', auto_set_up=[]):
+class cluster_zmq:
+    def __init__(self, node_IP_list):
+        # Keep the caller-provided slot list (may include duplicates).
+        self.node_IP_list = list(node_IP_list)
         
-        if matrix_labeling != '' and len(node_percentages) == 0:
-            node_percentages = [0] * len(node_IP_list)
+        # =============== FOLDER PATH CONFIGURATION ===============
+        print("\n📁 CONFIGURING STORAGE PATHS...")
         
-        print("=" * 70)
-        print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
-        print("=" * 70)
-        
-        # =============== NODE CONFIGURATION VALIDATION ===============
-        #print("\n📋 VALIDATING NODE CONFIGURATION...")
-        
-        # Check consistency of the node configuration
-        
-        if not (len(node_IP_list) == len(CPU_GPU_select_list) == len(back_end_select_list) == len(node_percentages)):
-            print("❌ NODE CONFIGURATION ERROR: Lengths do not match!")
-            print(f"   - node_IP_list: {len(node_IP_list)} nodes")
-            print(f"   - CPU_GPU_select_list: {len(CPU_GPU_select_list)} selections")
-            print(f"   - back_end_select_list: {len(back_end_select_list)} backends")
-            print(f"   - node_percentages: {len(node_percentages)} percentages")
-            raise ValueError("Node configuration error: All lists must have the same length")
-        
+        # Local paths (head node)
+        self.local_matrix_results_RAM_folder = os.environ.get(
+            'LOCAL_MATRIX_RESULTS_RAM_FOLDER', '/dev/shm/matrix_results/'
+        )
+        self.local_DISK_folder = os.environ.get('LOCAL_DISK_FOLDER', 'matrix_shards/')
+        self.local_RAM_folder = os.environ.get('LOCAL_RAM_FOLDER', '/dev/shm/matrix_shards/')
 
-        # Check that percentages sum to (roughly) 1.0
-        half_node_percentages = len(node_percentages) // 2
-        sys2_split_percentages = node_percentages[:half_node_percentages]
-        total_percent = sum(node_percentages)
+        default_project_dir = os.path.dirname(os.path.abspath(__file__)) + os.sep
+        self.local_project_dir = os.environ.get('LOCAL_PROJECT_DIR', default_project_dir)
+        if not self.local_project_dir.endswith(os.sep):
+            self.local_project_dir += os.sep
+        
+        print(f"   Local Paths:")
+        print(f"     - Disk Folder: {self.local_DISK_folder}")
+        print(f"     - RAM Folder: {self.local_RAM_folder}")
+        print(f"     - Project Dir: {self.local_project_dir}")
+        
+        # Remote paths (worker nodes)
+        self.remote_matrix_results_RAM_folder = os.environ.get(
+            'REMOTE_MATRIX_RESULTS_RAM_FOLDER', '/dev/shm/matrix_results/'
+        )
+        self.remote_DISK_folder = os.environ.get('REMOTE_DISK_FOLDER', 'matrix_shards/')
+        self.remote_RAM_folder = os.environ.get('REMOTE_RAM_FOLDER', '/dev/shm/matrix_shards/')
+        self.remote_project_dir = os.environ.get('REMOTE_PROJECT_DIR', default_project_dir)
+        if not self.remote_project_dir.endswith(os.sep):
+            self.remote_project_dir += os.sep
+        
+        print(f"   Remote Paths:")
+        print(f"     - Disk Folder: {self.remote_DISK_folder}")
+        print(f"     - RAM Folder: {self.remote_RAM_folder}")
+        print(f"     - Project Dir: {self.remote_project_dir}")
+        
+        # Get Python executable path
+        self.conda_env_dir = os.environ.get('CONDA_ENV_DIR', '/home/rino/anaconda3/envs/ray-conda-env')
+        self.python_path = os.environ.get('OPEN_CLUSTER_SCRIPT_PATH', '/home/rino/anaconda3/envs/cluster-worker/bin/python')
 
-        #if abs(total_percent - 1.0) > 0.01:  # Increased tolerance to 0.01
-        #    raise ValueError(f"Node configuration error: percentages sum to {total_percent:.6f}, should be 1.0")
-
-        print(f"✅ Node configuration validated: {len(node_IP_list)} nodes configured")
-        print(f"✅ Percentage distribution validated: {total_percent:.6f}")
 
         # =============== NETWORK AND PORT CONFIGURATION ===============
         print("\n🌐 CONFIGURING NETWORK SETTINGS...")
-        
+                
         # Get head node IP addresses from environment variables
         self.IP = os.environ.get('HEAD_NODE_IP', '192.168.2.100')
         self.wifi_IP = os.environ.get('HEAD_NODE_IP_WIFI', '192.168.50.113')
+
+        # Optional WiFi IP mapping (best-effort)
+        wifi_env = os.environ.get("WORKER_WIFI_IPS", "")
+        if wifi_env:
+            self.IP_list_wifi = [ip.strip() for ip in wifi_env.split(",") if ip.strip()]
+        else:
+            self.IP_list_wifi = ['192.168.3.13', '192.168.3.243', '192.168.3.165', '192.168.3.94']
         
         print(f"   Head Node Ethernet IP: {self.IP}")
         print(f"   Head Node WiFi IP: {self.wifi_IP}")
@@ -123,110 +139,11 @@ class cluster_matrix:
         self.python_front_end_cluster_port = os.environ.get("PYTHON_FRONT_END_CLUSTER_PORT", "7790")
         print(f"   Cluster Barrier Port: {self.python_front_end_cluster_port}")
 
-        # =============== FOLDER PATH CONFIGURATION ===============
-        print("\n📁 CONFIGURING STORAGE PATHS...")
-        
-        # Local paths (head node)
-        self.local_matrix_results_RAM_folder = os.environ.get('LOCAL_MATRIX_RESULTS_RAM_FOLDER', '/dev/shm/matrix_results/')
-        self.local_DISK_folder = os.environ.get('LOCAL_DISK_FOLDER', 'matrix_shards/')
-        self.local_RAM_folder = os.environ.get('LOCAL_RAM_FOLDER', '/dev/shm/matrix_shards/')
-
-        default_project_dir = os.path.dirname(os.path.abspath(__file__)) + os.sep
-        self.local_project_dir = os.environ.get('LOCAL_PROJECT_DIR', default_project_dir)
-        if not self.local_project_dir.endswith(os.sep):
-            self.local_project_dir += os.sep
-        
-        print(f"   Local Paths:")
-        print(f"     - RAM Results: {self.local_matrix_results_RAM_folder}")
-        print(f"     - Disk Folder: {self.local_DISK_folder}")
-        print(f"     - RAM Folder: {self.local_RAM_folder}")
-        print(f"     - Project Dir: {self.local_project_dir}")
-        
-        # Remote paths (worker nodes)
-        self.remote_DISK_folder = os.environ.get('REMOTE_DISK_FOLDER', 'matrix_shards/')
-        self.remote_RAM_folder = os.environ.get('REMOTE_RAM_FOLDER', '/dev/shm/matrix_shards/')
-        self.remote_matrix_results_RAM_folder = os.environ.get('REMOTE_MATRIX_RESULTS_RAM_FOLDER', '/dev/shm/matrix_results/')
-        self.remote_project_dir = os.environ.get('REMOTE_PROJECT_DIR', default_project_dir)
-        if not self.remote_project_dir.endswith(os.sep):
-            self.remote_project_dir += os.sep
-        
-        print(f"   Remote Paths:")
-        print(f"     - Disk Folder: {self.remote_DISK_folder}")
-        print(f"     - RAM Folder: {self.remote_RAM_folder}")
-        print(f"     - RAM Results: {self.remote_matrix_results_RAM_folder}")
-        print(f"     - Project Dir: {self.remote_project_dir}")
-        
-        # Get Python executable path
-        self.conda_env_dir = os.environ.get('CONDA_ENV_DIR', '/home/rino/anaconda3/envs/ray-conda-env')
-        self.python_path = os.environ.get('OPEN_CLUSTER_SCRIPT_PATH', '/home/rino/anaconda3/envs/cluster-worker/bin/python')
-
-        print(f"✅ Using Python path: {self.python_path}")
-
-        # =============== INSTANCE VARIABLE INITIALIZATION ===============
-        print("\n📊 INITIALIZING INSTANCE VARIABLES...")
-        
-        self.matrix_file_path = matrix_file_path
-        self.node_IP_list = node_IP_list
-        wifi_env = os.environ.get("WORKER_WIFI_IPS", "")
-        if wifi_env:
-            self.IP_list_wifi = [ip.strip() for ip in wifi_env.split(",") if ip.strip()]
-        else:
-            self.IP_list_wifi = ['192.168.3.13', '192.168.3.243', '192.168.3.165', '192.168.3.94']  # WiFi testing IPs
-        self.node_percentages = node_percentages
-        self.dim = dim
-        self.transpose = False
-        self.CPU_GPU_select_list = CPU_GPU_select_list  # True for GPU, False for CPU
-        self.back_end_select_list = back_end_select_list  # 'torch', 'llama', 'opencl'
-        self.split_matrix = split_matrix
-        self.OG_matrix_shape = []
-        self.sys2_split_percentages = sys2_split_percentages
-        self.matrix_labeling= matrix_labeling
-
-        # Extract matrix name from file path
-        if torch.is_tensor(matrix_file_path):
-            #print(f'matrix_file_path.names : {matrix_file_path.names}')
-            self.matrix_name = matrix_name
-        else:
-            matrix_file_path_split = matrix_file_path.split('/')
-            self.matrix_name = matrix_file_path_split[len(matrix_file_path_split)-1].split('.pt')[0]
-            print(f"   Matrix Name: {self.matrix_name}")
-            print(f"   Split Matrix: {split_matrix}")
-            print(f"   Dimension: {dim}")
-        
-        # If no backend specified, default to 'torch' for all nodes
-        if self.back_end_select_list == []:
-            print("   No backend specified, defaulting to 'torch' for all nodes")
-            for CPU_GPU_select in self.CPU_GPU_select_list:
-                self.back_end_select_list.append('torch')
-        
-        self.node_matrices = []
-        self.matrix_file_paths_list = []  # List for storing matrix file paths
-        
-        '''
-        # =============== CREATE LOCAL DIRECTORIES ===============
-        print("\n📂 CREATING LOCAL DIRECTORIES...")
-        directories_created = []
-        if not os.path.exists(self.local_DISK_folder):
-            os.makedirs(self.local_DISK_folder)
-            directories_created.append(self.local_DISK_folder)
-        if not os.path.exists(self.local_RAM_folder):
-            os.makedirs(self.local_RAM_folder)
-            directories_created.append(self.local_RAM_folder)
-        if not os.path.exists(self.local_matrix_results_RAM_folder):
-            os.makedirs(self.local_matrix_results_RAM_folder)
-            directories_created.append(self.local_matrix_results_RAM_folder)
-        
-        if directories_created:
-            print(f"✅ Created directories: {', '.join(directories_created)}")
-        else:
-            print("✅ All required directories already exist")
-        '''
-
         # =============== ZEROMMQ SOCKET SETUP ===============
         print("\n🔌 SETTING UP ZEROMQ CONNECTIONS...")
 
         # Check if we're in worker mode (all IPs are 0.0.0.0)
-        all_ips_are_zero = all(ip == '0.0.0.0' for ip in node_IP_list)
+        all_ips_are_zero = all(ip == '0.0.0.0' for ip in self.node_IP_list)
 
         if all_ips_are_zero:
             print("   ⚙️ Worker mode detected - skipping network connections")
@@ -242,7 +159,7 @@ class cluster_matrix:
             self.timeout = 5000  # 5 second timeout
             
             # Create PUSH sockets for ALL remote nodes
-            unique_IP_list = list(dict.fromkeys(node_IP_list))
+            unique_IP_list = list(dict.fromkeys(self.node_IP_list))
             print(f"   Connecting to {len(unique_IP_list)} unique nodes...")
             
             for node_ip in unique_IP_list:
@@ -283,10 +200,10 @@ class cluster_matrix:
             print("\n🔄 SETTING UP CLUSTER BARRIER/ACK RECEIVER...")
             
             # Initialize ack receiver socket (singleton pattern)
-            if not hasattr(cluster_matrix, '_ack_receiver_socket'):
+            if not hasattr(cluster_zmq, '_ack_receiver_socket'):
                 try:
-                    cluster_matrix._ack_receiver_socket = self.zmq_context.socket(zmq.PULL)
-                    cluster_matrix._ack_receiver_socket.bind(f"tcp://0.0.0.0:{self.python_front_end_cluster_port}")
+                    cluster_zmq._ack_receiver_socket = self.zmq_context.socket(zmq.PULL)
+                    cluster_zmq._ack_receiver_socket.bind(f"tcp://0.0.0.0:{self.python_front_end_cluster_port}")
                     print(f"✅ Python frontend ACK receiver bound to port {self.python_front_end_cluster_port}")
                 except Exception as e:
                     print(f"❌ Failed to bind ACK receiver: {e}")
@@ -295,23 +212,185 @@ class cluster_matrix:
                 print(f"✅ ACK receiver already exists on port {self.python_front_end_cluster_port}")
             
             # Reference it in the instance
-            self.ack_receiver_socket = cluster_matrix._ack_receiver_socket
+            self.ack_receiver_socket = cluster_zmq._ack_receiver_socket
 
-        '''
-            # =============== CREATE REMOTE DIRECTORIES ===============
-            print("\n📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...")
+        # =============== CREATE LOCAL DIRECTORIES ===============
+        print("\n📂 CREATING LOCAL DIRECTORIES...")
+        directories_created = []
+        if not os.path.exists(self.local_DISK_folder):
+            os.makedirs(self.local_DISK_folder)
+            directories_created.append(self.local_DISK_folder)
+        if not os.path.exists(self.local_RAM_folder):
+            os.makedirs(self.local_RAM_folder)
+            directories_created.append(self.local_RAM_folder)
+        if not os.path.exists(self.local_matrix_results_RAM_folder):
+            os.makedirs(self.local_matrix_results_RAM_folder)
+            directories_created.append(self.local_matrix_results_RAM_folder)
+        
+        if directories_created:
+            print(f"✅ Created directories: {', '.join(directories_created)}")
+        else:
+            print("✅ All required directories already exist")
+                
+        # =============== CREATE REMOTE DIRECTORIES ===============
+        print("\n📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...")
             
-            command = f'mkdir -p {self.remote_project_dir}{self.remote_DISK_folder} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}'
-            print(f"   Sending command: {command}")
+        command = f'mkdir -p {self.remote_project_dir}{self.remote_DISK_folder} {self.remote_RAM_folder} {self.remote_matrix_results_RAM_folder}'
+        print(f"   Sending command: {command}")
             
-            for node_ip, socket in self.llama_socket_pool.items():
-                try:
-                    socket.send_multipart([command.encode('utf-8')])
-                    print(f"   ✅ Directory creation command sent to {node_ip}")
-                except Exception as e:
-                    print(f"   ❌ Failed to send command to {node_ip}: {e}")
-        '''
+        for node_ip, socket in self.llama_socket_pool.items():
+            try:
+                socket.send_multipart([command.encode('utf-8')])
+                print(f"   ✅ Directory creation command sent to {node_ip}")
+            except Exception as e:
+                print(f"   ❌ Failed to send command to {node_ip}: {e}")
+        
+class cluster_matrix:
+    def __init__(
+        self,
+        matrix_file_path,
+        cluster_zmq_object=None,
+        node_IP_list=None,
+        CPU_GPU_select_list=None,
+        node_percentages=None,
+        back_end_select_list=None,
+        split_matrix=False,
+        dim=0,
+        matrix_name='',
+        matrix_labeling='',
+        auto_set_up=None,
+    ):
+        
+        print("=" * 70)
+        print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
+        print("=" * 70)
 
+        # =============== NODE CONFIGURATION VALIDATION ===============        
+        # Check consistency of the node configuration
+
+        if node_percentages is None:
+            node_percentages = []
+        if back_end_select_list is None:
+            back_end_select_list = []
+        if auto_set_up is None:
+            auto_set_up = []
+
+        # Backwards-compatible positional signature support:
+        #   cluster_matrix(matrix_path, node_IP_list, CPU_GPU_select_list, node_percentages,
+        #                  back_end_select_list, split_matrix=False, dim=0, ...)
+        #
+        # After introducing `cluster_zmq_object` as the 2nd parameter, older code that passes
+        # positional args will shift everything by one. Detect that pattern and re-map.
+        if (
+            cluster_zmq_object is not None
+            and not isinstance(cluster_zmq_object, cluster_zmq)
+            and isinstance(cluster_zmq_object, (list, tuple))
+            and node_IP_list is not None
+            and isinstance(node_IP_list, (list, tuple))
+            and (len(node_IP_list) == 0 or isinstance(node_IP_list[0], bool))
+            and isinstance(back_end_select_list, bool)
+        ):
+            old_node_IP_list = list(cluster_zmq_object)
+            old_cpu_gpu = list(node_IP_list)
+            old_percentages = CPU_GPU_select_list if CPU_GPU_select_list is not None else []
+            old_backends = node_percentages if node_percentages is not None else []
+            old_split_matrix = bool(back_end_select_list)
+            old_dim = split_matrix if isinstance(split_matrix, int) else 0
+
+            cluster_zmq_object = None
+            node_IP_list = old_node_IP_list
+            CPU_GPU_select_list = old_cpu_gpu
+            node_percentages = old_percentages
+            back_end_select_list = old_backends
+            split_matrix = old_split_matrix
+            dim = old_dim
+
+        if CPU_GPU_select_list is None:
+            raise ValueError("CPU_GPU_select_list is required")
+
+        self._owns_cluster_zmq_object = False
+        if cluster_zmq_object is None:
+            if node_IP_list is None:
+                raise ValueError("Provide either cluster_zmq_object or node_IP_list")
+            cluster_zmq_object = cluster_zmq(node_IP_list)
+            self._owns_cluster_zmq_object = True
+
+        self.cluster_zmq_object = cluster_zmq_object
+        node_IP_list = list(cluster_zmq_object.node_IP_list)
+
+        if matrix_labeling != '' and len(node_percentages) == 0:
+            node_percentages = [0] * len(node_IP_list)
+                
+        if not (len(node_IP_list) == len(CPU_GPU_select_list) == len(back_end_select_list) == len(node_percentages)):
+            print("❌ NODE CONFIGURATION ERROR: Lengths do not match!")
+            print(f"   - node_IP_list: {len(node_IP_list)} nodes")
+            print(f"   - CPU_GPU_select_list: {len(CPU_GPU_select_list)} selections")
+            print(f"   - back_end_select_list: {len(back_end_select_list)} backends")
+            print(f"   - node_percentages: {len(node_percentages)} percentages")
+            raise ValueError("Node configuration error: All lists must have the same length")
+        
+        # Get head node IP addresses from environment variables
+        self.IP = cluster_zmq_object.IP
+        self.wifi_IP = cluster_zmq_object.wifi_IP
+
+        # ZMQ objects (shared via cluster_zmq_object)
+        self.zmq_context = cluster_zmq_object.zmq_context
+        self.llama_socket_pool = cluster_zmq_object.llama_socket_pool
+        self.llama_socket_pool_wifi = cluster_zmq_object.llama_socket_pool_wifi
+        self.ack_receiver_socket = cluster_zmq_object.ack_receiver_socket
+        
+        # =============== FOLDER PATH CONFIGURATION ===============
+        print("\n📁 CONFIGURING STORAGE PATHS...")
+        
+        # Local paths (head node)
+        self.local_DISK_folder = cluster_zmq_object.local_DISK_folder
+        self.local_RAM_folder = cluster_zmq_object.local_RAM_folder
+        self.local_project_dir = cluster_zmq_object.local_project_dir
+        
+        # Remote paths (worker nodes)
+        self.remote_DISK_folder = cluster_zmq_object.remote_DISK_folder
+        self.remote_RAM_folder = cluster_zmq_object.remote_RAM_folder
+        self.remote_project_dir = cluster_zmq_object.remote_project_dir
+                
+        # Get Python executable path
+        self.conda_env_dir = cluster_zmq_object.conda_env_dir
+        self.python_path = cluster_zmq_object.python_path
+
+        print(f"✅ Using Python path: {self.python_path}")
+
+        # =============== INSTANCE VARIABLE INITIALIZATION ===============
+        print("\n📊 INITIALIZING INSTANCE VARIABLES...")
+        
+        self.matrix_file_path = matrix_file_path
+        self.node_IP_list = node_IP_list
+        self.node_percentages = node_percentages
+        self.dim = dim
+        self.transpose = False
+        self.CPU_GPU_select_list = CPU_GPU_select_list  # True for GPU, False for CPU
+        self.back_end_select_list = back_end_select_list  # 'torch', 'llama', 'opencl'
+        self.split_matrix = split_matrix
+        self.OG_matrix_shape = []
+        self.matrix_labeling= matrix_labeling
+
+        # Extract matrix name from file path
+        if torch.is_tensor(matrix_file_path):
+            self.matrix_name = matrix_name
+        else:
+            matrix_file_path_split = matrix_file_path.split('/')
+            self.matrix_name = matrix_file_path_split[len(matrix_file_path_split)-1].split('.pt')[0]
+            print(f"   Matrix Name: {self.matrix_name}")
+            print(f"   Split Matrix: {split_matrix}")
+            print(f"   Dimension: {dim}")
+        
+        # If no backend specified, default to 'torch' for all nodes
+        if self.back_end_select_list == []:
+            print("   No backend specified, defaulting to 'torch' for all nodes")
+            for CPU_GPU_select in self.CPU_GPU_select_list:
+                self.back_end_select_list.append('torch')
+        
+        self.node_matrices = []
+        self.matrix_file_paths_list = []  # List for storing matrix file paths
+        
         # =============== MATRIX DISTRIBUTION LOGIC ===============
         # auto_set_up format: [system_id, "save"|"load"]
 
@@ -370,6 +449,14 @@ class cluster_matrix:
         Returns:
             Number of ACKs actually received (may be less than expected if timeout occurs)
         """
+        ack_socket = None
+        if getattr(self, "cluster_zmq_object", None) is not None:
+            ack_socket = getattr(self.cluster_zmq_object, "ack_receiver_socket", None)
+        if ack_socket is None:
+            ack_socket = getattr(self, "ack_receiver_socket", None)
+        if ack_socket is None:
+            raise RuntimeError("ACK receiver socket is not available (missing cluster_zmq_object?).")
+
         acks = 0
         start_time = time.time()
         
@@ -380,7 +467,7 @@ class cluster_matrix:
                 return acks
                 
             try:
-                msg = self.ack_receiver_socket.recv_string(flags=zmq.NOBLOCK)
+                msg = ack_socket.recv_string(flags=zmq.NOBLOCK)
                 if msg == expected_msg:
                     acks += 1
                     print(f"✅ Received {expected_msg} {acks}/{expected_count}")
@@ -393,8 +480,14 @@ class cluster_matrix:
 
     def zmq_send_command(self, worker_ip, command, timeout=5):
         """Send command using persistent connection pool"""
-        if worker_ip in self.llama_socket_pool:
-            socket_eth = self.llama_socket_pool[worker_ip]
+        socket_pool = None
+        if getattr(self, "cluster_zmq_object", None) is not None:
+            socket_pool = getattr(self.cluster_zmq_object, "llama_socket_pool", None)
+        if socket_pool is None:
+            socket_pool = getattr(self, "llama_socket_pool", None)
+
+        if socket_pool and worker_ip in socket_pool:
+            socket_eth = socket_pool[worker_ip]
             try:
                 # MUST send bytes, NOT str.
                 socket_eth.send(command.encode('utf-8'))
@@ -405,10 +498,16 @@ class cluster_matrix:
         else:
             print(f"❌ No socket found for worker {worker_ip}")
             return False
- 
+	 
     def zmq_send_file(self, worker_ip, local_file_path):
-        if worker_ip in self.llama_socket_pool:
-            socket_eth = self.llama_socket_pool[worker_ip]
+        socket_pool = None
+        if getattr(self, "cluster_zmq_object", None) is not None:
+            socket_pool = getattr(self.cluster_zmq_object, "llama_socket_pool", None)
+        if socket_pool is None:
+            socket_pool = getattr(self, "llama_socket_pool", None)
+
+        if socket_pool and worker_ip in socket_pool:
+            socket_eth = socket_pool[worker_ip]
             with open(local_file_path, 'rb') as f:
                 file_data = f.read()
             
@@ -420,7 +519,7 @@ class cluster_matrix:
                 file_data
             ])
             print(f"📤 Sent file {filename_only} to {worker_ip}")
-        
+	        
     def stream_matrix_binary(self, worker_ip, matrix, save_name):
         """
         Stream a matrix as binary data directly to a remote node without saving locally.
@@ -435,11 +534,17 @@ class cluster_matrix:
         if verbose:
             print(f"📤 Streaming matrix to {worker_ip} as {save_name}")
         
-        if worker_ip not in self.llama_socket_pool:
+        socket_pool = None
+        if getattr(self, "cluster_zmq_object", None) is not None:
+            socket_pool = getattr(self.cluster_zmq_object, "llama_socket_pool", None)
+        if socket_pool is None:
+            socket_pool = getattr(self, "llama_socket_pool", None)
+
+        if not socket_pool or worker_ip not in socket_pool:
             print(f"  ERROR: No socket connection to {worker_ip}")
             return
         
-        socket_eth = self.llama_socket_pool[worker_ip]
+        socket_eth = socket_pool[worker_ip]
 
         # ===== CREATE BINARY FILE DATA IN MEMORY (FAST PATH) =====
         if verbose:
@@ -506,11 +611,16 @@ class cluster_matrix:
         return payload_size
 
     def cleanup(self):
-        for socket in self.llama_socket_pool.values():
-            socket.close()
-        for socket in self.llama_socket_pool_wifi.values():
-            socket.close()
-        self.zmq_context.term()
+        # Network resources are owned by `cluster_zmq_object` and are meant to be shared across
+        # multiple `cluster_matrix` instances. Only tear them down if this instance created its
+        # own `cluster_zmq_object` (backwards-compatible mode).
+        if getattr(self, "_owns_cluster_zmq_object", False):
+            for socket in self.llama_socket_pool.values():
+                socket.close()
+            for socket in self.llama_socket_pool_wifi.values():
+                socket.close()
+            if self.zmq_context is not None:
+                self.zmq_context.term()
 
     def convert_to_cluster_matrix_grid(self):
         """
