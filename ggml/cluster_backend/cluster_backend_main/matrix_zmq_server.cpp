@@ -40,6 +40,18 @@ struct combined_matrix_shards
     std::list<std::vector<uint8_t>> received_matrix_data;  // Raw binary data of each shard
     std::list<std::vector<int>> dims_list;                 // Dimensions of each shard [batch, depth, rows, cols]
     
+    // System marker:
+    // - System 1: concatenate shards along join_dim
+    // - System 2: 2D grid tile assembly
+    //
+    // IMPORTANT: some sent_back shards arrive via `save_file_handler()` which currently
+    // calls `handle_combine_matrix_shard_list(..., total_shards=0)`, so we must persist
+    // whether this matrix is System-2 when we first learn it (from any shard that carries
+    // the signed total_shards encoding).
+    bool is_system2 = false;
+
+    // Dedupe: avoid counting the same shard index twice if it is retransmitted.
+    std::set<int> received_shard_numbers;
 
     int join_dim = 0; // << for now you only will join dim=0 but join based off this 
     // Note: Using std::list for received data allows efficient insertion
@@ -207,9 +219,18 @@ class llama_zmq_server
             worker_peer_receiver(zmq_context, zmq::socket_type::pull),
             server_running(true)
         {
-            // Load configuration from environment variables with defaults
-            project_folder = get_env("OPEN_CLUSTER_PROJECT_DIRECTORY", 
-                                "/home/rino/Desktop/Open_Cluster_AI_Station_beta/");
+
+            
+            // Load configuration from environment variables with defaults.
+            // Avoid hardcoding absolute paths; default to current working directory.
+            std::string default_project_folder = std::filesystem::current_path().string();
+            if (!default_project_folder.empty() && default_project_folder.back() != '/') {
+                default_project_folder.push_back('/');
+            }
+            project_folder = get_env("OPEN_CLUSTER_PROJECT_DIRECTORY", default_project_folder.c_str());
+
+
+
             matrix_shard_folder = get_env("OPEN_CLUSTER_MATRIX_SHARD_DIRECTORY", 
                                         "/dev/shm/matrix_shards/");
             matrix_results_folder = get_env("OPEN_CLUSTER_MATRIX_RESULTS_DIRECTORY", 
@@ -1250,6 +1271,14 @@ class llama_zmq_server
                     std::cout << "DEBUG: FOUND MATCH for matrix '"
                             << matrix_name << "'" << std::endl;
 
+                    // Dedupe retransmits (do not advance total_shards_reserved for duplicates)
+                    if (combined.received_shard_numbers.find(shard_num) != combined.received_shard_numbers.end())
+                    {
+                        std::cout << "DEBUG: Duplicate shard " << shard_num
+                                << " ignored for matrix '" << matrix_name << "'" << std::endl;
+                        return true;
+                    }
+
                     // Update shard count if first shard was placeholder
                     if (combined.number_of_shards_needed == 0 && total_shards != 0)
                     {
@@ -1265,6 +1294,7 @@ class llama_zmq_server
 
                         combined.join_dim = join_dim;
                         combined.number_of_shards_needed = shards_needed;
+                        combined.is_system2 = (total_shards < 0);
 
                         std::cout << "DEBUG: number_of_shards_needed UPDATED to "
                                 << shards_needed
@@ -1275,6 +1305,7 @@ class llama_zmq_server
                     combined.shard_numbers.push_back(shard_num);
                     combined.received_matrix_data.push_back(std::move(shard_bytes));
                     combined.dims_list.push_back({1, 1, shard_rows, shard_cols});
+                    combined.received_shard_numbers.insert(shard_num);
 
                     std::cout << "DEBUG: Updated shard count to "
                             << combined.total_shards_reserved
@@ -1285,7 +1316,7 @@ class llama_zmq_server
 
                     if (needed > 0 && combined.total_shards_reserved == needed)
                     {
-                        bool is_system2 = (total_shards < 0);
+                        bool is_system2 = combined.is_system2;
 
                         std::cout << "DEBUG: ALL SHARDS RECEIVED! Combining..."
                                 << std::endl;
@@ -1351,10 +1382,12 @@ class llama_zmq_server
             combined.join_dim = join_dim;
             combined.number_of_shards_needed = shards_needed;
             combined.total_shards_reserved = 1;
+            combined.is_system2 = (total_shards < 0);
 
             combined.shard_numbers.push_back(shard_num);
             combined.received_matrix_data.push_back(std::move(shard_bytes));
             combined.dims_list.push_back({1, 1, shard_rows, shard_cols});
+            combined.received_shard_numbers.insert(shard_num);
 
             combined_matrix_shards_list.push_back(std::move(combined));
 
@@ -1533,69 +1566,129 @@ class llama_zmq_server
                     });
 
             // ============================================================
-            // STEP 2: INFER GRID STRUCTURE AUTOMATICALLY
+            // STEP 2: SYSTEM-2 GRID SHAPE (2 x N)
             // ============================================================
-            const int total_shards = shards.size();
-            const int shard_rows   = shards[0].rows;
-            const int shard_cols   = shards[0].cols;
+            const int total_shards = (int) shards.size();
+            if (total_shards == 0) {
+                return result;
+            }
 
-            // Count how many shards contribute to the same row-block
-            // by detecting when row offset changes
-            int B_parts = 0;
-            for (int i = 0; i < total_shards; ++i) {
-                if (shards[i].index == i) {
-                    B_parts++;
-                } else {
-                    break;
+            // System-2 dispatch in `cluster_matrix_v1.py` is a 2 x base_slots grid:
+            // - first half of op slots use A_shard_0
+            // - second half use A_shard_1
+            // Each shard result is a unique (row, col) block that must be tiled into the
+            // final matrix.
+            constexpr int row_parts = 2;
+            if (total_shards % row_parts != 0) {
+                throw std::runtime_error("System-2 grid expects an even number of shards");
+            }
+            const int col_parts = total_shards / row_parts;
+
+            // Normalize shard indices so we can validate a contiguous range and map
+            // index -> (row, col).
+            const int min_index = shards.front().index;
+            const int max_index = shards.back().index;
+            if (max_index - min_index + 1 != total_shards) {
+                throw std::runtime_error(
+                    "System-2 combine expects contiguous shard indices; got gaps (check shard_index_override)"
+                );
+            }
+
+            std::vector<bool> seen((size_t) total_shards, false);
+            std::vector<torch::Tensor> grid((size_t) total_shards);
+
+            for (const auto& s : shards) {
+                const int norm = s.index - min_index;
+                if (norm < 0 || norm >= total_shards) {
+                    throw std::runtime_error("System-2 shard index out of expected range");
+                }
+                if (seen[(size_t) norm]) {
+                    throw std::runtime_error("Duplicate shard index received during System-2 combine");
+                }
+                seen[(size_t) norm] = true;
+                grid[(size_t) norm] = s.t;
+            }
+
+            // Row heights (2 parts) and column widths (N parts) may be uneven due to remainder.
+            std::vector<int64_t> row_heights((size_t) row_parts);
+            std::vector<int64_t> col_widths((size_t) col_parts);
+
+            for (int r = 0; r < row_parts; ++r) {
+                const auto& t0 = grid[(size_t) (r * col_parts)];
+                if (!t0.defined()) {
+                    throw std::runtime_error("Missing System-2 shard block");
+                }
+                row_heights[(size_t) r] = t0.size(0);
+                for (int c = 0; c < col_parts; ++c) {
+                    const auto& t = grid[(size_t) (r * col_parts + c)];
+                    if (!t.defined()) {
+                        throw std::runtime_error("Missing System-2 shard block");
+                    }
+                    if (t.size(0) != row_heights[(size_t) r]) {
+                        throw std::runtime_error("System-2 row-block height mismatch within same row");
+                    }
                 }
             }
 
-            if (B_parts == 0) {
-                throw std::runtime_error("Failed to infer System-2 grid");
+            for (int c = 0; c < col_parts; ++c) {
+                const auto& t0 = grid[(size_t) c];
+                if (!t0.defined()) {
+                    throw std::runtime_error("Missing System-2 shard block");
+                }
+                col_widths[(size_t) c] = t0.size(1);
+                for (int r = 0; r < row_parts; ++r) {
+                    const auto& t = grid[(size_t) (r * col_parts + c)];
+                    if (!t.defined()) {
+                        throw std::runtime_error("Missing System-2 shard block");
+                    }
+                    if (t.size(1) != col_widths[(size_t) c]) {
+                        throw std::runtime_error("System-2 col-block width mismatch within same column");
+                    }
+                }
             }
 
-            const int A_parts = total_shards / B_parts;
+            int64_t total_rows = 0;
+            for (int r = 0; r < row_parts; ++r) {
+                total_rows += row_heights[(size_t) r];
+            }
 
-            // ============================================================
-            // STEP 3: FINAL SHAPE
-            // ============================================================
-            const int total_rows = A_parts * shard_rows;
-            const int total_cols = shard_cols;
-
-            result.dims[0] = 1;
-            result.dims[1] = 1;
-            result.dims[2] = total_rows;
-            result.dims[3] = total_cols;
+            int64_t total_cols = 0;
+            for (int c = 0; c < col_parts; ++c) {
+                total_cols += col_widths[(size_t) c];
+            }
 
             auto out = torch::zeros(
                 {total_rows, total_cols},
                 torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU)
             );
 
-            // ============================================================
-            // STEP 4: SYSTEM-2 COMBINE (SUM PARTIALS)
-            // ============================================================
-            for (int i = 0; i < total_shards; ++i) {
-
-                const int a = i / B_parts;   // row block
-                const int row_offset = a * shard_rows;
-
-                out.slice(
-                    0,
-                    row_offset,
-                    row_offset + shard_rows
-                ).add_(shards[i].t);
+            int64_t row_off = 0;
+            for (int r = 0; r < row_parts; ++r) {
+                int64_t col_off = 0;
+                for (int c = 0; c < col_parts; ++c) {
+                    const auto& block = grid[(size_t) (r * col_parts + c)];
+                    out.narrow(0, row_off, row_heights[(size_t) r])
+                        .narrow(1, col_off, col_widths[(size_t) c])
+                        .copy_(block);
+                    col_off += col_widths[(size_t) c];
+                }
+                row_off += row_heights[(size_t) r];
             }
 
-            // ============================================================
-            // STEP 5: EXPORT RESULT
-            // ============================================================
-            result.data = std::make_unique<float[]>(total_rows * total_cols);
+            result.dims[0] = 1;
+            result.dims[1] = 1;
+            result.dims[2] = (int) total_rows;
+            result.dims[3] = (int) total_cols;
+
+            result.data = std::make_unique<float[]>((size_t) total_rows * (size_t) total_cols);
             std::memcpy(
                 result.data.get(),
                 out.contiguous().data_ptr<float>(),
-                sizeof(float) * total_rows * total_cols
+                sizeof(float) * (size_t) total_rows * (size_t) total_cols
             );
+
+            std::cout << "System-2 grid combine complete → shape ("
+                    << result.dims[2] << " x " << result.dims[3] << ")\n";
 
             return result;
         }
