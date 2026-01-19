@@ -382,12 +382,12 @@ class llama_zmq_server
             std::cout << "==============================\n" << std::endl;
         }
 
-	        void send_ack(std::string ack_msg = "ACK") 
-	        {
-	            zmq::message_t ack(ack_msg.data(), ack_msg.size());
-	            std::lock_guard<std::mutex> lock(ack_sender_mutex);
-	            ack_sender.send(ack, zmq::send_flags::none);
-	        }
+	    void send_ack(std::string ack_msg = "ACK") 
+	    {
+	        zmq::message_t ack(ack_msg.data(), ack_msg.size());
+	        std::lock_guard<std::mutex> lock(ack_sender_mutex);
+	        ack_sender.send(ack, zmq::send_flags::none);
+	    }
 
         void run_server() 
         {
