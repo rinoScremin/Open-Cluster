@@ -222,8 +222,10 @@ class llama_zmq_server
         // Thread-safe mutexes (ADD THESE)
         std::mutex linux_commands_mutex;
         std::mutex server_commands_mutex;
-        std::mutex file_data_mutex;
-        std::mutex wifi_commands_mutex;
+	        std::mutex file_data_mutex;
+	        std::mutex wifi_commands_mutex;
+	        std::mutex head_node_sender_mutex;
+	        std::mutex ack_sender_mutex;
         
         std::atomic<bool> server_running;
         llama_matrix_backend matrix_backend_llama;
@@ -319,16 +321,23 @@ class llama_zmq_server
             file_receiver_wifi.bind(wifi_pull_port);
             file_sender_wifi.bind(wifi_push_port);
             
-            // Connect to head node for coordination
-            head_node_sender_eth.connect("tcp://" + head_node_ip_eth + ":" + head_node_PULL_port);
-            head_node_sender_wifi.connect("tcp://" + head_node_ip_wifi + ":" + head_node_PULL_port);
+	            // Connect to head node for coordination
+	            head_node_sender_eth.connect("tcp://" + head_node_ip_eth + ":" + head_node_PULL_port);
+	            head_node_sender_wifi.connect("tcp://" + head_node_ip_wifi + ":" + head_node_PULL_port);
+	            // Prevent indefinite blocking on send if the head isn't reachable/reading.
+	            head_node_sender_eth.set(zmq::sockopt::linger, 0);
+	            head_node_sender_wifi.set(zmq::sockopt::linger, 0);
+	            head_node_sender_eth.set(zmq::sockopt::sndtimeo, 10000);
+	            head_node_sender_wifi.set(zmq::sockopt::sndtimeo, 10000);
             
             // Setup Python front-end ACK communication
             std::string python_frontend_ip = get_env("HEAD_NODE_IP", "192.168.2.100");
             std::string python_frontend_port = get_env("PYTHON_FRONT_END_CLUSTER_PORT", "7790");
             
-            ack_sender = zmq::socket_t(zmq_context, zmq::socket_type::push);
-            ack_sender.connect("tcp://" + python_frontend_ip + ":" + python_frontend_port);
+	            ack_sender = zmq::socket_t(zmq_context, zmq::socket_type::push);
+	            ack_sender.connect("tcp://" + python_frontend_ip + ":" + python_frontend_port);
+	            ack_sender.set(zmq::sockopt::linger, 0);
+	            ack_sender.set(zmq::sockopt::sndtimeo, 10000);
             
             // Worker-to-worker peer communication setup
             // TODO: Load worker IPs from environment or configuration file
@@ -373,11 +382,12 @@ class llama_zmq_server
             std::cout << "==============================\n" << std::endl;
         }
 
-        void send_ack(std::string ack_msg = "ACK") 
-        {
-            zmq::message_t ack(ack_msg.data(), ack_msg.size());
-            ack_sender.send(ack, zmq::send_flags::none);
-        }
+	        void send_ack(std::string ack_msg = "ACK") 
+	        {
+	            zmq::message_t ack(ack_msg.data(), ack_msg.size());
+	            std::lock_guard<std::mutex> lock(ack_sender_mutex);
+	            ack_sender.send(ack, zmq::send_flags::none);
+	        }
 
         void run_server() 
         {
@@ -886,6 +896,80 @@ class llama_zmq_server
             return {filename, -1};
         }
 
+        std::string get_matrix_output_filename(
+            const std::string& matrix_pathA,
+            const std::string& matrix_pathB
+        )
+        {
+            // Extract filenames only
+            std::string a_filename =
+                std::filesystem::path(matrix_pathA).filename().string();
+            std::string b_filename =
+                std::filesystem::path(matrix_pathB).filename().string();
+
+            // -------------------------------
+            // Remove ".bin" if present
+            // -------------------------------
+            auto strip_bin = [](std::string& name)
+            {
+                size_t pos = name.rfind(".bin");
+                if (pos != std::string::npos)
+                    name = name.substr(0, pos);
+            };
+
+            strip_bin(a_filename);
+            strip_bin(b_filename);
+
+            // -------------------------------
+            // Extract shard numbers
+            // -------------------------------
+            auto [matrix_nameA, shard_numA] =
+                get_matrix_name_and_shard_number(a_filename);
+            auto [matrix_nameB, shard_numB] =
+                get_matrix_name_and_shard_number(b_filename);
+
+            // -------------------------------
+            // Remove any lingering "_shard_X"
+            // -------------------------------
+            auto strip_shard = [](std::string& name)
+            {
+                size_t pos = name.find("_shard_");
+                if (pos != std::string::npos)
+                    name = name.substr(0, pos);
+            };
+
+            strip_shard(matrix_nameA);
+            strip_shard(matrix_nameB);
+
+            // -------------------------------
+            // Determine shard number
+            // -------------------------------
+            int shard_num = -1;
+            if (shard_numA != -1)
+                shard_num = shard_numA;
+            else if (shard_numB != -1)
+                shard_num = shard_numB;
+
+            // -------------------------------
+            // Build output filename
+            // -------------------------------
+            std::string output_filename =
+                matrix_nameA + "x" + matrix_nameB;
+
+            // If no shard number could be inferred, assign a sequential shard index per output base
+            if (shard_num == -1) {
+                std::lock_guard<std::mutex> lock(output_shard_mutex);
+                shard_num = output_shard_counters[output_filename]++;
+            }
+
+            if (shard_num != -1)
+                output_filename += "_shard_" + std::to_string(shard_num);
+
+            output_filename += ".bin";
+
+            return output_filename;
+        }
+
         void save_file_handler()
         {
             // Move reserved files to local copy under lock for processing
@@ -1240,54 +1324,55 @@ class llama_zmq_server
             std::cout << "Save file handler completed" << std::endl;
         }
 
-        bool send_back_file(const std::string& local_file_path,
-                            const std::string& filename,
-                            MatrixResult& save_result,
-                            int total_shards,
-                            const std::string& selected_backend,
-                            int output_dtype_tag)
+	        bool send_back_file(const std::string& local_file_path,
+	                            const std::string& filename,
+	                            MatrixResult& save_result,
+	                            int total_shards,
+	                            const std::string& selected_backend,
+	                            int output_dtype_tag)
         {
             std::cout << "SENDING BACK FILE" << std::endl;
             bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);
 
             // ============================================================
-            // WORKER NODE → SEND RESULT BACK TO HEAD (HEAD-SEMANTIC FORMAT)
+            // WORKER NODE → STREAM RESULT BACK TO HEAD (NO DISK)
             // ============================================================
-            if (!is_head_node)
-            {
-                std::string send_back_filename = "sent_back=" + filename;
-                std::cout << "Worker sending result back to head: " << send_back_filename << std::endl;
+	            if (!is_head_node)
+	            {
+	                std::string send_back_filename = "sent_back=" + filename;
+	                std::cout << "Worker streaming result back to head: "
+	                        << send_back_filename << std::endl;
 
-                // Send the on-disk v2 .bin bytes as-is so dtype_tag matches the payload.
-                std::vector<uint8_t> buffer;
-                {
-                    std::ifstream f(local_file_path, std::ios::binary | std::ios::ate);
-                    if (!f) {
-                        std::cerr << "ERROR: Worker cannot open result file to send_back: " << local_file_path << std::endl;
-                        return false;
-                    }
-                    std::streamsize size = f.tellg();
-                    if (size <= 0) {
-                        std::cerr << "ERROR: Worker result file empty: " << local_file_path << std::endl;
-                        return false;
-                    }
-                    buffer.resize(static_cast<size_t>(size));
-                    f.seekg(0, std::ios::beg);
-                    if (!f.read(reinterpret_cast<char*>(buffer.data()), size)) {
-                        std::cerr << "ERROR: Worker failed to read result file for send_back: " << local_file_path << std::endl;
-                        return false;
-                    }
+	                // Stream directly from memory using v2 binary format.
+	                // IMPORTANT: results must be routed to the head node PULL socket (file_receiver_*),
+	                // which is what `head_node_sender_*` is connected to.
+	                bool ok = stream_matrix_binary(
+	                    head_node_sender_eth,
+	                    head_node_sender_mutex,
+	                    head_node_ip_eth,     // destination label (for logging)
+	                    save_result,          // MatrixResult (already in memory)
+	                    send_back_filename,   // name expected by save_file_handler
+	                    output_dtype_tag      // -1 f32, -2 fp16, -3 bf16
+	                );
+
+	                if (!ok)
+	                {
+	                    ok = stream_matrix_binary(
+	                        head_node_sender_wifi,
+	                        head_node_sender_mutex,
+	                        head_node_ip_wifi,
+	                        save_result,
+	                        send_back_filename,
+	                        output_dtype_tag
+	                    );
+	                }
+
+	                if (!ok)
+	                {
+	                    std::cerr << "❌ Failed to stream matrix back to head: "
+	                            << send_back_filename << std::endl;
+                    return false;
                 }
-
-                // Send data to head node via ZeroMQ
-                zmq::message_t filename_msg(send_back_filename.data(), send_back_filename.size());
-                zmq::message_t data_msg(buffer.data(), buffer.size());
-
-                head_node_sender_eth.send(filename_msg, zmq::send_flags::sndmore);
-                head_node_sender_eth.send(data_msg, zmq::send_flags::none);
-
-                std::cout << "Result sent to head node: "
-                        << send_back_filename << " (" << buffer.size() << " bytes)" << std::endl;
 
                 return true;
             }
@@ -1328,6 +1413,91 @@ class llama_zmq_server
 
             return false;
         }
+
+	        //NEW CODE START
+	        bool stream_matrix_binary(
+	            zmq::socket_t& out_socket,
+	            std::mutex& out_socket_mutex,
+	            const std::string& dest_label,
+	            const MatrixResult& result,
+	            const std::string& save_name,
+	            int dtype_tag = -1
+	        )
+	        {
+            // Validate dtype
+            if (dtype_tag != -1 && dtype_tag != -2 && dtype_tag != -3) {
+                std::cerr << "Unsupported dtype_tag for stream_matrix_binary: "
+                        << dtype_tag << std::endl;
+                return false;
+            }
+
+            // Expect fixed 4D layout (same as save_matrix_bin)
+            const int ndim = 4;
+            size_t total_elements = 1;
+            for (int i = 0; i < ndim; i++) {
+                total_elements *= result.dims[i];
+            }
+
+            const size_t elem_bytes = (dtype_tag == -1) ? 4 : 2;
+            const size_t header_bytes = sizeof(int) * 5; // dtype + 4 dims
+            const size_t payload_bytes = header_bytes + total_elements * elem_bytes;
+
+	            // Allocate payload message (so we don't memcpy again into zmq::message_t)
+	            zmq::message_t payload_msg(payload_bytes);
+
+	            // ---- Write header ----
+	            auto* header = static_cast<int*>(payload_msg.data());
+	            header[0] = dtype_tag;
+	            for (int i = 0; i < ndim; i++) {
+	                header[i + 1] = result.dims[i];
+	            }
+
+	            // ---- Write payload ----
+	            uint8_t* data_ptr = static_cast<uint8_t*>(payload_msg.data()) + header_bytes;
+
+	            if (dtype_tag == -1) {
+	                // float32 (direct copy)
+	                std::memcpy(
+	                    data_ptr,
+                    result.data.get(),
+                    total_elements * sizeof(float)
+                );
+            }
+            else if (dtype_tag == -2) {
+                // float16
+                uint16_t* out = reinterpret_cast<uint16_t*>(data_ptr);
+                for (size_t i = 0; i < total_elements; ++i) {
+                    out[i] = float_to_fp16_bits(result.data[i]);
+                }
+            }
+            else {
+                // bfloat16
+                uint16_t* out = reinterpret_cast<uint16_t*>(data_ptr);
+                for (size_t i = 0; i < total_elements; ++i) {
+                    out[i] = float_to_bf16_bits(result.data[i]);
+                }
+            }
+
+	            // ---- Send via ZMQ (same pattern as zmq_send_file) ----
+	            try {
+	                zmq::message_t name_msg(save_name.data(), save_name.size());
+
+	                std::lock_guard<std::mutex> lock(out_socket_mutex);
+	                out_socket.send(name_msg, zmq::send_flags::sndmore);
+	                out_socket.send(payload_msg, zmq::send_flags::none);
+
+	                std::cout << "📤 Streamed matrix to " << dest_label
+	                        << " as " << save_name
+	                        << " (" << payload_bytes << " bytes)" << std::endl;
+	            }
+	            catch (const zmq::error_t& e) {
+	                std::cerr << "ZMQ stream error: " << e.what() << std::endl;
+                return false;
+            }
+
+            return true;
+        }
+        //NEW CODE END
 
         bool handle_combine_matrix_shard_list(
             const std::string& filename,
@@ -1932,24 +2102,21 @@ class llama_zmq_server
                         result.dims[1] = 1;
                     }
 
-                    if (!result.data) {
-                        std::cerr << "❌ LLAMA operation failed" << std::endl;
-                        op_success = false;
-                    } else {
-                        // Common save/send_back
-                        if (!save_matrix_bin(output_path.c_str(), result, output_dtype_tag)) {
-                            std::cerr << "❌ Failed to save result" << std::endl;
-                            op_success = false;
-                        } else {
-                            if (send_back > 0 || send_back < 0)
-                            {
-                                std::cout << "**matrix_operation** send_back: " << send_back << std::endl;
-                                send_back_file(output_path, output_filename, result, send_back, "llama", output_dtype_tag);
-                            }
-                            
-                            op_success = true;
-                        }
+                    // NEW SEND BACK LOGIC TO NOT SAVE TO DISK WHEN SEND BACK STREAM DATA BACK
+                    op_success = false;
+                    if (send_back > 0)
+                    {
+                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
+                        op_success = true;  // assume success for now
                     }
+                    else
+                    {
+                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
+                            op_success = true;
+                        else
+                            std::cerr << "❌ Failed to save result" << std::endl;
+                    }
+
                 }
 
                 // ============================================================
@@ -2032,15 +2199,19 @@ class llama_zmq_server
                     result.data = std::make_unique<float[]>(total);
                     memcpy(result.data.get(), C.data_ptr<float>(), total * sizeof(float));
 
-                    // Common save/send_back
-                    if (!save_matrix_bin(output_path.c_str(), result, output_dtype_tag)) {
-                        std::cerr << "❌ Failed to save result" << std::endl;
-                        op_success = false;
-                    } else {
-                        if (send_back > 0)
-                            
-                            send_back_file(output_path, output_filename, result, send_back, "torch", output_dtype_tag);
-                        op_success = true;
+                    // NEW SEND BACK LOGIC TO NOT SAVE TO DISK WHEN SEND BACK STREAM DATA BACK
+                    op_success = false;
+                    if (send_back > 0)
+                    {
+                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
+                        op_success = true;  // assume success for now
+                    }
+                    else
+                    {
+                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
+                            op_success = true;
+                        else
+                            std::cerr << "❌ Failed to save result" << std::endl;
                     }
                 }
 
@@ -2114,14 +2285,19 @@ class llama_zmq_server
                     result.data = std::make_unique<float[]>(M * N);
                     queue.enqueueReadBuffer(bufC, CL_TRUE, 0, sizeof(float) * M * N, result.data.get());
 
-                    // Common save/send_back
-                    if (!save_matrix_bin(output_path.c_str(), result, output_dtype_tag)) {
-                        std::cerr << "❌ Failed to save result" << std::endl;
-                        op_success = false;
-                    } else {
-                        if (send_back > 0)
-                            send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
-                        op_success = true;
+                    // NEW SEND BACK LOGIC TO NOT SAVE TO DISK WHEN SEND BACK STREAM DATA BACK
+                    op_success = false;
+                    if (send_back > 0)
+                    {
+                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
+                        op_success = true;  // assume success for now
+                    }
+                    else
+                    {
+                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
+                            op_success = true;
+                        else
+                            std::cerr << "❌ Failed to save result" << std::endl;
                     }
                 }
 
@@ -2137,81 +2313,6 @@ class llama_zmq_server
 
             try { send_ack("ACK_matrixOp_complete"); } catch (...) {}
             return op_success;
-        }
-
-        // OLD FUNCTIONS REMOVED - Now using unified matrix_operation() for all backends
-        std::string get_matrix_output_filename(
-            const std::string& matrix_pathA,
-            const std::string& matrix_pathB
-        )
-        {
-            // Extract filenames only
-            std::string a_filename =
-                std::filesystem::path(matrix_pathA).filename().string();
-            std::string b_filename =
-                std::filesystem::path(matrix_pathB).filename().string();
-
-            // -------------------------------
-            // Remove ".bin" if present
-            // -------------------------------
-            auto strip_bin = [](std::string& name)
-            {
-                size_t pos = name.rfind(".bin");
-                if (pos != std::string::npos)
-                    name = name.substr(0, pos);
-            };
-
-            strip_bin(a_filename);
-            strip_bin(b_filename);
-
-            // -------------------------------
-            // Extract shard numbers
-            // -------------------------------
-            auto [matrix_nameA, shard_numA] =
-                get_matrix_name_and_shard_number(a_filename);
-            auto [matrix_nameB, shard_numB] =
-                get_matrix_name_and_shard_number(b_filename);
-
-            // -------------------------------
-            // Remove any lingering "_shard_X"
-            // -------------------------------
-            auto strip_shard = [](std::string& name)
-            {
-                size_t pos = name.find("_shard_");
-                if (pos != std::string::npos)
-                    name = name.substr(0, pos);
-            };
-
-            strip_shard(matrix_nameA);
-            strip_shard(matrix_nameB);
-
-            // -------------------------------
-            // Determine shard number
-            // -------------------------------
-            int shard_num = -1;
-            if (shard_numA != -1)
-                shard_num = shard_numA;
-            else if (shard_numB != -1)
-                shard_num = shard_numB;
-
-            // -------------------------------
-            // Build output filename
-            // -------------------------------
-            std::string output_filename =
-                matrix_nameA + "x" + matrix_nameB;
-
-            // If no shard number could be inferred, assign a sequential shard index per output base
-            if (shard_num == -1) {
-                std::lock_guard<std::mutex> lock(output_shard_mutex);
-                shard_num = output_shard_counters[output_filename]++;
-            }
-
-            if (shard_num != -1)
-                output_filename += "_shard_" + std::to_string(shard_num);
-
-            output_filename += ".bin";
-
-            return output_filename;
         }
 
 };
