@@ -314,20 +314,11 @@ big_new_matrixA = cluster_matrix(
 
 ---
 
-## 🔄 Converting Results Back to PyTorch
+# USING `cluster_matrix_v1 system #2`
 
-After operations, results are stored as binary files:
-
-```
-/dev/shm/matrix_shards/*.bin
-```
-
-Convert back to PyTorch:
-
-```python
-big_new_matrixC.convert_bin_matrix_to_pt("path/to/output_file.bin")
-```
+This document demonstrates how to use `cluster_matrix_v1` system #1 for **distributed matrix operations** across multiple machines, GPUs, and backends, including **LLM inference workloads** (e.g. attention + MLP layers).
 
 ---
+
 
 
