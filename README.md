@@ -70,6 +70,8 @@ IP_list = [
     "192.168.2.101",
     "192.168.2.104",
 ]
+
+cluster_zmq_obj = cluster_zmq(IP_list) # init the cluster paths and networks connections 
 ```
 
 #### How IP duplication works
@@ -193,7 +195,7 @@ All operations like:
 ```python
 mlp_in_cluster = cluster_matrix(
     matrix_file_path=mlp_in_col,
-    node_IP_list=IP_list,
+    cluster_zmq_object=cluster_zmq_obj,
     CPU_GPU_select_list=CPU_GPU_select_list,
     node_percentages=percentages,
     back_end_select_list=backend_select_list,
@@ -211,7 +213,7 @@ mlp_in_cluster = cluster_matrix(
 ```python
 mlp_gate_cluster = cluster_matrix(
     matrix_file_path=mlp_gate_path,
-    node_IP_list=IP_list,
+    cluster_zmq_object=cluster_zmq_obj,
     CPU_GPU_select_list=CPU_GPU_select_list,
     node_percentages=percentages,
     back_end_select_list=backend_select_list,
@@ -237,7 +239,7 @@ x = x.unsqueeze(1)
 
 x = cluster_matrix(
     matrix_file_path=x,
-    node_IP_list=IP_list,
+    cluster_zmq_object=cluster_zmq_obj,
     CPU_GPU_select_list=CPU_GPU_select_list,
     node_percentages=percentages,
     back_end_select_list=backend_select_list,
@@ -300,7 +302,7 @@ Useful if:
 ```python
 big_new_matrixA = cluster_matrix(
     matrix_file_path=big_test_matrix_pathA_T,
-    node_IP_list=["192.168.2.100"],
+    cluster_zmq_object=cluster_zmq([192.168.2.100]),
     CPU_GPU_select_list=[True],
     node_percentages=[1],
     back_end_select_list=["llama"],
