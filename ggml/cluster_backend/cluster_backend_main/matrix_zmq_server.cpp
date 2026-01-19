@@ -382,12 +382,77 @@ class llama_zmq_server
             std::cout << "==============================\n" << std::endl;
         }
 
-	    void send_ack(std::string ack_msg = "ACK") 
-	    {
-	        zmq::message_t ack(ack_msg.data(), ack_msg.size());
-	        std::lock_guard<std::mutex> lock(ack_sender_mutex);
-	        ack_sender.send(ack, zmq::send_flags::none);
-	    }
+		    void send_ack(std::string ack_msg = "ACK") 
+		    {
+		        zmq::message_t ack(ack_msg.data(), ack_msg.size());
+		        std::lock_guard<std::mutex> lock(ack_sender_mutex);
+		        ack_sender.send(ack, zmq::send_flags::none);
+		    }
+
+	        bool send_combined_bin_to_python(
+	            const std::string& matrix_name,
+	            const MatrixResult& full,
+	            int output_dtype_tag
+	        )
+	        {
+	            // v2 binary wire format:
+	            // [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
+	            const int dtype_tag = output_dtype_tag;
+	            if (dtype_tag != -1 && dtype_tag != -2 && dtype_tag != -3) {
+	                std::cerr << "ERROR: Unsupported output dtype_tag for combined stream: "
+	                          << dtype_tag << std::endl;
+	                return false;
+	            }
+
+	            const int ndim = 4;
+	            size_t total_elements = 1;
+	            for (int i = 0; i < ndim; ++i) {
+	                const int v = (full.dims[i] > 0) ? full.dims[i] : 1;
+	                total_elements *= static_cast<size_t>(v);
+	            }
+
+	            const size_t elem_bytes = (dtype_tag == -1) ? sizeof(float) : sizeof(uint16_t);
+	            const size_t header_bytes = sizeof(int) * 5;
+	            const size_t payload_bytes = header_bytes + total_elements * elem_bytes;
+
+	            zmq::message_t payload_msg(payload_bytes);
+	            auto* header = static_cast<int*>(payload_msg.data());
+	            header[0] = dtype_tag;
+	            for (int i = 0; i < ndim; ++i) {
+	                header[i + 1] = (full.dims[i] > 0) ? full.dims[i] : 1;
+	            }
+
+	            uint8_t* data_ptr = static_cast<uint8_t*>(payload_msg.data()) + header_bytes;
+	            if (dtype_tag == -1) {
+	                std::memcpy(data_ptr, full.data.get(), total_elements * sizeof(float));
+	            } else if (dtype_tag == -2) {
+	                uint16_t* out = reinterpret_cast<uint16_t*>(data_ptr);
+	                for (size_t i = 0; i < total_elements; ++i) {
+	                    out[i] = float_to_fp16_bits(full.data[i]);
+	                }
+	            } else {
+	                uint16_t* out = reinterpret_cast<uint16_t*>(data_ptr);
+	                for (size_t i = 0; i < total_elements; ++i) {
+	                    out[i] = float_to_bf16_bits(full.data[i]);
+	                }
+	            }
+
+	            const std::string header_str = "BIN_COMBINED=" + matrix_name;
+	            try {
+	                zmq::message_t header_msg(header_str.data(), header_str.size());
+
+	                std::lock_guard<std::mutex> lock(ack_sender_mutex);
+	                ack_sender.send(header_msg, zmq::send_flags::sndmore);
+	                ack_sender.send(payload_msg, zmq::send_flags::none);
+	                std::cout << "📤 Streamed combined matrix to Python: "
+	                          << matrix_name << " (" << payload_bytes << " bytes)" << std::endl;
+	                return true;
+	            } catch (const zmq::error_t& e) {
+	                std::cerr << "ERROR: Failed to stream combined PT to Python: "
+	                          << e.what() << std::endl;
+	                return false;
+	            }
+	        }
 
         void run_server() 
         {
@@ -1631,18 +1696,19 @@ class llama_zmq_server
                             ? combine_matrix_shards_grid_2d(combined)
                             : combine_matrix_shards_2d(combined);
 
-                        if (full.data)
-                        {
-                            std::string final_path =
-                                std::filesystem::path(matrix_shard_folder) /
-                                (matrix_name + "_combined.bin");
-
-                            save_matrix_bin(final_path.c_str(), full, combined.output_dtype_tag);
-                            send_ack("ACK_combined_matrix_saved");
-
-                            std::cout << "Combined matrix saved: "
-                                    << final_path << std::endl;
-                        }
+	                        if (full.data)
+	                        {
+	                            const bool sent = send_combined_bin_to_python(
+	                                matrix_name,
+	                                full,
+	                                combined.output_dtype_tag
+	                            );
+	                            if (!sent) {
+	                                std::cerr << "ERROR: Failed to stream combined PT for "
+	                                          << matrix_name << std::endl;
+	                            }
+	                            send_ack("ACK_combined_matrix_saved");
+	                        }
                         else
                         {
                             std::cerr << "ERROR: Combine failed for "
@@ -1729,25 +1795,50 @@ class llama_zmq_server
             auto shard_num_it = combined.shard_numbers.begin();
             auto data_it      = combined.received_matrix_data.begin();
 
-            for (; shard_num_it != combined.shard_numbers.end() &&
-                data_it      != combined.received_matrix_data.end();
-                ++shard_num_it, ++data_it)
-            {
-                // Save shard bytes to temp file OR directly load from memory
-                // You already have bin layout → reuse loader
-                const std::vector<uint8_t>& bytes = *data_it;
+	            for (; shard_num_it != combined.shard_numbers.end() &&
+	                data_it      != combined.received_matrix_data.end();
+	                ++shard_num_it, ++data_it)
+	            {
+	                const std::vector<uint8_t>& bytes = *data_it;
+	                if (bytes.size() < static_cast<size_t>(5 * sizeof(int))) {
+	                    throw std::runtime_error("Shard payload too small to contain v2 header");
+	                }
 
-                // Write to temp buffer-backed stream
-                std::string tmp_path = "/dev/shm/tmp_shard_" + std::to_string(*shard_num_it) + ".bin";
-                {
-                    std::ofstream f(tmp_path, std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
-                }
+	                int dtype_tag = 0;
+	                int dims[4] = {0, 0, 0, 0};
+	                std::memcpy(&dtype_tag, bytes.data(), sizeof(int));
+	                std::memcpy(&dims[0], bytes.data() + sizeof(int), 4 * sizeof(int));
 
-                torch::Tensor t = load_matrix_bin_as_torch_view(tmp_path);
+	                if (dtype_tag != -1) {
+	                    throw std::runtime_error("combine_matrix_shards_2d expects float32 v2 shards (dtype_tag=-1)");
+	                }
 
-                shards.push_back({*shard_num_it, t});
-            }
+	                const int batch = dims[0];
+	                const int depth = dims[1];
+	                const int rows  = dims[2];
+	                const int cols  = dims[3];
+
+	                const size_t numel = static_cast<size_t>(batch) * depth * rows * cols;
+	                const size_t need_bytes = static_cast<size_t>(5 * sizeof(int)) + numel * sizeof(float);
+	                if (bytes.size() < need_bytes) {
+	                    throw std::runtime_error("Shard payload truncated (not enough float32 data)");
+	                }
+
+	                const float* raw = reinterpret_cast<const float*>(bytes.data() + 5 * sizeof(int));
+	                const auto options =
+	                    torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+
+	                torch::Tensor t;
+	                if (batch > 1 && depth > 1) {
+	                    t = torch::from_blob((void*)raw, {batch, depth, rows, cols}, options).clone();
+	                } else if (batch > 1) {
+	                    t = torch::from_blob((void*)raw, {batch, rows, cols}, options).clone();
+	                } else {
+	                    t = torch::from_blob((void*)raw, {rows, cols}, options).clone();
+	                }
+
+	                shards.push_back({*shard_num_it, std::move(t)});
+	            }
 
             std::sort(shards.begin(), shards.end(),
                     [](const ShardEntry& a, const ShardEntry& b) {
@@ -2102,20 +2193,22 @@ class llama_zmq_server
                         result.dims[1] = 1;
                     }
 
-                    // NEW SEND BACK LOGIC TO NOT SAVE TO DISK WHEN SEND BACK STREAM DATA BACK
-                    op_success = false;
-                    if (send_back > 0)
-                    {
-                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
-                        op_success = true;  // assume success for now
-                    }
-                    else
-                    {
-                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
-                            op_success = true;
-                        else
-                            std::cerr << "❌ Failed to save result" << std::endl;
-                    }
+	                    // SEND BACK LOGIC:
+	                    // `send_back == 0`  => no combine, just save
+	                    // `send_back != 0`  => combine on head (System-1: +, System-2: -)
+	                    op_success = false;
+	                    if (send_back != 0)
+	                    {
+	                        send_back_file(output_path, output_filename, result, send_back, "llama", output_dtype_tag);
+	                        op_success = true;  // assume success for now
+	                    }
+	                    else
+	                    {
+	                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
+	                            op_success = true;
+	                        else
+	                            std::cerr << "❌ Failed to save result" << std::endl;
+	                    }
 
                 }
 
@@ -2199,20 +2292,22 @@ class llama_zmq_server
                     result.data = std::make_unique<float[]>(total);
                     memcpy(result.data.get(), C.data_ptr<float>(), total * sizeof(float));
 
-                    // NEW SEND BACK LOGIC TO NOT SAVE TO DISK WHEN SEND BACK STREAM DATA BACK
-                    op_success = false;
-                    if (send_back > 0)
-                    {
-                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
-                        op_success = true;  // assume success for now
-                    }
-                    else
-                    {
-                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
-                            op_success = true;
-                        else
-                            std::cerr << "❌ Failed to save result" << std::endl;
-                    }
+	                    // SEND BACK LOGIC:
+	                    // `send_back == 0`  => no combine, just save
+	                    // `send_back != 0`  => combine on head (System-1: +, System-2: -)
+	                    op_success = false;
+	                    if (send_back != 0)
+	                    {
+	                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
+	                        op_success = true;  // assume success for now
+	                    }
+	                    else
+	                    {
+	                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
+	                            op_success = true;
+	                        else
+	                            std::cerr << "❌ Failed to save result" << std::endl;
+	                    }
                 }
 
                 // ============================================================
@@ -2285,20 +2380,22 @@ class llama_zmq_server
                     result.data = std::make_unique<float[]>(M * N);
                     queue.enqueueReadBuffer(bufC, CL_TRUE, 0, sizeof(float) * M * N, result.data.get());
 
-                    // NEW SEND BACK LOGIC TO NOT SAVE TO DISK WHEN SEND BACK STREAM DATA BACK
-                    op_success = false;
-                    if (send_back > 0)
-                    {
-                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
-                        op_success = true;  // assume success for now
-                    }
-                    else
-                    {
-                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
-                            op_success = true;
-                        else
-                            std::cerr << "❌ Failed to save result" << std::endl;
-                    }
+	                    // SEND BACK LOGIC:
+	                    // `send_back == 0`  => no combine, just save
+	                    // `send_back != 0`  => combine on head (System-1: +, System-2: -)
+	                    op_success = false;
+	                    if (send_back != 0)
+	                    {
+	                        send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
+	                        op_success = true;  // assume success for now
+	                    }
+	                    else
+	                    {
+	                        if (save_matrix_bin(output_path.c_str(), result, output_dtype_tag))
+	                            op_success = true;
+	                        else
+	                            std::cerr << "❌ Failed to save result" << std::endl;
+	                    }
                 }
 
                 else {
