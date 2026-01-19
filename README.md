@@ -264,7 +264,7 @@ By default:
 
 ---
 
-## ➕ Distributed Matrix Addition Example
+## ➕ Distributed Matrix Addition Example NOTE: CLUSTER ADD ONLY USED WITH 'SYSTEM 1' DO NOT USE WITH 'SYSTEM 2'
 
 ### Cluster ADD (Sharded)
 
