@@ -5,6 +5,8 @@ from cluster_matrix_v1 import cluster_zmq
 import torch
 import time
 import math
+import gc
+import glob
 
 class cluster_llm_transformer:
     def __init__(self, model_path, IP_list, percentages, CPU_GPU_select_list, backend_select_list):
@@ -174,18 +176,76 @@ class cluster_llm_transformer:
         inside the token decode loop. It preserves numerics because the underlying shards
         and `cluster_shard_operation` calls are unchanged.
         """
-        cm = self._cluster_weight_cache.get(matrix_file_path)
-        if cm is None:
-            cm = cluster_matrix(
-                matrix_file_path=matrix_file_path,
+        def _regenerate_weight_shards() -> None:
+            # Fallback path: only regenerate if `auto_set_up=[1, "load"]` fails.
+            # This avoids false-positive "missing shard" checks on the head node, because
+            # shards are intentionally distributed across nodes (not centralized on the head's disk).
+            matrix_name = os.path.basename(matrix_file_path).split(".pt")[0]
+
+            # Recreate shards with the same transpose policy used by `save_distribute_model_matrices`.
+            w = torch.load(matrix_file_path, map_location="cpu")
+            if not isinstance(w, torch.Tensor) or w.ndim != 2:
+                raise ValueError(f"Expected 2D torch.Tensor at {matrix_file_path}, got {type(w)} {getattr(w, 'shape', None)}")
+
+            hidden = int(self.hidden_size)
+            if matrix_file_path.endswith("_mlp_gate_proj_weight.pt") or matrix_file_path.endswith("_mlp_up_proj_weight.pt"):
+                if w.shape[0] == hidden:
+                    w = w.contiguous()
+                elif w.shape[1] == hidden:
+                    w = w.t().contiguous()
+                else:
+                    raise ValueError(f"Unexpected MLP gate/up shape at {matrix_file_path}: {tuple(w.shape)} (hidden={hidden})")
+            elif matrix_file_path.endswith("_mlp_down_proj_weight.pt"):
+                if w.shape[1] == hidden:
+                    w = w.contiguous()
+                elif w.shape[0] == hidden:
+                    w = w.t().contiguous()
+                else:
+                    raise ValueError(f"Unexpected MLP down shape at {matrix_file_path}: {tuple(w.shape)} (hidden={hidden})")
+            else:
+                w = w.t().contiguous()
+
+            cluster_matrix(
+                matrix_file_path=w,
                 cluster_zmq_object=self.cluster_zmq_object,
                 CPU_GPU_select_list=self.CPU_GPU_select_list,
                 node_percentages=self.percentages,
                 back_end_select_list=self.backend_select_list,
                 split_matrix=True,
                 dim=1,
-                auto_set_up=[1, "load"],
+                auto_set_up=[1, "save"],
+                matrix_name=matrix_name,
             )
+            del w
+            gc.collect()
+
+        cm = self._cluster_weight_cache.get(matrix_file_path)
+        if cm is None:
+            try:
+                cm = cluster_matrix(
+                    matrix_file_path=matrix_file_path,
+                    cluster_zmq_object=self.cluster_zmq_object,
+                    CPU_GPU_select_list=self.CPU_GPU_select_list,
+                    node_percentages=self.percentages,
+                    back_end_select_list=self.backend_select_list,
+                    split_matrix=True,
+                    dim=1,
+                    auto_set_up=[1, "load"],
+                )
+            except Exception as e:
+                print(f"⚠️  Weight load failed for {os.path.basename(matrix_file_path)}: {e}")
+                print("   Regenerating shards via save path, then retrying load...")
+                _regenerate_weight_shards()
+                cm = cluster_matrix(
+                    matrix_file_path=matrix_file_path,
+                    cluster_zmq_object=self.cluster_zmq_object,
+                    CPU_GPU_select_list=self.CPU_GPU_select_list,
+                    node_percentages=self.percentages,
+                    back_end_select_list=self.backend_select_list,
+                    split_matrix=True,
+                    dim=1,
+                    auto_set_up=[1, "load"],
+                )
             self._cluster_weight_cache[matrix_file_path] = cm
         return cm
 
@@ -669,14 +729,75 @@ class cluster_llm_transformer:
 
     def save_distribute_model_matrices(
         self,
+        start_layer = 0,
+        end_layer = 0,
         include_embed_tokens: bool = False,
         include_lm_head: bool = False,
         include_final_norm: bool = False,
         transpose_for_runtime: bool = True,
+        keep_ram_copies: bool = False,
+        cleanup_sleep_s: float = 0.0,
+        gc_collect: bool = True,
     ):
+        def _zmq_send_command(worker_ip: str, command: str) -> bool:
+            socket_pool = getattr(self.cluster_zmq_object, "llama_socket_pool", None)
+            if socket_pool and worker_ip in socket_pool:
+                try:
+                    socket_pool[worker_ip].send(command.encode("utf-8"))
+                    return True
+                except Exception as e:
+                    print(f"❌ Error sending command to {worker_ip}: {e}")
+                    return False
+            print(f"❌ No socket found for worker {worker_ip}")
+            return False
+
+        def _cleanup_ram_bins(prefix: str) -> None:
+            prefix = str(prefix)
+            if not prefix:
+                return
+
+            local_ram = getattr(self.cluster_zmq_object, "local_RAM_folder", "/dev/shm/matrix_shards/")
+            remote_ram = getattr(self.cluster_zmq_object, "remote_RAM_folder", "/dev/shm/matrix_shards/")
+            if not local_ram.endswith("/"):
+                local_ram += "/"
+            if not remote_ram.endswith("/"):
+                remote_ram += "/"
+
+            # Local cleanup (head node)
+            for path in glob.glob(os.path.join(local_ram, f"{prefix}*.bin")):
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except Exception as e:
+                    print(f"⚠️  Failed to remove local RAM file {path}: {e}")
+
+            # Remote cleanup (worker nodes)
+            # Note: no ACK is guaranteed for Linux commands; we best-effort free RAM.
+            unique_ips = sorted(set(getattr(self.cluster_zmq_object, "node_IP_list", self.IP_list)))
+            head_ip = getattr(self.cluster_zmq_object, "IP", None)
+            for ip in unique_ips:
+                if head_ip and ip == head_ip:
+                    continue
+                cmd = f"rm -f {remote_ram}{prefix}*.bin"
+                _zmq_send_command(ip, cmd)
+
+            if cleanup_sleep_s:
+                time.sleep(float(cleanup_sleep_s))
+
+            if gc_collect:
+                gc.collect()
+
         num_layers = getattr(self.config, "num_hidden_layers", 32)
         print(f"📊 Total layers: {num_layers}")
         print("-" * 70)
+
+        if end_layer > num_layers or start_layer > num_layers:
+            print("incorrect start/end layers")
+            return 0
+
+        if end_layer == 0:
+            end_layer = self.num_layers
 
         extra_paths: list[str] = []
         if include_embed_tokens:
@@ -695,6 +816,7 @@ class cluster_llm_transformer:
             if not os.path.exists(extra_path):
                 print(f"⚠️  Missing extra weight (skip): {extra_path}")
                 continue
+            extra_name = os.path.basename(extra_path).split(".pt")[0]
             cluster_matrix(
                 matrix_file_path=extra_path,
                 cluster_zmq_object=self.cluster_zmq_object,
@@ -705,8 +827,10 @@ class cluster_llm_transformer:
                 dim=1,
                 auto_set_up=[1, "save"],
             )
-
-        for layer_idx in range(num_layers):
+            if not keep_ram_copies:
+                _cleanup_ram_bins(extra_name)
+         
+        for layer_idx in range(start_layer, end_layer):
             print(f"SAVING LAYER: {layer_idx}")
             # ------------------------------------------------------------
             # Paths
@@ -779,6 +903,12 @@ class cluster_llm_transformer:
                     auto_set_up=[1, "save"],
                     matrix_name=matrix_name,
                 )
+                # Release CPU memory pressure early (these weights are huge).
+                del weight
+                if not keep_ram_copies:
+                    _cleanup_ram_bins(matrix_name)
+                elif gc_collect:
+                    gc.collect()
 
     def rms_norm(self, x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
         # x: [..., hidden]
@@ -1251,15 +1381,17 @@ class cluster_llm_transformer:
             return layer_out.squeeze(0)
         return layer_out
 
-
 if __name__ == "__main__":
     IP_list = [
         "192.168.2.100",
-        "192.168.2.100"
+        "192.168.2.100",
+        "192.168.2.101",
+        "192.168.2.101",
+        "192.168.2.104"
     ]
-    percentages = [0.5, 0.5]
-    CPU_GPU_select_list = [True, True]
-    backend_select_list = ["llama", "llama"]
+    percentages = [0.35,0.35,0.15,0.05,0.1]
+    CPU_GPU_select_list = [True,True,True,True,True]
+    backend_select_list = ["llama","llama","llama","llama","llama"]
 
     test = cluster_llm_transformer(
         "/home/rino/.cache/exo/downloads/mlabonne--Meta-Llama-3.1-8B-Instruct-abliterated",
@@ -1271,13 +1403,13 @@ if __name__ == "__main__":
 
     #test.save_all_model_layers()
     #test.transpose_mlp_layers()
-    test.save_distribute_model_matrices()
+    #test.save_distribute_model_matrices(0,32)
 
     # Example:
 
     input_prompt = input("Enter prompt: ")
 
-    output_prompt = test.run_transformer('tell me a short joke', max_new_tokens=16, micro_batch_size=8)
+    output_prompt = test.run_transformer(input_prompt, max_new_tokens=16, micro_batch_size=8)
 
     print(input_prompt, '\n')
     print(output_prompt, '\n')
