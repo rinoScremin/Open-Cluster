@@ -405,3 +405,278 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
     small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)  
 ```
 
+Here’s a polished, GitHub-ready version of your README section. I’ve cleaned up spelling, formatting, headings, and markdown so it’s **clear, consistent, and professional**, while keeping all your examples intact.
+
+---
+
+# System 2 — Matrix Split & Combine
+
+System 2 uses a **grid-based splitting pattern** for distributed matrix operations.
+
+* This produces a **fixed number of matrix operations** (ops) for configurations with fewer than the threshold nodes.
+* As you add nodes, the number of ops **remains the same** until the number of nodes exceeds the current ops.
+* Once this threshold is crossed, the number of matrix ops **increases to the next multiple** (e.g., 8 → 12 → 16, etc.).
+* This pattern continues as nodes are added.
+
+---
+
+## Node Mapping Examples
+
+### Example 1 — 6 nodes
+
+```python
+IP_list = [
+    '192.168.2.100','192.168.2.100','192.168.2.100',
+    '192.168.2.101','192.168.2.101',
+    '192.168.2.104'
+]
+```
+
+* **Number of matrix ops:** 8
+
+```
+'192.168.2.100' → matrix op 1 and 7
+'192.168.2.100' → matrix op 2 and 8
+'192.168.2.100' → matrix op 3
+'192.168.2.101' → matrix op 4
+'192.168.2.101' → matrix op 5
+'192.168.2.104' → matrix op 6
+```
+
+---
+
+### Example 2 — 8 nodes
+
+```python
+IP_list = [
+    '192.168.2.100','192.168.2.100','192.168.2.100',
+    '192.168.2.101','192.168.2.101','192.168.2.104',
+    '192.168.2.103','192.168.2.102'
+]
+```
+
+* **Number of matrix ops:** 8
+
+```
+'192.168.2.100' → matrix op 1
+'192.168.2.100' → matrix op 2
+'192.168.2.100' → matrix op 3
+'192.168.2.101' → matrix op 4
+'192.168.2.101' → matrix op 5
+'192.168.2.104' → matrix op 6
+'192.168.2.103' → matrix op 7
+'192.168.2.102' → matrix op 8
+```
+
+---
+
+# Splitting & Join Workflow
+
+### Base Example
+
+```python
+A3 = np.random.rand(1500, 1500)
+B3 = np.random.rand(1500, 1500)
+```
+
+* **Split A along columns (`dim=1`)**
+* **Split B along rows (`dim=0`)**
+
+**A shards:**
+
+```
+A1 = (1500, 750)
+A2 = (1500, 750)
+```
+
+**B shards:**
+
+```
+B1 = (750, 1500)
+B2 = (750, 1500)
+```
+
+**Further split B shards:**
+
+```
+B1_1 = (250, 1500)
+B1_2 = (250, 1500)
+B1_3 = (250, 1500)
+
+B2_1 = (250, 1500)
+B2_2 = (250, 1500)
+B2_3 = (250, 1500)
+```
+
+**Compute operations:**
+
+```
+A1[:, 0:250]   @ B1_1 = C1
+A1[:, 250:500] @ B1_2 = C2
+A1[:, 500:750] @ B1_3 = C3
+
+A2[:, 0:250]   @ B2_1 = C4
+A2[:, 250:500] @ B2_2 = C5
+A2[:, 500:750] @ B2_3 = C6
+```
+
+**Final result:**
+
+```
+C = C1 + C2 + C3 + C4 + C5 + C6
+```
+
+---
+
+# ✅ Example 1 — 4 nodes
+
+**Target:**
+
+```
+C = C1 + C2 + C3 + C4
+```
+
+**Matrices:**
+
+```python
+A = np.random.rand(500, 1500)
+B = np.random.rand(1500, 1000)
+```
+
+**Split strategy:**
+
+```
+Split A along dim = 1
+Split B along dim = 0
+```
+
+**A shards (2 shards):**
+
+```
+A1 = (500, 750)
+A2 = (500, 750)
+```
+
+**B shards (2 shards):**
+
+```
+B1 = (750, 1000)
+B2 = (750, 1000)
+```
+
+**Further split B shards (2-way for 4 nodes):**
+
+```
+B1_1 = (375, 1000)
+B1_2 = (375, 1000)
+
+B2_1 = (375, 1000)
+B2_2 = (375, 1000)
+```
+
+**Compute:**
+
+```
+A1[:, 0:375]   @ B1_1 = C1
+A1[:, 375:750] @ B1_2 = C2
+
+A2[:, 0:375]   @ B2_1 = C3
+A2[:, 375:750] @ B2_2 = C4
+```
+
+**Final result:**
+
+```
+C = C1 + C2 + C3 + C4  → shape: (500, 1000)
+```
+
+---
+
+# ✅ Example 2 — 8 nodes
+
+**Target:**
+
+```
+C = C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8
+```
+
+**Matrices:**
+
+```python
+A = np.random.rand(500, 1500)
+B = np.random.rand(1500, 1000)
+```
+
+**Split strategy:**
+
+```
+Split A along dim = 1
+Split B along dim = 0
+```
+
+**A shards (2 shards):**
+
+```
+A1 = (500, 750)
+A2 = (500, 750)
+```
+
+**B shards (2 shards):**
+
+```
+B1 = (750, 1000)
+B2 = (750, 1000)
+```
+
+**Further split B shards (4-way split per shard):**
+
+```
+B1_1 = (187, 1000)
+B1_2 = (187, 1000)
+B1_3 = (188, 1000)
+B1_4 = (188, 1000)
+
+B2_1 = (187, 1000)
+B2_2 = (187, 1000)
+B2_3 = (188, 1000)
+B2_4 = (188, 1000)
+```
+
+**Compute:**
+
+```
+A1[:, 0:187]   @ B1_1 = C1
+A1[:, 187:374] @ B1_2 = C2
+A1[:, 374:562] @ B1_3 = C3
+A1[:, 562:750] @ B1_4 = C4
+
+A2[:, 0:187]   @ B2_1 = C5
+A2[:, 187:374] @ B2_2 = C6
+A2[:, 374:562] @ B2_3 = C7
+A2[:, 562:750] @ B2_4 = C8
+```
+
+**Final result:**
+
+```
+C = C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8  → shape: (500, 1000)
+```
+
+---
+
+## 🧠 Core Pattern
+
+* **A** is always split **by columns**
+* **B** is always split **by rows**
+* **Inner dimension chunks must match**
+* Each node computes a **full output matrix**
+* **Partial outputs are summed** to produce the final result
+
+---
+
+This version is ready to drop straight into your GitHub README.md — it’s structured, readable, and fully formatted.
+
+If you want, I can **also make a small diagram showing node → matrix op mapping** to make it visually clear for readers. It would look really clean in the README.
+
+Do you want me to do that?
+
