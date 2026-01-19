@@ -1782,8 +1782,17 @@ class cluster_matrix:
         print(f"Matrix B: {cluster_matrixB.matrix_name}")
         print(f"Operation: {operation}")
         print(f"Transpose A: {TransposeA}, Transpose B: {TransposeB}")
+        node_IP_list_len = len(self.node_IP_list)
+
+        # Single-node runs should not use send_back/combining logic.
+        # The result will be written locally as a single shard (e.g. `<base>_shard_0.bin`)
+        # and can be loaded directly via `convert_bin_matrix_to_pt(...)`.
+        if node_IP_list_len == 1 and send_back_result:
+            print("⚠️  Single-node mode detected: forcing send_back_result=False (no combine/send_back).")
+            send_back_result = False
+
         print(f"Send back result: {send_back_result}")
-        print(f"Number of shards: {len(self.node_IP_list)}")
+        print(f"Number of shards: {node_IP_list_len}")
         
         # ===== TRACK GPU USAGE PER NODE =====
         # This ensures multiple GPUs on the same node get used properly
@@ -1818,8 +1827,6 @@ class cluster_matrix:
             # Get file paths for both matrices
             matrix_a = node_matrix  # Current matrix shard
             matrix_b = cluster_matrixB.matrix_file_paths_list[shard_index]  # Other matrix shard
-            print(f"  Matrix A path: {matrix_a}")
-            print(f"  Matrix B path: {matrix_b}")
             
             # Convert booleans to lowercase strings for command
             use_gpu_str = str(CPU_GPU_select).lower()  # "true" or "false"
@@ -1842,7 +1849,7 @@ class cluster_matrix:
                 send_back = 0
                 print("Send back result: No (keep distributed)")
             else:
-                shard_count = len(self.node_IP_list)
+                shard_count = node_IP_list_len
                 # join_dim must ALWAYS be set
                 join_dim = self.dim  # 0 or 1
                 # Encode: join_dim * 10 + shard_count
@@ -1894,11 +1901,25 @@ class cluster_matrix:
             base_result_name = f"{cluster_matrixB.matrix_name}x{self.matrix_name}"
             print(f"\n📊 Result base: {base_result_name} (send_back={send_back_result})")
 
-        if send_back_result:  
-            combined_matrix = self.wait_for_combined_pt(base_result_name)
-            #cluster_matrixB.cleanup() we do not need this anymore 
+        # CASE 1: Single node, keep distributed → just convert single shard
+        if not send_back_result and node_IP_list_len == 1:
+            path = self.local_RAM_folder + base_result_name + '_shard_0.bin'
+            # Give the server a moment to finish writing the shard file (RAM-backed FS).
+            if not os.path.exists(path):
+                for _ in range(200):  # ~2s
+                    time.sleep(0.01)
+                    if os.path.exists(path):
+                        break
+            combined_matrix = self.convert_bin_matrix_to_pt(path)
             return combined_matrix
-        else:  
+
+        # CASE 2: Multiple nodes, want combined result → wait for combined PT
+        if send_back_result and node_IP_list_len > 1:  
+            combined_matrix = self.wait_for_combined_pt(base_result_name)
+            return combined_matrix
+
+        # CASE 3: Multiple nodes, keep distributed → return cluster_matrix
+        if not send_back_result and node_IP_list_len > 1: 
             result_cluster_matrix = cluster_matrix(  
                 base_result_name,  
                 self.node_IP_list,  
@@ -1908,7 +1929,9 @@ class cluster_matrix:
                 True  
             )  
             return result_cluster_matrix
-        return False  # Return the distributed result instance
+
+        # fallback (should rarely happen)
+        return False
 
     def __del__(self):
         """Destructor as fallback cleanup."""
