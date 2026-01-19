@@ -1324,7 +1324,7 @@ class llama_zmq_server
             std::cout << "Save file handler completed" << std::endl;
         }
 
-	        bool send_back_file(const std::string& local_file_path,
+	    bool send_back_file(const std::string& local_file_path,
 	                            const std::string& filename,
 	                            MatrixResult& save_result,
 	                            int total_shards,
@@ -1415,15 +1415,15 @@ class llama_zmq_server
         }
 
 	        //NEW CODE START
-	        bool stream_matrix_binary(
-	            zmq::socket_t& out_socket,
-	            std::mutex& out_socket_mutex,
-	            const std::string& dest_label,
-	            const MatrixResult& result,
-	            const std::string& save_name,
-	            int dtype_tag = -1
-	        )
-	        {
+	    bool stream_matrix_binary(
+	        zmq::socket_t& out_socket,
+	        std::mutex& out_socket_mutex,
+	        const std::string& dest_label,
+	        const MatrixResult& result,
+	        const std::string& save_name,
+	        int dtype_tag = -1
+	    )
+	    {
             // Validate dtype
             if (dtype_tag != -1 && dtype_tag != -2 && dtype_tag != -3) {
                 std::cerr << "Unsupported dtype_tag for stream_matrix_binary: "
