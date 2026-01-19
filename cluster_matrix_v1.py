@@ -212,6 +212,10 @@ class cluster_zmq:
             
             # Reference it in the instance
             self.ack_receiver_socket = cluster_zmq._ack_receiver_socket
+            # Cache for combined PT blobs streamed from C++ (PT_COMBINED=<name>)
+            if not hasattr(cluster_zmq, "_combined_pt_payloads"):
+                cluster_zmq._combined_pt_payloads = {}
+            self.combined_pt_payloads = cluster_zmq._combined_pt_payloads
 
         # =============== CREATE LOCAL DIRECTORIES ===============
         print("\n📂 CREATING LOCAL DIRECTORIES...")
@@ -465,15 +469,115 @@ class cluster_matrix:
                 print(f"⏰ TIMEOUT: Only received {acks}/{expected_count} ACKs after {time_out} seconds")
                 return acks
             try:
-                msg = ack_socket.recv_string(flags=zmq.NOBLOCK)
-                if msg == expected_msg:
-                    acks += 1
-                    print(f"✅ Received {expected_msg} {acks}/{expected_count}")
+                parts = ack_socket.recv_multipart(flags=zmq.NOBLOCK)
+                if not parts:
+                    continue
+
+                # Single-part string ACK
+                if len(parts) == 1:
+                    msg = parts[0].decode("utf-8", errors="replace")
+                    if msg == expected_msg:
+                        acks += 1
+                        print(f"✅ Received {expected_msg} {acks}/{expected_count}")
+                    continue
+
+                # Multipart payload: header + bytes
+                header = parts[0].decode("utf-8", errors="replace")
+                payload = parts[1]
+                if header.startswith("BIN_COMBINED=") or header.startswith("PT_COMBINED="):
+                    key = header.split("=", 1)[1]
+                    store = None
+                    if getattr(self, "cluster_zmq_object", None) is not None:
+                        store = getattr(self.cluster_zmq_object, "combined_pt_payloads", None)
+                    if store is None and hasattr(cluster_zmq, "_combined_pt_payloads"):
+                        store = cluster_zmq._combined_pt_payloads
+                    if store is not None:
+                        store[key] = payload
             except zmq.Again:
                 # No message yet, sleep briefly to avoid 100% CPU
                 time.sleep(0.01)
         print("✅ All ACKs received!")
         return acks
+
+    def wait_for_combined_pt(self, base_result_name, time_out=120, force_2d=True):
+        ack_socket = None
+        if getattr(self, "cluster_zmq_object", None) is not None:
+            ack_socket = getattr(self.cluster_zmq_object, "ack_receiver_socket", None)
+        if ack_socket is None:
+            ack_socket = getattr(self, "ack_receiver_socket", None)
+        if ack_socket is None:
+            raise RuntimeError("ACK receiver socket is not available (missing cluster_zmq_object?).")
+
+        store = None
+        if getattr(self, "cluster_zmq_object", None) is not None:
+            store = getattr(self.cluster_zmq_object, "combined_pt_payloads", None)
+        if store is None and hasattr(cluster_zmq, "_combined_pt_payloads"):
+            store = cluster_zmq._combined_pt_payloads
+        if store is None:
+            store = {}
+
+        import io
+
+        def _bin_payload_to_tensor(payload: bytes):
+            # v2: [dtype_tag(int32), batch, depth, rows, cols, data]
+            mv = memoryview(payload)
+            if len(mv) < 5 * 4:
+                raise ValueError("Combined payload too small for v2 header")
+            dtype_tag, b, d, r, c = struct.unpack_from("iiiii", mv, 0)
+            offset = 5 * 4
+            numel = int(b) * int(d) * int(r) * int(c)
+
+            if dtype_tag == -1:
+                np_dtype = np.float32
+            elif dtype_tag == -2:
+                np_dtype = np.float16
+            elif dtype_tag == -3:
+                np_dtype = np.uint16  # raw bf16 bits
+            else:
+                raise ValueError(f"Unsupported dtype_tag in combined payload: {dtype_tag}")
+
+            need = numel * np.dtype(np_dtype).itemsize
+            if len(mv) < offset + need:
+                raise ValueError("Combined payload truncated")
+
+            arr = np.frombuffer(mv, dtype=np_dtype, count=numel, offset=offset).reshape((b, d, r, c))
+            if dtype_tag == -3:
+                u16 = np.array(arr, copy=True, dtype=np.uint16)
+                u32 = (u16.astype(np.uint32) << 16)
+                f32 = u32.view(np.float32)
+                t = torch.from_numpy(f32).to(dtype=torch.bfloat16)
+            else:
+                t = torch.from_numpy(np.array(arr, copy=True))
+
+            if force_2d and t.dim() == 4:
+                t = t.reshape(t.shape[0] * t.shape[1] * t.shape[2], t.shape[3])
+            return t
+
+        start_time = time.time()
+        while True:
+            if base_result_name in store:
+                payload = store.pop(base_result_name)
+                return _bin_payload_to_tensor(payload)
+
+            if time.time() - start_time > time_out:
+                raise TimeoutError(
+                    f"Timed out waiting for combined PT payload for '{base_result_name}'"
+                )
+
+            try:
+                parts = ack_socket.recv_multipart(flags=zmq.NOBLOCK)
+                if not parts:
+                    continue
+                if len(parts) == 1:
+                    # Ignore ACK strings here
+                    continue
+                header = parts[0].decode("utf-8", errors="replace")
+                payload = parts[1]
+                if header.startswith("BIN_COMBINED=") or header.startswith("PT_COMBINED="):
+                    key = header.split("=", 1)[1]
+                    store[key] = payload
+            except zmq.Again:
+                time.sleep(0.01)
 
     def zmq_send_command(self, worker_ip, command, timeout=5):
         """Send command using persistent connection pool"""
@@ -1791,21 +1895,9 @@ class cluster_matrix:
             print(f"\n📊 Result base: {base_result_name} (send_back={send_back_result})")
 
         if send_back_result:  
-            path = self.local_RAM_folder + base_result_name + '_combined.bin'  
-            if os.path.exists(path):  
-                time.sleep(0.05)  
-                combined_matrix = self.convert_bin_matrix_to_pt(path)  
-                time.sleep(0.05)  
-                os.remove(path)  
-            else:  
-                self.wait_for_acks(1, "ACK_combined_matrix_saved")  
-                # Add this check - file might not exist yet  
-                if not os.path.exists(path):  
-                    time.sleep(0.05)  # Brief wait for file system  
-                combined_matrix = self.convert_bin_matrix_to_pt(path)  
-                os.remove(path)  # Clean up any existing combined file  
-                cluster_matrixB.cleanup()
-            return combined_matrix  
+            combined_matrix = self.wait_for_combined_pt(base_result_name)
+            cluster_matrixB.cleanup()
+            return combined_matrix
         else:  
             result_cluster_matrix = cluster_matrix(  
                 base_result_name,  
