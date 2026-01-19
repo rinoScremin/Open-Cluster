@@ -50,6 +50,11 @@ struct combined_matrix_shards
     // the signed total_shards encoding).
     bool is_system2 = false;
 
+    // Output dtype tag for the final combined matrix (v2 header):
+    //   -1 = float32, -2 = float16, -3 = bfloat16
+    // This is derived from input dtypes and propagated from worker/head results.
+    int output_dtype_tag = -1;
+
     // Dedupe: avoid counting the same shard index twice if it is retransmitted.
     std::set<int> received_shard_numbers;
 
@@ -128,6 +133,36 @@ std::string get_env(const char* env_var, const char* default_val)
 {
     const char* env_value = std::getenv(env_var);
     return env_value ? std::string(env_value) : std::string(default_val);
+}
+
+static inline int normalize_dtype_tag_from_bin_header_int(int tag_or_ndim) {
+    // v2: dtype_tag (negative). v1: ndim (positive) => legacy float32.
+    return (tag_or_ndim < 0) ? tag_or_ndim : -1;
+}
+
+static inline int merge_output_dtype_tag(int current, int incoming) {
+    // "Don't promote to float32" policy:
+    // - Once we know we want fp16/bf16 output, keep it even if some shards arrive as float32.
+    // - Prefer bf16 over fp16 if both appear.
+    if (incoming != -1 && incoming != -2 && incoming != -3) return current;
+    if (current != -1 && current != -2 && current != -3) current = -1;
+
+    if (current == -3 || incoming == -3) return -3;
+    if (current == -2 || incoming == -2) return -2;
+    return -1;
+}
+
+static inline int read_dtype_tag_from_bin_file(const std::string& path) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file) {
+        return -1;
+    }
+    int tag_or_ndim = 0;
+    file.read(reinterpret_cast<char*>(&tag_or_ndim), sizeof(int));
+    if (!file) {
+        return -1;
+    }
+    return normalize_dtype_tag_from_bin_header_int(tag_or_ndim);
 }
 
 class llama_zmq_server 
@@ -909,9 +944,51 @@ class llama_zmq_server
                         // Head node-specific processing for combined sent_back (attempt to parse 4D tensor)
                         if (local_IP_eth == head_node_ip_eth)
                         {
+                            auto bf16_to_f32 = [](uint16_t v) -> float {
+                                uint32_t bits = uint32_t(v) << 16;
+                                float out;
+                                std::memcpy(&out, &bits, sizeof(out));
+                                return out;
+                            };
+
+                            auto fp16_to_f32 = [](uint16_t h) -> float {
+                                const uint32_t sign = (uint32_t(h & 0x8000u) << 16);
+                                uint32_t exp = (h & 0x7C00u) >> 10;
+                                uint32_t mant = (h & 0x03FFu);
+
+                                uint32_t f_bits = 0;
+                                if (exp == 0) {
+                                    if (mant == 0) {
+                                        f_bits = sign;
+                                    } else {
+                                        exp = 1;
+                                        while ((mant & 0x0400u) == 0) {
+                                            mant <<= 1;
+                                            exp--;
+                                        }
+                                        mant &= 0x03FFu;
+                                        const uint32_t f_exp = (exp + (127 - 15)) << 23;
+                                        const uint32_t f_mant = mant << 13;
+                                        f_bits = sign | f_exp | f_mant;
+                                    }
+                                } else if (exp == 0x1F) {
+                                    f_bits = sign | 0x7F800000u | (mant << 13);
+                                } else {
+                                    const uint32_t f_exp = (exp + (127 - 15)) << 23;
+                                    const uint32_t f_mant = mant << 13;
+                                    f_bits = sign | f_exp | f_mant;
+                                }
+
+                                float out;
+                                std::memcpy(&out, &f_bits, sizeof(out));
+                                return out;
+                            };
+
                             const uint8_t* p = combined.data();
-                            int ndim = *reinterpret_cast<const int*>(p);
+                            int tag_or_ndim = *reinterpret_cast<const int*>(p);
                             p += sizeof(int);
+                            const int dtype_tag = (tag_or_ndim < 0) ? tag_or_ndim : -1;
+                            const int ndim = (tag_or_ndim < 0) ? 4 : tag_or_ndim;
                             if (ndim == 4)
                             {
                                 int dims[4];
@@ -922,9 +999,25 @@ class llama_zmq_server
                                 int cols = dims[3];
                                 size_t total_elements = static_cast<size_t>(batch) * depth * rows * cols;
                                 auto shard_data = std::make_unique<float[]>(total_elements);
-                                std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
+                                if (dtype_tag == -1)
+                                {
+                                    std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
+                                }
+                                else if (dtype_tag == -2 || dtype_tag == -3)
+                                {
+                                    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(p);
+                                    for (size_t i = 0; i < total_elements; ++i)
+                                    {
+                                        shard_data[i] = (dtype_tag == -2) ? fp16_to_f32(u16[i]) : bf16_to_f32(u16[i]);
+                                    }
+                                }
+                                else
+                                {
+                                    std::cerr << "ERROR: Unsupported dtype_tag in sent_back payload: " << dtype_tag << std::endl;
+                                    return;
+                                }
 
-                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0);
+                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0, dtype_tag);
                             }
                         }
                     }
@@ -936,8 +1029,9 @@ class llama_zmq_server
                         if (combined.size() >= static_cast<size_t>(5 * sizeof(int)))
                         {
                             const uint8_t* p = combined.data();
-                            int ndim = *reinterpret_cast<const int*>(p);
-                            if (ndim == 4)
+                            int tag_or_ndim = *reinterpret_cast<const int*>(p);
+                            // v2 dtype-tagged files must be saved as raw bytes to preserve dtype.
+                            if (tag_or_ndim >= 0 && tag_or_ndim == 4)
                             {
                                 MatrixResult result;
                                 result.dims[0] = *reinterpret_cast<const int*>(p + sizeof(int));
@@ -981,9 +1075,51 @@ class llama_zmq_server
                         // Head node-specific processing for shard combination
                         if (local_IP_eth == head_node_ip_eth)
                         {
+                            auto bf16_to_f32 = [](uint16_t v) -> float {
+                                uint32_t bits = uint32_t(v) << 16;
+                                float out;
+                                std::memcpy(&out, &bits, sizeof(out));
+                                return out;
+                            };
+
+                            auto fp16_to_f32 = [](uint16_t h) -> float {
+                                const uint32_t sign = (uint32_t(h & 0x8000u) << 16);
+                                uint32_t exp = (h & 0x7C00u) >> 10;
+                                uint32_t mant = (h & 0x03FFu);
+
+                                uint32_t f_bits = 0;
+                                if (exp == 0) {
+                                    if (mant == 0) {
+                                        f_bits = sign;
+                                    } else {
+                                        exp = 1;
+                                        while ((mant & 0x0400u) == 0) {
+                                            mant <<= 1;
+                                            exp--;
+                                        }
+                                        mant &= 0x03FFu;
+                                        const uint32_t f_exp = (exp + (127 - 15)) << 23;
+                                        const uint32_t f_mant = mant << 13;
+                                        f_bits = sign | f_exp | f_mant;
+                                    }
+                                } else if (exp == 0x1F) {
+                                    f_bits = sign | 0x7F800000u | (mant << 13);
+                                } else {
+                                    const uint32_t f_exp = (exp + (127 - 15)) << 23;
+                                    const uint32_t f_mant = mant << 13;
+                                    f_bits = sign | f_exp | f_mant;
+                                }
+
+                                float out;
+                                std::memcpy(&out, &f_bits, sizeof(out));
+                                return out;
+                            };
+
                             const uint8_t* p = data.data();
-                            int ndim = *reinterpret_cast<const int*>(p);
+                            int tag_or_ndim = *reinterpret_cast<const int*>(p);
                             p += sizeof(int);
+                            const int dtype_tag = (tag_or_ndim < 0) ? tag_or_ndim : -1;
+                            const int ndim = (tag_or_ndim < 0) ? 4 : tag_or_ndim;
                             if (ndim == 4)
                             {
                                 int dims[4];
@@ -994,23 +1130,46 @@ class llama_zmq_server
                                 int cols = dims[3];
                                 size_t total_elements = static_cast<size_t>(batch) * depth * rows * cols;
                                 auto shard_data = std::make_unique<float[]>(total_elements);
-                                std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
+                                if (dtype_tag == -1)
+                                {
+                                    std::memcpy(shard_data.get(), p, total_elements * sizeof(float));
+                                }
+                                else if (dtype_tag == -2 || dtype_tag == -3)
+                                {
+                                    const uint16_t* u16 = reinterpret_cast<const uint16_t*>(p);
+                                    for (size_t i = 0; i < total_elements; ++i)
+                                    {
+                                        shard_data[i] = (dtype_tag == -2) ? fp16_to_f32(u16[i]) : bf16_to_f32(u16[i]);
+                                    }
+                                }
+                                else
+                                {
+                                    std::cerr << "ERROR: Unsupported dtype_tag in sent_back payload: " << dtype_tag << std::endl;
+                                    return;
+                                }
 
-                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0);
+                                handle_combine_matrix_shard_list(actual_filename, std::move(shard_data), rows, cols, 0, dtype_tag);
                             }
                         }
                     }
                     else
                     {
-                        // Regular ETH file: validate 4D and save via save_matrix_bin
+                        // Regular ETH file: for v2 dtype-tagged files, save raw bytes to preserve dtype.
                         std::filesystem::path save_path = std::filesystem::path(matrix_shard_folder) / filename;
                         if (data.size() >= static_cast<size_t>(5 * sizeof(int)))
                         {
                             const uint8_t* p = data.data();
-                            int ndim = *reinterpret_cast<const int*>(p);
-                            if (ndim != 4)
+                            int tag_or_ndim = *reinterpret_cast<const int*>(p);
+                            if (tag_or_ndim < 0)
                             {
-                                std::cerr << "ERROR: Worker sent non-4D tensor: " << filename << " (ndim=" << ndim << ")" << std::endl;
+                                if (write_raw(save_path, data))
+                                    std::cout << "ETH saved (raw) to SHARDS: " << save_path << " (" << data.size() << " bytes)" << std::endl;
+                                else
+                                    std::cerr << "Failed to save ETH file: " << save_path << std::endl;
+                            }
+                            else if (tag_or_ndim != 4)
+                            {
+                                std::cerr << "ERROR: Worker sent non-4D tensor: " << filename << " (ndim=" << tag_or_ndim << ")" << std::endl;
                             }
                             else
                             {
@@ -1085,7 +1244,8 @@ class llama_zmq_server
                             const std::string& filename,
                             MatrixResult& save_result,
                             int total_shards,
-                            const std::string& selected_backend)
+                            const std::string& selected_backend,
+                            int output_dtype_tag)
         {
             std::cout << "SENDING BACK FILE" << std::endl;
             bool is_head_node = (local_IP_eth == head_node_ip_eth || local_IP_wifi == head_node_ip_wifi);
@@ -1098,56 +1258,26 @@ class llama_zmq_server
                 std::string send_back_filename = "sent_back=" + filename;
                 std::cout << "Worker sending result back to head: " << send_back_filename << std::endl;
 
+                // Send the on-disk v2 .bin bytes as-is so dtype_tag matches the payload.
                 std::vector<uint8_t> buffer;
-
-                // Network contract: Always send logical 4D tensor
-                int ndim = 4;
-                buffer.insert(buffer.end(),
-                    reinterpret_cast<uint8_t*>(&ndim),
-                    reinterpret_cast<uint8_t*>(&ndim) + sizeof(int));
-
-                // Normalize dimensions according to backend format
-                int batch, depth, shard_rows, shard_cols;
-                if (selected_backend == "llama")  // for incase things go fucked does nothing
-                {  
-                    // GGML format: {cols, rows, depth, batch}
-                    batch      = save_result.dims[0];  // batch is index 3
-                    depth      = save_result.dims[1];  // depth is index 2
-                    shard_rows = save_result.dims[2];  // rows is index 1
-                    shard_cols = save_result.dims[3];  // cols is index 0
-                }  
-                else if (selected_backend == "torch")  // for incase things go fucked does nothing 
-                {  
-                    // Torch format: {batch, depth, rows, cols}
-                    batch      = save_result.dims[0];
-                    depth      = save_result.dims[1];
-                    shard_rows = save_result.dims[2];
-                    shard_cols = save_result.dims[3];
-                }
-
-                // IMPORTANT: save_result.dims[] must already reflect the logical shape
-                // If not, this indicates a backend issue, not a network issue
-                int dims[4] = { batch, depth, shard_rows, shard_cols };
-
-                // Insert all 4 dimensions into buffer
-                for (int i = 0; i < 4; i++)
                 {
-                    buffer.insert(buffer.end(),
-                        reinterpret_cast<uint8_t*>(&dims[i]),
-                        reinterpret_cast<uint8_t*>(&dims[i]) + sizeof(int));
+                    std::ifstream f(local_file_path, std::ios::binary | std::ios::ate);
+                    if (!f) {
+                        std::cerr << "ERROR: Worker cannot open result file to send_back: " << local_file_path << std::endl;
+                        return false;
+                    }
+                    std::streamsize size = f.tellg();
+                    if (size <= 0) {
+                        std::cerr << "ERROR: Worker result file empty: " << local_file_path << std::endl;
+                        return false;
+                    }
+                    buffer.resize(static_cast<size_t>(size));
+                    f.seekg(0, std::ios::beg);
+                    if (!f.read(reinterpret_cast<char*>(buffer.data()), size)) {
+                        std::cerr << "ERROR: Worker failed to read result file for send_back: " << local_file_path << std::endl;
+                        return false;
+                    }
                 }
-
-                // Calculate and insert data payload
-                size_t total_elements =
-                    static_cast<size_t>(batch) *
-                    static_cast<size_t>(depth) *
-                    static_cast<size_t>(shard_rows) *
-                    static_cast<size_t>(shard_cols);
-
-                buffer.insert(buffer.end(),
-                    reinterpret_cast<uint8_t*>(save_result.data.get()),
-                    reinterpret_cast<uint8_t*>(save_result.data.get()) +
-                    total_elements * sizeof(float));
 
                 // Send data to head node via ZeroMQ
                 zmq::message_t filename_msg(send_back_filename.data(), send_back_filename.size());
@@ -1186,7 +1316,8 @@ class llama_zmq_server
                     std::move(shard_data),
                     shard_rows,
                     shard_cols,
-                    total_shards
+                    total_shards,
+                    output_dtype_tag
                 );
 
                 std::cout << "Head node processed shard: " << filename 
@@ -1203,7 +1334,8 @@ class llama_zmq_server
             std::unique_ptr<float[]> data,
             int shard_rows,
             int shard_cols,
-            int total_shards
+            int total_shards,
+            int output_dtype_tag
         )
         {
             // ============================================================
@@ -1214,6 +1346,7 @@ class llama_zmq_server
             std::cout << "DEBUG: shard_rows=" << shard_rows
                     << ", shard_cols=" << shard_cols << std::endl;
             std::cout << "DEBUG: total_shards=" << total_shards << std::endl;
+            std::cout << "DEBUG: output_dtype_tag=" << output_dtype_tag << std::endl;
 
             // ============================================================
             // EXTRACT MATRIX NAME AND SHARD NUMBER
@@ -1228,11 +1361,12 @@ class llama_zmq_server
             // ============================================================
             std::vector<uint8_t> shard_bytes;
 
-            int ndim = 4;
+            // v2 header: dtype_tag + fixed 4D dims (payload is float32 here)
+            int dtype_tag = -1;
             shard_bytes.insert(
                 shard_bytes.end(),
-                reinterpret_cast<uint8_t*>(&ndim),
-                reinterpret_cast<uint8_t*>(&ndim) + sizeof(int)
+                reinterpret_cast<uint8_t*>(&dtype_tag),
+                reinterpret_cast<uint8_t*>(&dtype_tag) + sizeof(int)
             );
 
             int dims[4] = {1, 1, shard_rows, shard_cols};
@@ -1301,6 +1435,8 @@ class llama_zmq_server
                                 << ", join_dim=" << join_dim << std::endl;
                     }
 
+                    combined.output_dtype_tag = merge_output_dtype_tag(combined.output_dtype_tag, output_dtype_tag);
+
                     combined.total_shards_reserved++;
                     combined.shard_numbers.push_back(shard_num);
                     combined.received_matrix_data.push_back(std::move(shard_bytes));
@@ -1331,7 +1467,7 @@ class llama_zmq_server
                                 std::filesystem::path(matrix_shard_folder) /
                                 (matrix_name + "_combined.bin");
 
-                            save_matrix_bin(final_path.c_str(), full);
+                            save_matrix_bin(final_path.c_str(), full, combined.output_dtype_tag);
                             send_ack("ACK_combined_matrix_saved");
 
                             std::cout << "Combined matrix saved: "
@@ -1383,6 +1519,7 @@ class llama_zmq_server
             combined.number_of_shards_needed = shards_needed;
             combined.total_shards_reserved = 1;
             combined.is_system2 = (total_shards < 0);
+            combined.output_dtype_tag = merge_output_dtype_tag(combined.output_dtype_tag, output_dtype_tag);
 
             combined.shard_numbers.push_back(shard_num);
             combined.received_matrix_data.push_back(std::move(shard_bytes));
@@ -1728,6 +1865,11 @@ class llama_zmq_server
                 }
                 std::string output_path = std::filesystem::path(matrix_shard_folder) / output_filename;
 
+                // Determine output dtype tag from input file headers (v2 dtype_tag or legacy float32).
+                const int dtype_tag_A = read_dtype_tag_from_bin_file(matrix_pathA);
+                const int dtype_tag_B = read_dtype_tag_from_bin_file(matrix_pathB);
+                const int output_dtype_tag = merge_output_dtype_tag(dtype_tag_A, dtype_tag_B);
+
                 // ============================================================
                 // BACKEND: LLAMA / GGML / VULKAN
                 // ============================================================
@@ -1795,14 +1937,14 @@ class llama_zmq_server
                         op_success = false;
                     } else {
                         // Common save/send_back
-                        if (!save_matrix_bin(output_path.c_str(), result)) {
+                        if (!save_matrix_bin(output_path.c_str(), result, output_dtype_tag)) {
                             std::cerr << "❌ Failed to save result" << std::endl;
                             op_success = false;
                         } else {
                             if (send_back > 0 || send_back < 0)
                             {
                                 std::cout << "**matrix_operation** send_back: " << send_back << std::endl;
-                                send_back_file(output_path, output_filename, result, send_back, "llama");
+                                send_back_file(output_path, output_filename, result, send_back, "llama", output_dtype_tag);
                             }
                             
                             op_success = true;
@@ -1891,13 +2033,13 @@ class llama_zmq_server
                     memcpy(result.data.get(), C.data_ptr<float>(), total * sizeof(float));
 
                     // Common save/send_back
-                    if (!save_matrix_bin(output_path.c_str(), result)) {
+                    if (!save_matrix_bin(output_path.c_str(), result, output_dtype_tag)) {
                         std::cerr << "❌ Failed to save result" << std::endl;
                         op_success = false;
                     } else {
                         if (send_back > 0)
                             
-                            send_back_file(output_path, output_filename, result, send_back, "torch");
+                            send_back_file(output_path, output_filename, result, send_back, "torch", output_dtype_tag);
                         op_success = true;
                     }
                 }
@@ -1973,12 +2115,12 @@ class llama_zmq_server
                     queue.enqueueReadBuffer(bufC, CL_TRUE, 0, sizeof(float) * M * N, result.data.get());
 
                     // Common save/send_back
-                    if (!save_matrix_bin(output_path.c_str(), result)) {
+                    if (!save_matrix_bin(output_path.c_str(), result, output_dtype_tag)) {
                         std::cerr << "❌ Failed to save result" << std::endl;
                         op_success = false;
                     } else {
                         if (send_back > 0)
-                            send_back_file(output_path, output_filename, result, send_back, "opencl");
+                            send_back_file(output_path, output_filename, result, send_back, "opencl", output_dtype_tag);
                         op_success = true;
                     }
                 }
