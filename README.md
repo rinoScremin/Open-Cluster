@@ -300,9 +300,10 @@ Useful if:
 * GPU supports Vulkan / Metal / OpenCL (via GGML)
 
 ```python
-big_new_matrixA = cluster_matrix(
+cluster_zmq([192.168.2.100])
+big_new_matrixA_single_node = cluster_matrix(
     matrix_file_path=big_test_matrix_pathA_T,
-    cluster_zmq_object=cluster_zmq([192.168.2.100]),
+    cluster_zmq_object=cluster_zmq,
     CPU_GPU_select_list=[True],
     node_percentages=[1],
     back_end_select_list=["llama"],
@@ -310,6 +311,30 @@ big_new_matrixA = cluster_matrix(
     dim=0,
     auto_set_up=[1, "save"],
 )
+
+big_new_matrixB_single_node = cluster_matrix(
+    matrix_file_path=big_test_matrix_pathA_T,
+    cluster_zmq_object=cluster_zmq,
+    CPU_GPU_select_list=[True],
+    node_percentages=[1],
+    back_end_select_list=["llama"],
+    split_matrix=False,
+    dim=0,
+    auto_set_up=[1, "save"],
+)
+
+big_new_matrixC = big_new_matrixA_single_node.cluster_shard_operation(
+    big_new_matrixB_single_node,
+    False,
+    True,
+    False ## IF YOU ARE USING 1 NODE DO NOT USE SEND BACK NOT NEEDED IT MUST BE SET TO FALSE FOR SINGLE NODE MATRIX OPERATION'S 
+)
+#small_c_ref = A3 @ B3.T
+#torch.save(small_c_ref, 'model_matrixs/small_c_ref.pt')
+#check_combined_result_values('model_matrixs/small_c_ref.pt',small_new_matrixC) # use the 'check_combined_result_values' function to make ssure
+#values are correct 
+
+
 ```
 
 ---
@@ -320,5 +345,63 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
 
 ---
 
+```python
+    A3 = torch.from_numpy(np.random.rand(1500, 4500).astype(np.float16))
+    B3 = torch.from_numpy(np.random.rand(1000, 4500).astype(np.float16))
+    torch.save(A3, 'model_matrixs/small_matrixA.pt')
+    torch.save(B3, 'model_matrixs/small_matrixB.pt')
+    small_test_matrix_pathA = 'model_matrixs/small_matrixA.pt'  
+    small_test_matrix_pathB = 'model_matrixs/small_matrixB.pt'  
 
+    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.101','192.168.2.104']    
+    CPU_GPU_select_list = [ True, True, True, True, True, True ]  
+    backend_select_list = ['llama','llama','llama','llama','llama','llama']
+
+    cluster_zmq_obj = cluster_zmq(IP_list)
+
+    small_big_new_matrixA = cluster_matrix(small_test_matrix_pathA, 
+                                    cluster_zmq_object=cluster_zmq_obj,
+                                    CPU_GPU_select_list=CPU_GPU_select_list, 
+                                    back_end_select_list=backend_select_list,
+                                    split_matrix=True,
+                                    dim=0,
+                                    auto_set_up=[2, "save"],
+                                    matrix_labeling='a'
+                                    )
+
+
+    small_new_matrixB = cluster_matrix(small_test_matrix_pathB, 
+                                    cluster_zmq_object=cluster_zmq_obj,
+                                    CPU_GPU_select_list=CPU_GPU_select_list, 
+                                    back_end_select_list=backend_select_list,
+                                    split_matrix=True,
+                                    dim=0,
+                                    auto_set_up=[2, "save"],
+                                    matrix_labeling='b'
+                                    )
+
+    small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)  
+
+    small_big_new_matrixA = cluster_matrix(small_test_matrix_pathA, 
+                                    cluster_zmq_object=cluster_zmq_obj,
+                                    CPU_GPU_select_list=CPU_GPU_select_list, 
+                                    back_end_select_list=backend_select_list,
+                                    split_matrix=True,
+                                    dim=0,
+                                    auto_set_up=[2, "load"],
+                                    matrix_labeling='a'
+                                    )
+
+    small_new_matrixB = cluster_matrix(small_test_matrix_pathB, 
+                                    cluster_zmq_object=cluster_zmq_obj,
+                                    CPU_GPU_select_list=CPU_GPU_select_list, 
+                                    back_end_select_list=backend_select_list,
+                                    split_matrix=True,
+                                    dim=0,
+                                    auto_set_up=[2, "load"],
+                                    matrix_labeling='b'
+                                    )
+
+    small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)  
+```
 
