@@ -674,9 +674,4 @@ C = C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8  → shape: (500, 1000)
 
 ---
 
-This version is ready to drop straight into your GitHub README.md — it’s structured, readable, and fully formatted.
-
-If you want, I can **also make a small diagram showing node → matrix op mapping** to make it visually clear for readers. It would look really clean in the README.
-
-Do you want me to do that?
 
