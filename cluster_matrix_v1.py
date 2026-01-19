@@ -20,7 +20,6 @@ import sys
 import io
 import pyopencl as cl
 
-
 def check_combined_result_values(c_ref_path, combined):
     c_ref = torch.load(c_ref_path)
     if c_ref.shape != combined.shape:
@@ -465,7 +464,6 @@ class cluster_matrix:
             if time.time() - start_time > time_out:
                 print(f"⏰ TIMEOUT: Only received {acks}/{expected_count} ACKs after {time_out} seconds")
                 return acks
-                
             try:
                 msg = ack_socket.recv_string(flags=zmq.NOBLOCK)
                 if msg == expected_msg:
@@ -474,7 +472,6 @@ class cluster_matrix:
             except zmq.Again:
                 # No message yet, sleep briefly to avoid 100% CPU
                 time.sleep(0.01)
-        
         print("✅ All ACKs received!")
         return acks
 
@@ -550,6 +547,18 @@ class cluster_matrix:
         if verbose:
             print("  Creating binary file data in memory...")
 
+        # Binary wire format (v2):
+        # [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
+        #
+        # dtype_tag is NEGATIVE to stay backward compatible with legacy files where
+        # the first int was `ndim` (typically 4).
+        #   -1 = float32
+        #   -2 = float16
+        #   -3 = bfloat16 (payload is raw bf16 bits as int16/uint16)
+        #
+        # Legacy format (v1) is still accepted by readers:
+        # [ndim(int32), dims..., data(float32)]
+
         if isinstance(matrix, torch.Tensor):
             t = matrix.detach()
             if t.device.type != "cpu":
@@ -564,11 +573,23 @@ class cluster_matrix:
                 raise ValueError(f"Unsupported number of dimensions: {t.ndim}")
             if not t.is_contiguous():
                 t = t.contiguous()
-            matrix_np = t.numpy()  # zero-copy view on CPU
+
+            if t.dtype == torch.float32:
+                dtype_tag = -1
+                matrix_np = t.numpy()  # zero-copy view on CPU
+            elif t.dtype == torch.float16:
+                dtype_tag = -2
+                matrix_np = t.numpy()  # zero-copy view on CPU
+            elif t.dtype == torch.bfloat16:
+                dtype_tag = -3
+                # numpy can't represent bf16 directly; send raw bf16 bits as int16.
+                matrix_np = t.view(torch.int16).numpy()
+            else:
+                raise ValueError(f"Unsupported tensor dtype for binary stream: {t.dtype}")
         elif isinstance(matrix, np.ndarray):
             matrix_np = matrix
-            if matrix_np.dtype != np.float32 or not matrix_np.flags.get("C_CONTIGUOUS", False):
-                matrix_np = np.asarray(matrix_np, dtype=np.float32, order="C")
+            if not matrix_np.flags.get("C_CONTIGUOUS", False):
+                matrix_np = np.asarray(matrix_np, order="C")
             if matrix_np.ndim == 2:
                 matrix_np = matrix_np.reshape(1, 1, matrix_np.shape[0], matrix_np.shape[1])
             elif matrix_np.ndim == 3:
@@ -577,17 +598,29 @@ class cluster_matrix:
                 pass
             else:
                 raise ValueError(f"Unsupported number of dimensions: {matrix_np.ndim}")
+
+            if matrix_np.dtype == np.float32:
+                dtype_tag = -1
+            elif matrix_np.dtype == np.float16:
+                dtype_tag = -2
+            else:
+                raise ValueError(f"Unsupported numpy dtype for binary stream: {matrix_np.dtype}")
         else:
             raise ValueError(f"Unsupported matrix type: {type(matrix)}")
 
         b, c, h, w = (int(x) for x in matrix_np.shape)
         header_size = 4 + 4 * 4  # ndim + 4 dims
-        payload_size = header_size + matrix_np.size * 4
+        payload_size = header_size + matrix_np.nbytes
         payload = bytearray(payload_size)
-        struct.pack_into("iiiii", payload, 0, 4, b, c, h, w)
+        struct.pack_into("iiiii", payload, 0, dtype_tag, b, c, h, w)
 
-        # Fill the payload data area as float32 without creating an intermediate `tobytes()` copy.
-        out_view = np.frombuffer(payload, dtype=np.float32, offset=header_size, count=matrix_np.size).reshape(matrix_np.shape)
+        # Fill the payload data area without creating an intermediate `tobytes()` copy.
+        out_view = np.frombuffer(
+            payload,
+            dtype=matrix_np.dtype,
+            offset=header_size,
+            count=matrix_np.size,
+        ).reshape(matrix_np.shape)
         out_view[...] = matrix_np
 
         if verbose:
@@ -741,7 +774,6 @@ class cluster_matrix:
         raise ValueError(f"Unknown matrix_labeling={self.matrix_labeling!r} for System 2 grid")
 
     def convert_to_cluster_matrix_shards(self):
-
         if torch.is_tensor(self.matrix_file_path):
             full_matrix = self.matrix_file_path
         else:
@@ -900,9 +932,7 @@ class cluster_matrix:
                 # Step 2: Tell remote node to copy from RAM to DISK for persistence
                 copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
                 self.zmq_send_command(node_ip, copy_command)
-        
         print(f"Full matrix distribution completed")
-        print(f"Total file paths tracked: {len(self.matrix_file_paths_list)}")
         return 0
 
     def save_distribute_matrixA_grid_bin(self):
@@ -933,9 +963,6 @@ class cluster_matrix:
             self.save_matrix_binary(self.node_matrices[0], matrixA1_file_path)
             self.save_matrix_binary(self.node_matrices[1], matrixA2_file_path)
 
-            # Copy to project directory AND disk folder
-            import subprocess
-            
             # Copy shard 0 to both locations
             shard0_disk_path = os.path.join(disk_folder_path, f'{self.matrix_name}_shard_0.bin')
             subprocess.run(['cp', matrixA1_file_path, shard0_disk_path], check=True)
@@ -976,11 +1003,9 @@ class cluster_matrix:
                     if shard_type == 0 and node_IP not in shard0_sent_to_ips:
                         # Send the file to remote RAM
                         self.zmq_send_file(node_IP, matrixA1_file_path)
-                        
-                        
+                                                
                         # Send command to copy from RAM to disk
                         remote_filename = os.path.basename(matrixA1_file_path)
-
                         
                         remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, remote_filename)
                         remote_save_file_path_DISK = os.path.join(self.remote_project_dir, self.remote_DISK_folder, remote_filename)
@@ -1011,22 +1036,29 @@ class cluster_matrix:
             
             # Now extract just the file paths (remove IPs) and store in matrix_file_paths_list
             self.matrix_file_paths_list = [file_path for _, file_path in ip_shard_pairs]
-            
-            print(f"\n✅ Final matrix_file_paths_list (paths only):")
-            for i, path in enumerate(self.matrix_file_paths_list):
-                shard_name = "shard_0" if path == matrixA1_file_path else "shard_1"
-                print(f"  Node {i}: {shard_name}")
-
+            #print(f"\n✅ Final matrix_file_paths_list (paths only):")
+            #for i, path in enumerate(self.matrix_file_paths_list):
+            #    shard_name = "shard_0" if path == matrixA1_file_path else "shard_1"
+            #    print(f"  Node {i}: {shard_name}")
         return self.matrix_file_paths_list
 
     def save_matrix_binary(self, matrix, filename):
         """
         Save a PyTorch tensor or numpy array as a binary file.
         
-        Binary format:
-        [num_dims, dim1, dim2, ..., data]
+        Binary format (v2):
+        [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
+
+        dtype_tag is NEGATIVE to stay backward compatible with legacy files where
+        the first int was `ndim` (typically 4).
+          -1 = float32
+          -2 = float16
+          -3 = bfloat16 (payload is raw bf16 bits as int16/uint16)
+
+        Legacy format (v1):
+        [ndim(int32), dims..., data(float32)]
+
         Always saves as 4D format (batch, channel, height, width) for consistency.
-        Data is always saved as float32.
         
         Args:
             matrix: PyTorch tensor or numpy array to save
@@ -1058,6 +1090,18 @@ class cluster_matrix:
             if not t.is_contiguous():
                 t = t.contiguous()
 
+            if t.dtype == torch.float32:
+                dtype_tag = -1
+                payload_np = t.numpy()
+            elif t.dtype == torch.float16:
+                dtype_tag = -2
+                payload_np = t.numpy()
+            elif t.dtype == torch.bfloat16:
+                dtype_tag = -3
+                payload_np = t.view(torch.int16).numpy()
+            else:
+                raise ValueError(f"Unsupported tensor dtype for save_matrix_binary: {t.dtype}")
+
             shape = tuple(int(x) for x in t.shape)
             if verbose:
                 print(f"Original shape: {tuple(matrix.shape)}")
@@ -1065,14 +1109,18 @@ class cluster_matrix:
                 print("Writing binary file...")
 
             with open(filename, "wb") as f:
-                f.write(struct.pack("iiiii", 4, shape[0], shape[1], shape[2], shape[3]))
-                t.numpy().tofile(f)
+                f.write(struct.pack("iiiii", dtype_tag, shape[0], shape[1], shape[2], shape[3]))
+                payload_np.tofile(f)
             return
 
         if isinstance(matrix, np.ndarray):
-            arr = matrix
-            if arr.dtype != np.float32 or not arr.flags.get("C_CONTIGUOUS", False):
-                arr = np.asarray(arr, dtype=np.float32, order="C")
+            arr = np.asarray(matrix, order="C")
+            if arr.dtype == np.float32:
+                dtype_tag = -1
+            elif arr.dtype == np.float16:
+                dtype_tag = -2
+            else:
+                raise ValueError(f"Unsupported numpy dtype for save_matrix_binary: {arr.dtype}")
 
             if arr.ndim == 2:
                 arr = arr.reshape(1, 1, arr.shape[0], arr.shape[1])
@@ -1090,7 +1138,7 @@ class cluster_matrix:
                 print("Writing binary file...")
 
             with open(filename, "wb") as f:
-                f.write(struct.pack("iiiii", 4, shape[0], shape[1], shape[2], shape[3]))
+                f.write(struct.pack("iiiii", dtype_tag, shape[0], shape[1], shape[2], shape[3]))
                 arr.tofile(f)
             return
 
@@ -1257,13 +1305,14 @@ class cluster_matrix:
                         print(f"  Added remote RAM path to file list: {remote_ram_path}")
                         
         self.wait_for_acks(len(unique_node_IP_list)-1,'MATRIX_SPLIT_COMPLETE_')
-        print(f"Distribution complete: {len(self.matrix_file_paths_list)} shards saved and distributed")
+        print(f"Distribution complete shards saved and distributed")
         return self.matrix_file_paths_list
 
     def convert_bin_matrix_to_pt(self, filename, force_2d=True):  
         """  
-        Load a binary matrix saved in the format:  
-        [num_dims(int), dim1(int), dim2(int), ..., data(float32)]  
+        Load a binary matrix saved in the format:
+        - v2: [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
+        - v1: [ndim(int32), dims..., data(float32)]
         
         Args:  
             filename: path to binary file  
@@ -1280,22 +1329,56 @@ class cluster_matrix:
             offset = 0
             if mm.size() < 4:
                 raise ValueError("File too short to read ndim")
-            ndim = struct.unpack_from('i', mm, offset)[0]
+            tag_or_ndim = struct.unpack_from('i', mm, offset)[0]
             offset += 4
 
-            header_bytes = ndim * 4
-            if mm.size() < offset + header_bytes:
-                raise ValueError("File too short to read dimensions")
-            dims = list(struct.unpack_from('i' * ndim, mm, offset))
-            offset += header_bytes
+            # v2 header (dtype tag)
+            if tag_or_ndim < 0:
+                dtype_tag = tag_or_ndim
+                ndim = 4
 
-            num_elements = int(np.prod(dims, dtype=np.int64))
-            data_bytes_needed = num_elements * 4
-            if mm.size() < offset + data_bytes_needed:
-                raise ValueError(f"File too short to read {num_elements} floats")
+                header_bytes = 4 * 4
+                if mm.size() < offset + header_bytes:
+                    raise ValueError("File too short to read 4D dimensions")
+                dims = list(struct.unpack_from('iiii', mm, offset))
+                offset += header_bytes
 
-            data_np = np.frombuffer(mm, dtype=np.float32, count=num_elements, offset=offset)
-            tensor_np = data_np.reshape(dims)
+                num_elements = int(np.prod(dims, dtype=np.int64))
+
+                if dtype_tag == -1:
+                    np_dtype = np.float32
+                elif dtype_tag == -2:
+                    np_dtype = np.float16
+                elif dtype_tag == -3:
+                    np_dtype = np.uint16  # raw bf16 bits
+                else:
+                    raise ValueError(f"Unsupported dtype_tag in binary file: {dtype_tag}")
+
+                data_bytes_needed = num_elements * np.dtype(np_dtype).itemsize
+                if mm.size() < offset + data_bytes_needed:
+                    raise ValueError(f"File too short to read {num_elements} elements of {np_dtype}")
+
+                data_np = np.frombuffer(mm, dtype=np_dtype, count=num_elements, offset=offset)
+                tensor_np = data_np.reshape(dims)
+
+            # v1 legacy header (ndim)
+            else:
+                ndim = tag_or_ndim
+                dtype_tag = -1  # legacy files are float32
+
+                header_bytes = ndim * 4
+                if mm.size() < offset + header_bytes:
+                    raise ValueError("File too short to read dimensions")
+                dims = list(struct.unpack_from('i' * ndim, mm, offset))
+                offset += header_bytes
+
+                num_elements = int(np.prod(dims, dtype=np.int64))
+                data_bytes_needed = num_elements * 4
+                if mm.size() < offset + data_bytes_needed:
+                    raise ValueError(f"File too short to read {num_elements} floats")
+
+                data_np = np.frombuffer(mm, dtype=np.float32, count=num_elements, offset=offset)
+                tensor_np = data_np.reshape(dims)
         finally:
             # `tensor_np` is a view over `mm`; we will detach below, so it's safe to close here.
             try:
@@ -1309,12 +1392,19 @@ class cluster_matrix:
             tensor_np = tensor_np.reshape(batch * depth * rows, cols)  
     
         # Convert to PyTorch tensor (detach from mm-backed buffer)
-        tensor_pt = torch.from_numpy(np.array(tensor_np, copy=True, dtype=np.float32))
+        if dtype_tag == -3:
+            # bf16 bits (uint16) -> float32 -> bfloat16
+            u16 = np.array(tensor_np, copy=True, dtype=np.uint16)
+            u32 = (u16.astype(np.uint32) << 16)
+            f32 = u32.view(np.float32)
+            tensor_pt = torch.from_numpy(f32).to(dtype=torch.bfloat16)
+        else:
+            tensor_pt = torch.from_numpy(np.array(tensor_np, copy=True))
     
         # Info  
         print(f"✅ Loaded {filename}")  
         print(f"  Original dims: {dims}")  
-        print(f"  Result tensor shape: {tensor_pt.shape}, size: {tensor_pt.numel()*4:,} bytes")  
+        print(f"  Result tensor shape: {tensor_pt.shape}, size: {tensor_pt.numel() * tensor_pt.element_size():,} bytes")
         stats_max_elems = int(os.environ.get("CONVERT_BIN_STATS_MAX_ELEMS", "2000000"))
         if tensor_pt.numel() <= stats_max_elems:
             print(f"  Data range: [{tensor_pt.min().item():.6f}, {tensor_pt.max().item():.6f}]")
@@ -1390,9 +1480,14 @@ class cluster_matrix:
         Load distributed matrix shards from storage.
         
         This method checks if matrix shards are already in RAM, and if not,
-        loads them from disk to RAM for both local and remote nodes.
-        The controller (head node) needs all shards in its local RAM.
-        Remote nodes only need their specific assigned shards.
+        loads them from disk to RAM on the nodes that actually need them.
+        
+        Design (System 1):
+        - Each "slot" in `self.node_IP_list` corresponds to a shard index.
+        - Shard files are distributed across the cluster; the head node does NOT
+          necessarily have all shard files on its own disk.
+        - The head node only copies its *assigned* shards into its local RAM.
+        - Each worker node only needs its assigned shard indices in its RAM.
         """
         
         # Initialize the file paths list
@@ -1400,89 +1495,64 @@ class cluster_matrix:
         
         print(f"Loading cluster matrix shards: {self.matrix_name}")
         print(f"Number of nodes/shard locations: {len(self.node_IP_list)}")
-        
-        # ===== CHECK IF SHARDS ARE ALREADY IN LOCAL RAM =====
-        # Check if the first shard already exists in RAM (indicator all might be there)
-        check_first_local_matrix_shard_ram_path = os.path.join(
-            self.local_RAM_folder, 
-            f"{self.matrix_name}_shard_0.bin"
-        )
-        print(f"Checking for existing shards in RAM: {check_first_local_matrix_shard_ram_path}")
-        
-        # ===== CASE 1: SHARDS ALREADY IN LOCAL RAM =====
-        if os.path.exists(check_first_local_matrix_shard_ram_path):
-            print("Found existing matrix shards in local RAM")
-            
-            # Just add all existing RAM paths to our list
-            for shard_index, node_IP in enumerate(self.node_IP_list):
-                local_matrix_shard_ram_path = os.path.join(
-                    self.local_RAM_folder, 
-                    f"{self.matrix_name}_shard_{shard_index}.bin"
-                )
-                self.matrix_file_paths_list.append(local_matrix_shard_ram_path)
-                print(f"  Shard {shard_index}: Using existing RAM path")
-        
-        # ===== CASE 2: SHARDS NOT IN RAM, NEED TO LOAD FROM DISK =====
-        else:
-            print("Matrix shards not found in RAM, loading from disk...")
-            
-            for shard_index, node_IP in enumerate(self.node_IP_list):
-                print(f"\nProcessing shard {shard_index} for node {node_IP}:")
-                
-                # Create file names
+
+        # Map each IP to the shard indices it is responsible for.
+        shard_indices_by_ip = {}
+        for shard_index, node_ip in enumerate(self.node_IP_list):
+            shard_indices_by_ip.setdefault(node_ip, []).append(shard_index)
+
+        head_ip = self.IP
+        head_shard_indices = shard_indices_by_ip.get(head_ip, [])
+
+        # The controller tracks per-slot paths:
+        # - head slots refer to head local RAM
+        # - worker slots refer to worker RAM (same /dev/shm/... path on that machine)
+        for shard_index, node_ip in enumerate(self.node_IP_list):
+            shard_filename = f"{self.matrix_name}_shard_{shard_index}.bin"
+            if node_ip == head_ip:
+                self.matrix_file_paths_list.append(os.path.join(self.local_RAM_folder, shard_filename))
+            else:
+                self.matrix_file_paths_list.append(os.path.join(self.remote_RAM_folder, shard_filename))
+
+        # ===== HEAD: ensure only its assigned shards exist in local RAM =====
+        if head_shard_indices:
+            print(f"Head node assigned shard indices: {head_shard_indices}")
+            missing_local = []
+            for shard_index in head_shard_indices:
                 shard_filename = f"{self.matrix_name}_shard_{shard_index}.bin"
-                local_matrix_shard_ram_path = os.path.join(self.local_RAM_folder, shard_filename)
-                
-                # Add RAM path to our list (controller tracks all shard paths)
-                self.matrix_file_paths_list.append(local_matrix_shard_ram_path)
-                print(f"  Controller tracking: {local_matrix_shard_ram_path}")
-                
-                # ----- CONTROLLER NODE: COPY ALL SHARDS TO LOCAL RAM -----
-                # The controller needs ALL shards in its RAM for coordination
-                print(f"  Controller: Copying shard {shard_index} to local RAM")
-                
-                # Construct source and destination paths
-                local_disk_source = os.path.join(
-                    self.local_project_dir, 
-                    self.local_DISK_folder, 
-                    shard_filename
-                )
-                local_ram_dest = os.path.join(self.local_RAM_folder, shard_filename)
-                
-                # Create copy command for local system
-                local_copy_command = f'cp "{local_disk_source}" "{local_ram_dest}"'
-                print(f"  Local copy command: {local_copy_command}")
-                
-                # Execute local copy
-                try:
+                local_ram_path = os.path.join(self.local_RAM_folder, shard_filename)
+                if not os.path.exists(local_ram_path):
+                    missing_local.append(shard_index)
+
+            if not missing_local:
+                print("Found required head-node shards in local RAM")
+            else:
+                print(f"Head-node shards missing in RAM: {missing_local} → loading from disk...")
+                for shard_index in missing_local:
+                    shard_filename = f"{self.matrix_name}_shard_{shard_index}.bin"
+                    local_disk_source = os.path.join(self.local_project_dir, self.local_DISK_folder, shard_filename)
+                    local_ram_dest = os.path.join(self.local_RAM_folder, shard_filename)
+                    local_copy_command = f'cp "{local_disk_source}" "{local_ram_dest}"'
+                    print(f"  Local copy command: {local_copy_command}")
                     subprocess.run(local_copy_command, shell=True, check=True)
-                    print(f"  ✓ Successfully copied to local RAM")
-                except subprocess.CalledProcessError as e:
-                    print(f"  ✗ Failed to copy shard {shard_index} locally: {e}")
-                    raise
-                
-                # ----- REMOTE NODES: COPY ONLY THEIR ASSIGNED SHARD -----
-                # Each remote node only needs its specific shard in its RAM
-                if self.IP != node_IP:
-                    print(f"  Remote node {node_IP}: Setting up its assigned shard")
-                    
-                    # Construct remote paths
-                    remote_disk_path = os.path.join(self.remote_DISK_folder, shard_filename)
-                    remote_ram_path = os.path.join(self.remote_RAM_folder, shard_filename)
-                    
-                    # Command to copy from remote disk to remote RAM
-                    remote_copy_command = f'cp "{self.remote_project_dir}{remote_disk_path}" "{remote_ram_path}"'
-                    print(f"  Remote copy command: {remote_copy_command}")
-                    
-                    # Send command to remote node via ZeroMQ
-                    print(f"  Sending command to remote node {node_IP}...")
-                    self.zmq_send_command(node_IP, remote_copy_command)
-                    print(f"  ✓ Command sent to remote node")
-        
-        # ===== LOADING COMPLETE =====
+        else:
+            print("⚠️  Head node has no assigned shards in this slot list")
+
+        # ===== WORKERS: best-effort copy only their assigned shards into remote RAM =====
+        # This does not wait for ACKs because Linux commands are not ACKed, but it keeps
+        # worker behavior aligned with the head's slot list.
+        for node_ip, shard_indices in shard_indices_by_ip.items():
+            if node_ip == head_ip:
+                continue
+            for shard_index in shard_indices:
+                shard_filename = f"{self.matrix_name}_shard_{shard_index}.bin"
+                remote_disk_path = os.path.join(self.remote_DISK_folder, shard_filename)
+                remote_ram_path = os.path.join(self.remote_RAM_folder, shard_filename)
+                remote_copy_command = f'cp "{self.remote_project_dir}{remote_disk_path}" "{remote_ram_path}"'
+                print(f"  Remote node {node_ip}: {remote_copy_command}")
+                self.zmq_send_command(node_ip, remote_copy_command)
+
         print(f"\nMatrix shard loading complete")
-        print(f"Total shard paths tracked: {len(self.matrix_file_paths_list)}")
-        
         return True
  
     def load_cluster_matrixA_grid(self):
