@@ -1896,7 +1896,7 @@ class cluster_matrix:
 
         if send_back_result:  
             combined_matrix = self.wait_for_combined_pt(base_result_name)
-            cluster_matrixB.cleanup()
+            #cluster_matrixB.cleanup() we do not need this anymore 
             return combined_matrix
         else:  
             result_cluster_matrix = cluster_matrix(  
