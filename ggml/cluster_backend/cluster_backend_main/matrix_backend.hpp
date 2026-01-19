@@ -17,6 +17,8 @@
 #include <chrono>
 #include <algorithm>
 #include <mutex>
+#include <cstdint>
+#include <cstring>
 #include <sys/mman.h>
 
 
@@ -28,6 +30,57 @@ struct MatrixResult
     std::unique_ptr<float[]> data;  
     int dims[4]; // ne0, ne1, ne2, ne3  
 };  
+
+static inline uint16_t float_to_bf16_bits(float f) {
+    uint32_t bits;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return (uint16_t)(bits >> 16);
+}
+
+static inline uint16_t float_to_fp16_bits(float f) {
+    // IEEE 754 float -> half (round to nearest even)
+    uint32_t x;
+    std::memcpy(&x, &f, sizeof(x));
+
+    const uint32_t sign = (x >> 16) & 0x8000u;
+    int32_t exp = int32_t((x >> 23) & 0xFFu) - 127 + 15;
+    uint32_t mant = x & 0x007FFFFFu;
+
+    if (exp <= 0) {
+        if (exp < -10) return (uint16_t)sign; // too small -> 0
+        // subnormal
+        mant |= 0x00800000u;
+        uint32_t shift = (uint32_t)(1 - exp);
+        uint32_t mant16 = mant >> (shift + 13);
+        // round-to-nearest-even
+        uint32_t round_bit = (mant >> (shift + 12)) & 1u;
+        uint32_t sticky = mant & ((1u << (shift + 12)) - 1u);
+        mant16 += (round_bit && (sticky || (mant16 & 1u))) ? 1u : 0u;
+        return (uint16_t)(sign | mant16);
+    }
+
+    if (exp >= 31) {
+        // inf/nan
+        if ((x & 0x7FFFFFFFu) == 0x7F800000u) {
+            return (uint16_t)(sign | 0x7C00u);
+        }
+        uint16_t nan_mant = (uint16_t)(mant >> 13);
+        if (nan_mant == 0) nan_mant = 1;
+        return (uint16_t)(sign | 0x7C00u | nan_mant);
+    }
+
+    uint32_t mant16 = mant >> 13;
+    uint32_t round_bit = (mant >> 12) & 1u;
+    uint32_t sticky = mant & 0xFFFu;
+    mant16 += (round_bit && (sticky || (mant16 & 1u))) ? 1u : 0u;
+    if (mant16 == 0x400u) { // mantissa overflow
+        mant16 = 0;
+        exp += 1;
+        if (exp >= 31) return (uint16_t)(sign | 0x7C00u);
+    }
+
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | (mant16 & 0x03FFu));
+}
 
 // ============================================================================
 // OPENCL KERNELS FOR MATRIX MULTIPLICATION
@@ -281,27 +334,26 @@ bool save_matrix_bin(const char* path, const MatrixResult& result)
         std::cerr << "Cannot create file: " << path << std::endl;    
         return false;    
     }    
-    // FORCE 4D format for consistency with PyTorch backend  
-    int ndim = 4;  
-    // Write dimension count    
-    file.write(reinterpret_cast<const char*>(&ndim), sizeof(int));    
-    // Write ALL 4 dimensions  
-    for (int i = 0; i < ndim; i++)   
-    {  
-        file.write(reinterpret_cast<const char*>(&result.dims[i]), sizeof(int));  
-    }  
+    // Default: write float32 payload (v2 header).
+    // Use the overload `save_matrix_bin(path, result, dtype_tag)` to request float16/bfloat16 output.
+    const int dtype_tag = -1;
+    file.write(reinterpret_cast<const char*>(&dtype_tag), sizeof(int));
+    const int ndim = 4;
+    for (int i = 0; i < ndim; i++) {
+        file.write(reinterpret_cast<const char*>(&result.dims[i]), sizeof(int));
+    }
     // Calculate total elements and write data    
     size_t total_elements = 1;  
     for (int i = 0; i < ndim; i++)   
     {  
         total_elements *= result.dims[i];  
     }    
-    file.write(reinterpret_cast<const char*>(result.data.get()), sizeof(float) * total_elements);    
+    file.write(reinterpret_cast<const char*>(result.data.get()), sizeof(float) * total_elements);
     file.close();      
     // Print info (matching Python reference)    
     std::cout << "  Saved to " << path << std::endl;    
-    // Calculate expected file size  
-    size_t file_size = 4 + ndim * 4 + total_elements * 4;  // 4 bytes per int/float        
+    // Calculate expected file size
+    size_t file_size = 4 + 4 * 4 + total_elements * 4;  // 5 ints + float32 payload
     std::cout << "  Shape: (";    
     for (int i = 0; i < ndim; i++)  
     {  
@@ -310,6 +362,67 @@ bool save_matrix_bin(const char* path, const MatrixResult& result)
     }  
     std::cout << "), Size: " << file_size << " bytes" << std::endl;       
     return true;    
+}
+
+bool save_matrix_bin(const char* path, const MatrixResult& result, int dtype_tag)
+{
+    // Create directory if it doesn't exist
+    std::string path_str = path;
+    size_t last_slash = path_str.find_last_of('/');
+    if (last_slash != std::string::npos)
+    {
+        std::string dir_path = path_str.substr(0, last_slash);
+        std::filesystem::create_directories(dir_path);
+    }
+
+    std::ofstream file(path, std::ios::binary);
+    if (!file)
+    {
+        std::cerr << "Cannot create file: " << path << std::endl;
+        return false;
+    }
+
+    // Header (v2): dtype_tag + fixed 4D dims
+    if (dtype_tag != -1 && dtype_tag != -2 && dtype_tag != -3) {
+        std::cerr << "Unsupported dtype_tag for save_matrix_bin: " << dtype_tag << std::endl;
+        return false;
+    }
+
+    file.write(reinterpret_cast<const char*>(&dtype_tag), sizeof(int));
+    const int ndim = 4;
+    for (int i = 0; i < ndim; i++) {
+        file.write(reinterpret_cast<const char*>(&result.dims[i]), sizeof(int));
+    }
+
+    size_t total_elements = 1;
+    for (int i = 0; i < ndim; i++) {
+        total_elements *= result.dims[i];
+    }
+
+    if (dtype_tag == -1) {
+        file.write(reinterpret_cast<const char*>(result.data.get()), sizeof(float) * total_elements);
+    } else if (dtype_tag == -2) {
+        std::vector<uint16_t> out(total_elements);
+        for (size_t i = 0; i < total_elements; ++i) {
+            out[i] = float_to_fp16_bits(result.data[i]);
+        }
+        file.write(reinterpret_cast<const char*>(out.data()), sizeof(uint16_t) * total_elements);
+    } else { // -3 bfloat16
+        std::vector<uint16_t> out(total_elements);
+        for (size_t i = 0; i < total_elements; ++i) {
+            out[i] = float_to_bf16_bits(result.data[i]);
+        }
+        file.write(reinterpret_cast<const char*>(out.data()), sizeof(uint16_t) * total_elements);
+    }
+
+    file.close();
+
+    const size_t elem_bytes = (dtype_tag == -1) ? 4 : 2;
+    size_t file_size = 4 + 4 * 4 + total_elements * elem_bytes;
+    std::cout << "  Saved to " << path << std::endl;
+    std::cout << "  Shape: (" << result.dims[0] << ", " << result.dims[1] << ", " << result.dims[2] << ", " << result.dims[3]
+              << "), Size: " << file_size << " bytes" << std::endl;
+    return true;
 }
 
 std::unique_ptr<float[]> load_matrix_bin(const char* path, int& rows, int& cols,   
@@ -322,19 +435,39 @@ std::unique_ptr<float[]> load_matrix_bin(const char* path, int& rows, int& cols,
         return nullptr;  
     }  
 
-                // Read dimension count  
-    int ndim;  
-    file.read(reinterpret_cast<char*>(&ndim), sizeof(int));  
+    // Read first header word:
+    // - v2: dtype_tag (negative)
+    // - v1: ndim (positive)
+    int tag_or_ndim = 0;
+    file.read(reinterpret_cast<char*>(&tag_or_ndim), sizeof(int));
+    if (!file) {
+        std::cerr << "Cannot read header tag from file: " << path << std::endl;
+        return nullptr;
+    }
+
+    int ndim = 0;
+    int dtype_tag = -1; // legacy default: float32
+    std::vector<int> dims;
+
+    if (tag_or_ndim < 0) {
+        dtype_tag = tag_or_ndim;
+        ndim = 4;
+        dims.resize(4);
+        for (int i = 0; i < 4; i++) {
+            file.read(reinterpret_cast<char*>(&dims[i]), sizeof(int));
+        }
+    } else {
+        ndim = tag_or_ndim;
+        dims.resize(ndim);
+        for (int i = 0; i < ndim; i++) {
+            file.read(reinterpret_cast<char*>(&dims[i]), sizeof(int));
+        }
+    }
                 
-    //std::cout << "DEBUG LOADING: File " << path << " has " << ndim << " dimensions\n";
-                
-                // Read dimensions  
-    std::vector<int> dims(ndim);  
-    for (int i = 0; i < ndim; i++) 
-    {  
-        file.read(reinterpret_cast<char*>(&dims[i]), sizeof(int));  
+    for (int i = 0; i < ndim; i++)
+    {
         std::cout << "  Dim[" << i << "] = " << dims[i] << "\n";
-    }  
+    }
                 
                 // Map dimensions correctly based on ndim
     if (ndim == 2) 
@@ -380,9 +513,68 @@ std::unique_ptr<float[]> load_matrix_bin(const char* path, int& rows, int& cols,
                 
     //std::cout << "DEBUG: Total elements = " << total_elements << "\n";
                 
-                // Allocate and read data  
-    auto matrix = std::make_unique<float[]>(total_elements);  
-    file.read(reinterpret_cast<char*>(matrix.get()), sizeof(float) * total_elements);  
+    // Allocate and read data (convert to float32 as the internal representation)
+    auto matrix = std::make_unique<float[]>(total_elements);
+
+    auto bf16_to_f32 = [](uint16_t v) -> float {
+        uint32_t bits = uint32_t(v) << 16;
+        float out;
+        std::memcpy(&out, &bits, sizeof(out));
+        return out;
+    };
+
+    auto fp16_to_f32 = [](uint16_t h) -> float {
+        // IEEE 754 half -> float
+        const uint32_t sign = (uint32_t(h & 0x8000u) << 16);
+        uint32_t exp = (h & 0x7C00u) >> 10;
+        uint32_t mant = (h & 0x03FFu);
+
+        uint32_t f_bits = 0;
+        if (exp == 0) {
+            if (mant == 0) {
+                f_bits = sign; // zero
+            } else {
+                // subnormal
+                exp = 1;
+                while ((mant & 0x0400u) == 0) {
+                    mant <<= 1;
+                    exp--;
+                }
+                mant &= 0x03FFu;
+                const uint32_t f_exp = (exp + (127 - 15)) << 23;
+                const uint32_t f_mant = mant << 13;
+                f_bits = sign | f_exp | f_mant;
+            }
+        } else if (exp == 0x1F) {
+            // inf/nan
+            f_bits = sign | 0x7F800000u | (mant << 13);
+        } else {
+            const uint32_t f_exp = (exp + (127 - 15)) << 23;
+            const uint32_t f_mant = mant << 13;
+            f_bits = sign | f_exp | f_mant;
+        }
+
+        float out;
+        std::memcpy(&out, &f_bits, sizeof(out));
+        return out;
+    };
+
+    if (dtype_tag == -1) {
+        file.read(reinterpret_cast<char*>(matrix.get()), sizeof(float) * total_elements);
+    } else if (dtype_tag == -2 || dtype_tag == -3) {
+        std::vector<uint16_t> tmp(total_elements);
+        file.read(reinterpret_cast<char*>(tmp.data()), sizeof(uint16_t) * total_elements);
+        if (!file) {
+            std::cerr << "Failed to read 16-bit payload from: " << path << std::endl;
+            return nullptr;
+        }
+        for (size_t i = 0; i < total_elements; ++i) {
+            matrix[i] = (dtype_tag == -2) ? fp16_to_f32(tmp[i]) : bf16_to_f32(tmp[i]);
+        }
+    } else {
+        std::cerr << "Error: Unsupported dtype_tag: " << dtype_tag << std::endl;
+        return nullptr;
+    }
                 
                 // Print first few values
     //std::cout << "DEBUG: First 5 values: ";
