@@ -59,9 +59,7 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
 
 ---
 
----
 ## 🧩 System 1 — Linear Shard Split & Join
----
 
 ## 🔹 End-to-End Example
 
