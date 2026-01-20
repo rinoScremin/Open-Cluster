@@ -1,61 +1,8 @@
 from cluster_matrix_v1 import cluster_matrix
 from cluster_matrix_v1 import cluster_zmq
+from cluster_matrix_v1 import check_combined_result_values
 import torch
 import numpy as np
-
-
-def check_combined_result_values(c_ref_path, combined):
-    c_ref = torch.load(c_ref_path)
-    if c_ref.shape != combined.shape:
-        print(f"❌ Shape mismatch! Reference: {c_ref.shape}, Combined: {combined.shape}")
-    else:
-        print(f"✅ Shapes match: {c_ref.shape}")
-
-        # Ensure both are Torch tensors (defensive)
-        if not isinstance(c_ref, torch.Tensor):
-            c_ref = torch.from_numpy(c_ref)
-        if not isinstance(combined, torch.Tensor):
-            combined = torch.from_numpy(combined)
-
-        c_ref = c_ref.to(dtype=combined.dtype, device=combined.device)
-
-        # Calculate absolute differences
-        diff = torch.abs(c_ref - combined)
-
-        # Basic statistics
-        max_diff = torch.max(diff).item()
-        mean_diff = torch.mean(diff).item()
-
-        print(f"Max absolute difference:  {max_diff:.6e}")
-        print(f"Mean absolute difference: {mean_diff:.6e}")
-
-        # Looser tolerance for shard / float accumulation
-        tolerance = 0.15
-
-        if torch.allclose(c_ref, combined, rtol=tolerance, atol=tolerance):
-            print(f"✅ Results match within tolerance ({tolerance})")
-        else:
-            print(f"⚠️  Results differ beyond tolerance ({tolerance})")
-
-        significant_diff = diff > tolerance
-        num_different = torch.sum(significant_diff).item()
-        total_elements = c_ref.numel()
-
-        print(
-            f"Elements with > {tolerance} difference: "
-            f"{num_different}/{total_elements} "
-            f"({(num_different / total_elements * 100):.2f}%)"
-        )
-
-def print_matrix_sections(matrix, name, n_elements=100):
-    flat = matrix.flatten()
-    mid = flat.shape[0] // 2
-
-    print(f"\n{name} — first {n_elements} elements of first half:")
-    print(flat[:n_elements])
-
-    print(f"\n{name} — first {n_elements} elements of second half:")
-    print(flat[mid:mid + n_elements])
 
 #######################################------MAIN FUNCTION - TESTING-----######################################  
 if __name__ == "__main__":
@@ -69,20 +16,26 @@ if __name__ == "__main__":
     B2 = np.random.rand(9000, 7000)
     '''
     
-    A3 = np.random.rand(1500, 4500)
-    B3 = np.random.rand(1000, 4500)
+    #A3 = np.random.rand(1500, 4500).astype(np.bfloat16)
+    #B3 = np.random.rand(1000, 4500).astype(np.bfloat16)
+
+    A3 = torch.from_numpy(np.random.rand(1500, 4500).astype(np.float16))
+    B3 = torch.from_numpy(np.random.rand(1000, 4500).astype(np.float16))
+
+    torch.save(A3, 'model_matrices/small_matrixA.pt')
+    torch.save(B3, 'model_matrices/small_matrixB.pt')
+
+    print('A# DATA TYPE: ',A3.dtype)
+    print('A# DATA TYPE: ',B3.dtype)
 
     '''
-    torch.save(torch.tensor(A, dtype=torch.float32), 'model_matrixs/big_matrixA.pt')
-    torch.save(torch.tensor(B, dtype=torch.float32), 'model_matrixs/big_matrixB.pt')   
+    torch.save(torch.tensor(A, dtype=torch.float32), 'model_matrices/big_matrixA.pt')
+    torch.save(torch.tensor(B, dtype=torch.float32), 'model_matrices/big_matrixB.pt')   
     
-    torch.save(torch.tensor(A2, dtype=torch.float32), 'model_matrixs/mid_matrixA.pt')
-    torch.save(torch.tensor(B2, dtype=torch.float32), 'model_matrixs/mid_matrixB.pt')   
+    torch.save(torch.tensor(A2, dtype=torch.float32), 'model_matrices/mid_matrixA.pt')
+    torch.save(torch.tensor(B2, dtype=torch.float32), 'model_matrices/mid_matrixB.pt')   
     '''
     
-    torch.save(torch.tensor(A3, dtype=torch.float32), 'model_matrixs/small_matrixA.pt')
-    torch.save(torch.tensor(B3, dtype=torch.float32), 'model_matrixs/small_matrixB.pt')
-      
 
     # ----------------- CREATE MATRICES for dim = 1 split test -----------------
     '''
@@ -95,35 +48,35 @@ if __name__ == "__main__":
     A3_T = np.random.rand(500, 1500)
     B3_T = np.random.rand(500, 1000)
 
-    torch.save(torch.tensor(A_T, dtype=torch.float32), 'model_matrixs/big_matrixA_T.pt')
-    torch.save(torch.tensor(B_T, dtype=torch.float32), 'model_matrixs/big_matrixB_T.pt')   
+    torch.save(torch.tensor(A_T, dtype=torch.float32), 'model_matrices/big_matrixA_T.pt')
+    torch.save(torch.tensor(B_T, dtype=torch.float32), 'model_matrices/big_matrixB_T.pt')   
     
-    torch.save(torch.tensor(A2_T, dtype=torch.float32), 'model_matrixs/mid_matrixA_T.pt')
-    torch.save(torch.tensor(B2_T, dtype=torch.float32), 'model_matrixs/mid_matrixB_T.pt')   
+    torch.save(torch.tensor(A2_T, dtype=torch.float32), 'model_matrices/mid_matrixA_T.pt')
+    torch.save(torch.tensor(B2_T, dtype=torch.float32), 'model_matrices/mid_matrixB_T.pt')   
 
-    torch.save(torch.tensor(A3_T, dtype=torch.float32), 'model_matrixs/small_matrixA_T.pt')
-    torch.save(torch.tensor(B3_T, dtype=torch.float32), 'model_matrixs/small_matrixB_T.pt')
+    torch.save(torch.tensor(A3_T, dtype=torch.float32), 'model_matrices/small_matrixA_T.pt')
+    torch.save(torch.tensor(B3_T, dtype=torch.float32), 'model_matrices/small_matrixB_T.pt')
     '''
     
     # ----------------- FILE PATHS for dim = 0 split test-----------------
-    big_test_matrix_pathA = 'model_matrixs/big_matrixA.pt'  
-    big_test_matrix_pathB = 'model_matrixs/big_matrixB.pt'  
+    big_test_matrix_pathA = 'model_matrices/big_matrixA.pt'  
+    big_test_matrix_pathB = 'model_matrices/big_matrixB.pt'  
 
-    mid_test_matrix_pathA = 'model_matrixs/mid_matrixA.pt'  
-    mid_test_matrix_pathB = 'model_matrixs/mid_matrixB.pt'  
+    mid_test_matrix_pathA = 'model_matrices/mid_matrixA.pt'  
+    mid_test_matrix_pathB = 'model_matrices/mid_matrixB.pt'  
 
-    small_test_matrix_pathA = 'model_matrixs/small_matrixA.pt'  
-    small_test_matrix_pathB = 'model_matrixs/small_matrixB.pt'  
+    small_test_matrix_pathA = 'model_matrices/small_matrixA.pt'  
+    small_test_matrix_pathB = 'model_matrices/small_matrixB.pt'  
 
     # ----------------- FILE PATHS for dim = 1 split test-----------------
-    big_test_matrix_pathA_T = 'model_matrixs/big_matrixA_T.pt'  
-    big_test_matrix_pathB_T = 'model_matrixs/big_matrixB_T.pt'  
+    big_test_matrix_pathA_T = 'model_matrices/big_matrixA_T.pt'  
+    big_test_matrix_pathB_T = 'model_matrices/big_matrixB_T.pt'  
 
-    mid_test_matrix_pathA_T = 'model_matrixs/mid_matrixA_T.pt'  
-    mid_test_matrix_pathB_T = 'model_matrixs/mid_matrixB_T.pt'  
+    mid_test_matrix_pathA_T = 'model_matrices/mid_matrixA_T.pt'  
+    mid_test_matrix_pathB_T = 'model_matrices/mid_matrixB_T.pt'  
 
-    small_test_matrix_pathA_T = 'model_matrixs/small_matrixA_T.pt'  
-    small_test_matrix_pathB_T = 'model_matrixs/small_matrixB_T.pt'  
+    small_test_matrix_pathA_T = 'model_matrices/small_matrixA_T.pt'  
+    small_test_matrix_pathB_T = 'model_matrices/small_matrixB_T.pt'  
 
     
     # ----------------- REFERENCE RESULTS for dim = 0 split test-----------------
@@ -131,18 +84,15 @@ if __name__ == "__main__":
     big_a = torch.load(big_test_matrix_pathA)
     big_b = torch.load(big_test_matrix_pathB)
     big_c_ref = big_a @ big_b.T  # A @ B.T
-    torch.save(big_c_ref, 'model_matrixs/big_c_ref.pt')
+    torch.save(big_c_ref, 'model_matrices/big_c_ref.pt')
 
     mid_a = torch.load(mid_test_matrix_pathA)
     mid_b = torch.load(mid_test_matrix_pathB)
     mid_c_ref = mid_a @ mid_b.T
-    torch.save(mid_c_ref, 'model_matrixs/mid_c_ref.pt')
+    torch.save(mid_c_ref, 'model_matrices/mid_c_ref.pt')
     '''
-    
-    small_a = torch.load(small_test_matrix_pathA)
-    small_b = torch.load(small_test_matrix_pathB)
-    small_c_ref = small_a @ small_b.T
-    torch.save(small_c_ref, 'model_matrixs/small_c_ref.pt')
+    small_c_ref = A3 @ B3.T
+    torch.save(small_c_ref, 'model_matrices/small_c_ref.pt')
     
 
     # ----------------- REFERENCE RESULTS for dim = 1 split test-----------------
@@ -150,17 +100,17 @@ if __name__ == "__main__":
     big_a_T = torch.load(big_test_matrix_pathA_T)
     big_b_T = torch.load(big_test_matrix_pathB_T)
     big_c_ref_T = big_a_T.T @ big_b_T  # A @ B.T
-    torch.save(big_c_ref_T, 'model_matrixs/big_c_ref_T.pt')
+    torch.save(big_c_ref_T, 'model_matrices/big_c_ref_T.pt')
 
     mid_a_T = torch.load(mid_test_matrix_pathA)
     mid_b_T = torch.load(mid_test_matrix_pathB)
     mid_c_ref_T = mid_a_T @ mid_b_T.T
-    torch.save(mid_c_ref_T, 'model_matrixs/mid_c_ref_T.pt')
+    torch.save(mid_c_ref_T, 'model_matrices/mid_c_ref_T.pt')
 
     small_a_T = torch.load(small_test_matrix_pathA_T)
     small_b_T = torch.load(small_test_matrix_pathB_T)
     small_c_ref_T = small_a_T.T @ small_b_T
-    torch.save(small_c_ref_T, 'model_matrixs/small_c_ref_T.pt')
+    torch.save(small_c_ref_T, 'model_matrices/small_c_ref_T.pt')
     '''
     
 
@@ -188,7 +138,6 @@ if __name__ == "__main__":
                                     auto_set_up=[1, "save"]
                                     )
 
-
     small_new_matrixB = cluster_matrix(small_test_matrix_pathB, 
                                     cluster_zmq_object=cluster_zmq_obj,  
                                     CPU_GPU_select_list=CPU_GPU_select_list, 
@@ -200,7 +149,7 @@ if __name__ == "__main__":
                                     )
 
     big_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)  
-    check_combined_result_values('model_matrixs/small_c_ref.pt',big_new_matrixC)
+    check_combined_result_values('model_matrices/small_c_ref.pt',big_new_matrixC)
 
     small_big_new_matrixA = cluster_matrix(small_test_matrix_pathA, 
                                     cluster_zmq_object=cluster_zmq_obj, 
@@ -223,7 +172,7 @@ if __name__ == "__main__":
                                     )
 
     big_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)  
-    check_combined_result_values('model_matrixs/small_c_ref.pt',big_new_matrixC)
+    check_combined_result_values('model_matrices/small_c_ref.pt',big_new_matrixC)
     
     
     #############################SYSTEM 1 — 5 SLOT TEST#############################
@@ -256,7 +205,7 @@ if __name__ == "__main__":
                                     )
 
     big_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)
-    check_combined_result_values('model_matrixs/small_c_ref.pt',big_new_matrixC)
+    check_combined_result_values('model_matrices/small_c_ref.pt',big_new_matrixC)
 
     small_big_new_matrixA = cluster_matrix(small_test_matrix_pathA,
                                     cluster_zmq_object=cluster_zmq_obj,
@@ -279,11 +228,9 @@ if __name__ == "__main__":
                                     )
 
     big_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)
-    check_combined_result_values('model_matrixs/small_c_ref.pt',big_new_matrixC)
+    check_combined_result_values('model_matrices/small_c_ref.pt',big_new_matrixC)
 
-    
     #############################TESTING CLUSTER MATRIX OPERATIONS SYSTEM 2#############################
-    
     IP_list = ['192.168.2.100','192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.101','192.168.2.104']    
     CPU_GPU_select_list = [ True, True, True, True, True, True ]  
     backend_select_list = ['llama','llama','llama','llama','llama','llama']
@@ -312,8 +259,8 @@ if __name__ == "__main__":
                                     )
 
     small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)  
-    check_combined_result_values('model_matrixs/small_c_ref.pt',small_new_matrixC)
-
+    check_combined_result_values('model_matrices/small_c_ref.pt',small_new_matrixC)
+    print('small_new_matrixC# DATA TYPE: ',small_new_matrixC.dtype)
 
     small_big_new_matrixA = cluster_matrix(small_test_matrix_pathA, 
                                     cluster_zmq_object=cluster_zmq_obj,
@@ -324,7 +271,6 @@ if __name__ == "__main__":
                                     auto_set_up=[2, "load"],
                                     matrix_labeling='a'
                                     )
-
 
     small_new_matrixB = cluster_matrix(small_test_matrix_pathB, 
                                     cluster_zmq_object=cluster_zmq_obj,
@@ -337,7 +283,8 @@ if __name__ == "__main__":
                                     )
 
     small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)  
-    check_combined_result_values('model_matrixs/small_c_ref.pt',small_new_matrixC)
+    check_combined_result_values('model_matrices/small_c_ref.pt',small_new_matrixC)
+    print('small_new_matrixC# DATA TYPE: ',small_new_matrixC.dtype)
     
 
     #############################SYSTEM 2 — 5 SLOT TEST#############################
@@ -369,7 +316,8 @@ if __name__ == "__main__":
                                     )
 
     small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)
-    check_combined_result_values('model_matrixs/small_c_ref.pt',small_new_matrixC)
+    check_combined_result_values('model_matrices/small_c_ref.pt',small_new_matrixC)
+    print('small_new_matrixC# DATA TYPE: ',small_new_matrixC.dtype)
 
     small_big_new_matrixA = cluster_matrix(small_test_matrix_pathA,
                                     cluster_zmq_object=cluster_zmq_obj,
@@ -392,6 +340,7 @@ if __name__ == "__main__":
                                     )
 
     small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)
-    check_combined_result_values('model_matrixs/small_c_ref.pt',small_new_matrixC)
+    check_combined_result_values('model_matrices/small_c_ref.pt',small_new_matrixC)
+    print('small_new_matrixC# DATA TYPE: ',small_new_matrixC.dtype)
     
     
