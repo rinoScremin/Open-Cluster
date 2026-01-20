@@ -112,7 +112,6 @@ C shape → (1000, 512)
 * batch-parallel workloads
 
 ---
----
 
 ## 📡 Cluster Configuration
 
