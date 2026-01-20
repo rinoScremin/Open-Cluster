@@ -1,25 +1,12 @@
 import torch
-import paramiko
 import os
 import time
-import socket
-import threading
 import subprocess
-import ctypes
 import struct
 import numpy as np
-import tempfile
 import zmq
-import atexit
-import json
 import mmap
-import shutil
-import glob
 import math
-import sys
-import io
-import pyopencl as cl
-
 
 def check_combined_result_values(c_ref_path, combined):
     c_ref = torch.load(c_ref_path)
@@ -229,6 +216,7 @@ class cluster_zmq:
                 try:
                     cluster_zmq._ack_receiver_socket = self.zmq_context.socket(zmq.PULL)
                     cluster_zmq._ack_receiver_socket.bind(f"tcp://0.0.0.0:{self.python_front_end_cluster_port}")
+                    cluster_zmq._ack_owner_context = self.zmq_context
                     print(f"✅ Python frontend ACK receiver bound to port {self.python_front_end_cluster_port}")
                 except Exception as e:
                     print(f"❌ Failed to bind ACK receiver: {e}")
@@ -273,7 +261,340 @@ class cluster_zmq:
                 print(f"   ✅ Directory creation command sent to {node_ip}")
             except Exception as e:
                 print(f"   ❌ Failed to send command to {node_ip}: {e}")
+
+    def send_ack_confirmation(self, ack_msg="ACK"):    
+        """    
+        Send ACK confirmation back to C++ backend    
+        """    
+        try:    
+            # Create a separate socket for sending confirmations    
+            if not hasattr(self, 'ack_confirmation_socket'):    
+                self.ack_confirmation_socket = self.zmq_context.socket(zmq.PUSH)    
+                # Use self.IP for the head node IP and define confirmation port  
+                confirmation_port = os.environ.get("PYTHON_ACK_CONFIRMATION_PORT", "7791")  
+                self.ack_confirmation_socket.connect(f"tcp://{self.IP}:{confirmation_port}")    
+            
+            # Send the confirmation message    
+            self.ack_confirmation_socket.send_string(ack_msg)    
+            print(f"✅ Sent confirmation: {ack_msg}")    
+            
+        except Exception as e:    
+            print(f"❌ Failed to send confirmation: {e}")
+
+    def wait_for_acks(self, expected_count, expected_msg="ACK", time_out=120):
+        """
+        Wait for ACKs from all expected nodes on the Python front end cluster port.
         
+        Args:
+            expected_count: Number of ACKs to wait for
+            expected_msg: The expected message string (default: "ACK")
+            time_out: Timeout in seconds (default: 120 seconds)
+        
+        Returns:
+            Number of ACKs actually received (may be less than expected if timeout occurs)
+        """
+        ack_socket = getattr(self, "ack_receiver_socket", None) or getattr(cluster_zmq, "_ack_receiver_socket", None)
+        if ack_socket is None:
+            raise RuntimeError("ACK receiver socket is not available.")
+
+        acks = 0
+        start_time = time.time()
+        
+        while acks < expected_count:
+            # Check if timeout has been reached
+            if time.time() - start_time > time_out:
+                print(f"⏰ TIMEOUT: Only received {acks}/{expected_count} ACKs after {time_out} seconds")
+                return acks
+            try:
+                parts = ack_socket.recv_multipart(flags=zmq.NOBLOCK)
+                if not parts:
+                    continue
+
+                # Single-part string ACK
+                if len(parts) == 1:
+                    msg = parts[0].decode("utf-8", errors="replace")
+                    if msg == expected_msg:
+                        acks += 1
+                        print(f"✅ Received {expected_msg} {acks}/{expected_count}")
+                    continue
+
+                # Multipart payload: header + bytes
+                header = parts[0].decode("utf-8", errors="replace")
+                payload = parts[1]
+                if header.startswith("BIN_COMBINED=") or header.startswith("PT_COMBINED="):
+                    key = header.split("=", 1)[1]
+                    store = getattr(self, "combined_pt_payloads", None) or getattr(cluster_zmq, "_combined_pt_payloads", None)
+                    if store is not None:
+                        store[key] = payload
+            except zmq.Again:
+                # No message yet, sleep briefly to avoid 100% CPU
+                time.sleep(0.01)
+        print("✅ All ACKs received!")
+        return acks
+
+    def wait_for_combined_pt(self, base_result_name, time_out=120, force_2d=True):
+        ack_socket = getattr(self, "ack_receiver_socket", None) or getattr(cluster_zmq, "_ack_receiver_socket", None)
+        if ack_socket is None:
+            raise RuntimeError("ACK receiver socket is not available.")
+
+        store = getattr(self, "combined_pt_payloads", None) or getattr(cluster_zmq, "_combined_pt_payloads", None)
+        if store is None:
+            store = {}
+
+        import io
+
+        def _bin_payload_to_tensor(payload: bytes):
+            # v2: [dtype_tag(int32), batch, depth, rows, cols, data]
+            mv = memoryview(payload)
+            if len(mv) < 5 * 4:
+                raise ValueError("Combined payload too small for v2 header")
+            dtype_tag, b, d, r, c = struct.unpack_from("iiiii", mv, 0)
+            offset = 5 * 4
+            numel = int(b) * int(d) * int(r) * int(c)
+
+            if dtype_tag == -1:
+                np_dtype = np.float32
+            elif dtype_tag == -2:
+                np_dtype = np.float16
+            elif dtype_tag == -3:
+                np_dtype = np.uint16  # raw bf16 bits
+            else:
+                raise ValueError(f"Unsupported dtype_tag in combined payload: {dtype_tag}")
+
+            need = numel * np.dtype(np_dtype).itemsize
+            if len(mv) < offset + need:
+                raise ValueError("Combined payload truncated")
+
+            arr = np.frombuffer(mv, dtype=np_dtype, count=numel, offset=offset).reshape((b, d, r, c))
+            if dtype_tag == -3:
+                u16 = np.array(arr, copy=True, dtype=np.uint16)
+                u32 = (u16.astype(np.uint32) << 16)
+                f32 = u32.view(np.float32)
+                t = torch.from_numpy(f32).to(dtype=torch.bfloat16)
+            else:
+                t = torch.from_numpy(np.array(arr, copy=True))
+
+            if force_2d and t.dim() == 4:
+                t = t.reshape(t.shape[0] * t.shape[1] * t.shape[2], t.shape[3])
+            return t
+
+        start_time = time.time()
+        while True:
+            if base_result_name in store:
+                payload = store.pop(base_result_name)
+                return _bin_payload_to_tensor(payload)
+
+            if time.time() - start_time > time_out:
+                raise TimeoutError(
+                    f"Timed out waiting for combined PT payload for '{base_result_name}'"
+                )
+
+            try:
+                parts = ack_socket.recv_multipart(flags=zmq.NOBLOCK)
+                if not parts:
+                    continue
+                if len(parts) == 1:
+                    # Ignore ACK strings here
+                    continue
+                header = parts[0].decode("utf-8", errors="replace")
+                payload = parts[1]
+                if header.startswith("BIN_COMBINED=") or header.startswith("PT_COMBINED="):
+                    key = header.split("=", 1)[1]
+                    store[key] = payload
+            except zmq.Again:
+                time.sleep(0.01)
+
+    def zmq_send_command(self, worker_ip, command, timeout=5):
+        """Send command using persistent connection pool"""
+        socket_pool = getattr(self, "llama_socket_pool", None)
+        if socket_pool and worker_ip in socket_pool:
+            socket_eth = socket_pool[worker_ip]
+            try:
+                # MUST send bytes, NOT str.
+                socket_eth.send(command.encode('utf-8'))
+                return True
+            except Exception as e:
+                print(f"❌ Error sending command to {worker_ip}: {e}")
+                return False
+        else:
+            print(f"❌ No socket found for worker {worker_ip}")
+            return False
+		 
+    def zmq_send_file(self, worker_ip, local_file_path):
+        socket_pool = getattr(self, "llama_socket_pool", None)
+        if socket_pool and worker_ip in socket_pool:
+            socket_eth = socket_pool[worker_ip]
+            with open(local_file_path, 'rb') as f:
+                file_data = f.read()
+            
+            # Use os.path.basename to get filename
+            filename_only = os.path.basename(local_file_path)
+            
+            socket_eth.send_multipart([
+                filename_only.encode(),
+                file_data
+            ])
+            print(f"📤 Sent file {filename_only} to {worker_ip}")
+	        
+    def stream_matrix_binary(self, worker_ip, matrix, save_name):
+        """
+        Stream a matrix as binary data directly to a remote node without saving locally.
+        Creates the binary file data in memory and sends it via ZeroMQ.
+        
+        Args:
+            matrix: PyTorch tensor to stream
+            worker_ip: IP address of the target worker node
+            save_name: Filename to use for the streamed file
+        """
+        verbose = os.environ.get("STREAM_MATRIX_BINARY_VERBOSE", "1") == "1"
+        if verbose:
+            print(f"📤 Streaming matrix to {worker_ip} as {save_name}")
+        
+        socket_pool = getattr(self, "llama_socket_pool", None)
+
+        if not socket_pool or worker_ip not in socket_pool:
+            print(f"  ERROR: No socket connection to {worker_ip}")
+            return
+        
+        socket_eth = socket_pool[worker_ip]
+
+        # ===== CREATE BINARY FILE DATA IN MEMORY (FAST PATH) =====
+        if verbose:
+            print("  Creating binary file data in memory...")
+
+        # Binary wire format (v2):
+        # [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
+        #
+        # dtype_tag is NEGATIVE to stay backward compatible with legacy files where
+        # the first int was `ndim` (typically 4).
+        #   -1 = float32
+        #   -2 = float16
+        #   -3 = bfloat16 (payload is raw bf16 bits as int16/uint16)
+        #
+        # Legacy format (v1) is still accepted by readers:
+        # [ndim(int32), dims..., data(float32)]
+
+        if isinstance(matrix, torch.Tensor):
+            t = matrix.detach()
+            if t.device.type != "cpu":
+                t = t.cpu()
+            if t.ndim == 2:
+                t = t.reshape(1, 1, t.shape[0], t.shape[1])
+            elif t.ndim == 3:
+                t = t.reshape(1, t.shape[0], t.shape[1], t.shape[2])
+            elif t.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Unsupported number of dimensions: {t.ndim}")
+            if not t.is_contiguous():
+                t = t.contiguous()
+
+            if t.dtype == torch.float32:
+                dtype_tag = -1
+                matrix_np = t.numpy()  # zero-copy view on CPU
+            elif t.dtype == torch.float16:
+                dtype_tag = -2
+                matrix_np = t.numpy()  # zero-copy view on CPU
+            elif t.dtype == torch.bfloat16:
+                dtype_tag = -3
+                # numpy can't represent bf16 directly; send raw bf16 bits as int16.
+                matrix_np = t.view(torch.int16).numpy()
+            else:
+                raise ValueError(f"Unsupported tensor dtype for binary stream: {t.dtype}")
+        elif isinstance(matrix, np.ndarray):
+            matrix_np = matrix
+            if not matrix_np.flags.get("C_CONTIGUOUS", False):
+                matrix_np = np.asarray(matrix_np, order="C")
+            if matrix_np.ndim == 2:
+                matrix_np = matrix_np.reshape(1, 1, matrix_np.shape[0], matrix_np.shape[1])
+            elif matrix_np.ndim == 3:
+                matrix_np = matrix_np.reshape(1, matrix_np.shape[0], matrix_np.shape[1], matrix_np.shape[2])
+            elif matrix_np.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Unsupported number of dimensions: {matrix_np.ndim}")
+
+            if matrix_np.dtype == np.float32:
+                dtype_tag = -1
+            elif matrix_np.dtype == np.float16:
+                dtype_tag = -2
+            else:
+                raise ValueError(f"Unsupported numpy dtype for binary stream: {matrix_np.dtype}")
+        else:
+            raise ValueError(f"Unsupported matrix type: {type(matrix)}")
+
+        b, c, h, w = (int(x) for x in matrix_np.shape)
+        header_size = 4 + 4 * 4  # ndim + 4 dims
+        payload_size = header_size + matrix_np.nbytes
+        payload = bytearray(payload_size)
+        struct.pack_into("iiiii", payload, 0, dtype_tag, b, c, h, w)
+
+        # Fill the payload data area without creating an intermediate `tobytes()` copy.
+        out_view = np.frombuffer(
+            payload,
+            dtype=matrix_np.dtype,
+            offset=header_size,
+            count=matrix_np.size,
+        ).reshape(matrix_np.shape)
+        out_view[...] = matrix_np
+
+        if verbose:
+            print(f"  Dimensions: {b} × {c} × {h} × {w}")
+            print(f"  Binary data size: {payload_size:,} bytes ({payload_size/(1024*1024):.2f} MB)")
+        
+        # ===== SEND VIA ZMQ =====
+        # Use the exact same pattern as zmq_send_file
+        try:
+            # Zero-copy into ZMQ when possible (pyzmq will hold a reference to the bytearray buffer).
+            socket_eth.send_multipart([save_name.encode(), payload], copy=False)
+            if verbose:
+                print(f"  ✓ Matrix streamed to {worker_ip}")
+                print(f"  Sent: {save_name} ({payload_size:,} bytes)")
+        except Exception as e:
+            print(f"  ERROR streaming matrix to {worker_ip}: {e}")
+            raise
+        
+        return payload_size
+
+    def cleanup(self):
+        if getattr(self, "_cleaned_up", False):
+            return
+        self._cleaned_up = True
+
+        try:
+            for socket in getattr(self, "llama_socket_pool", {}).values():
+                try:
+                    socket.close(linger=0)
+                except Exception:
+                    pass
+            for socket in getattr(self, "llama_socket_pool_wifi", {}).values():
+                try:
+                    socket.close(linger=0)
+                except Exception:
+                    pass
+            if hasattr(self, "ack_confirmation_socket"):
+                try:
+                    self.ack_confirmation_socket.close(linger=0)
+                except Exception:
+                    pass
+        finally:
+            # Do not close/term the ack receiver singleton; it may be shared across instances.
+            # Also avoid terminating the context that owns the singleton ack receiver.
+            try:
+                ctx = getattr(self, "zmq_context", None)
+                if ctx is not None and ctx is not getattr(cluster_zmq, "_ack_owner_context", None):
+                    ctx.term()
+            except Exception:
+                pass
+
+    def __del__(self):
+        """Destructor as fallback cleanup."""
+        try:
+            self.cleanup()
+        except Exception:
+            pass  # Avoid exceptions in destructor
+   
+
 class cluster_matrix:
     def __init__(
         self,
@@ -448,342 +769,6 @@ class cluster_matrix:
             if auto_set_up[0] == 2 and auto_set_up[1] == 'load' and self.matrix_labeling == 'b':
                 self.load_cluster_matrixB_grid()   
                      
-    def send_ack_confirmation(self, ack_msg="ACK"):    
-        """    
-        Send ACK confirmation back to C++ backend    
-        """    
-        try:    
-            # Create a separate socket for sending confirmations    
-            if not hasattr(self, 'ack_confirmation_socket'):    
-                self.ack_confirmation_socket = self.zmq_context.socket(zmq.PUSH)    
-                # Use self.IP for the head node IP and define confirmation port  
-                confirmation_port = os.environ.get("PYTHON_ACK_CONFIRMATION_PORT", "7791")  
-                self.ack_confirmation_socket.connect(f"tcp://{self.IP}:{confirmation_port}")    
-            
-            # Send the confirmation message    
-            self.ack_confirmation_socket.send_string(ack_msg)    
-            print(f"✅ Sent confirmation: {ack_msg}")    
-            
-        except Exception as e:    
-            print(f"❌ Failed to send confirmation: {e}")
-
-    def wait_for_acks(self, expected_count, expected_msg="ACK", time_out=120):
-        """
-        Wait for ACKs from all expected nodes on the Python front end cluster port.
-        
-        Args:
-            expected_count: Number of ACKs to wait for
-            expected_msg: The expected message string (default: "ACK")
-            time_out: Timeout in seconds (default: 120 seconds)
-        
-        Returns:
-            Number of ACKs actually received (may be less than expected if timeout occurs)
-        """
-        ack_socket = None
-        if getattr(self, "cluster_zmq_object", None) is not None:
-            ack_socket = getattr(self.cluster_zmq_object, "ack_receiver_socket", None)
-        if ack_socket is None:
-            ack_socket = getattr(self, "ack_receiver_socket", None)
-        if ack_socket is None:
-            raise RuntimeError("ACK receiver socket is not available (missing cluster_zmq_object?).")
-
-        acks = 0
-        start_time = time.time()
-        
-        while acks < expected_count:
-            # Check if timeout has been reached
-            if time.time() - start_time > time_out:
-                print(f"⏰ TIMEOUT: Only received {acks}/{expected_count} ACKs after {time_out} seconds")
-                return acks
-            try:
-                parts = ack_socket.recv_multipart(flags=zmq.NOBLOCK)
-                if not parts:
-                    continue
-
-                # Single-part string ACK
-                if len(parts) == 1:
-                    msg = parts[0].decode("utf-8", errors="replace")
-                    if msg == expected_msg:
-                        acks += 1
-                        print(f"✅ Received {expected_msg} {acks}/{expected_count}")
-                    continue
-
-                # Multipart payload: header + bytes
-                header = parts[0].decode("utf-8", errors="replace")
-                payload = parts[1]
-                if header.startswith("BIN_COMBINED=") or header.startswith("PT_COMBINED="):
-                    key = header.split("=", 1)[1]
-                    store = None
-                    if getattr(self, "cluster_zmq_object", None) is not None:
-                        store = getattr(self.cluster_zmq_object, "combined_pt_payloads", None)
-                    if store is None and hasattr(cluster_zmq, "_combined_pt_payloads"):
-                        store = cluster_zmq._combined_pt_payloads
-                    if store is not None:
-                        store[key] = payload
-            except zmq.Again:
-                # No message yet, sleep briefly to avoid 100% CPU
-                time.sleep(0.01)
-        print("✅ All ACKs received!")
-        return acks
-
-    def wait_for_combined_pt(self, base_result_name, time_out=120, force_2d=True):
-        ack_socket = None
-        if getattr(self, "cluster_zmq_object", None) is not None:
-            ack_socket = getattr(self.cluster_zmq_object, "ack_receiver_socket", None)
-        if ack_socket is None:
-            ack_socket = getattr(self, "ack_receiver_socket", None)
-        if ack_socket is None:
-            raise RuntimeError("ACK receiver socket is not available (missing cluster_zmq_object?).")
-
-        store = None
-        if getattr(self, "cluster_zmq_object", None) is not None:
-            store = getattr(self.cluster_zmq_object, "combined_pt_payloads", None)
-        if store is None and hasattr(cluster_zmq, "_combined_pt_payloads"):
-            store = cluster_zmq._combined_pt_payloads
-        if store is None:
-            store = {}
-
-        import io
-
-        def _bin_payload_to_tensor(payload: bytes):
-            # v2: [dtype_tag(int32), batch, depth, rows, cols, data]
-            mv = memoryview(payload)
-            if len(mv) < 5 * 4:
-                raise ValueError("Combined payload too small for v2 header")
-            dtype_tag, b, d, r, c = struct.unpack_from("iiiii", mv, 0)
-            offset = 5 * 4
-            numel = int(b) * int(d) * int(r) * int(c)
-
-            if dtype_tag == -1:
-                np_dtype = np.float32
-            elif dtype_tag == -2:
-                np_dtype = np.float16
-            elif dtype_tag == -3:
-                np_dtype = np.uint16  # raw bf16 bits
-            else:
-                raise ValueError(f"Unsupported dtype_tag in combined payload: {dtype_tag}")
-
-            need = numel * np.dtype(np_dtype).itemsize
-            if len(mv) < offset + need:
-                raise ValueError("Combined payload truncated")
-
-            arr = np.frombuffer(mv, dtype=np_dtype, count=numel, offset=offset).reshape((b, d, r, c))
-            if dtype_tag == -3:
-                u16 = np.array(arr, copy=True, dtype=np.uint16)
-                u32 = (u16.astype(np.uint32) << 16)
-                f32 = u32.view(np.float32)
-                t = torch.from_numpy(f32).to(dtype=torch.bfloat16)
-            else:
-                t = torch.from_numpy(np.array(arr, copy=True))
-
-            if force_2d and t.dim() == 4:
-                t = t.reshape(t.shape[0] * t.shape[1] * t.shape[2], t.shape[3])
-            return t
-
-        start_time = time.time()
-        while True:
-            if base_result_name in store:
-                payload = store.pop(base_result_name)
-                return _bin_payload_to_tensor(payload)
-
-            if time.time() - start_time > time_out:
-                raise TimeoutError(
-                    f"Timed out waiting for combined PT payload for '{base_result_name}'"
-                )
-
-            try:
-                parts = ack_socket.recv_multipart(flags=zmq.NOBLOCK)
-                if not parts:
-                    continue
-                if len(parts) == 1:
-                    # Ignore ACK strings here
-                    continue
-                header = parts[0].decode("utf-8", errors="replace")
-                payload = parts[1]
-                if header.startswith("BIN_COMBINED=") or header.startswith("PT_COMBINED="):
-                    key = header.split("=", 1)[1]
-                    store[key] = payload
-            except zmq.Again:
-                time.sleep(0.01)
-
-    def zmq_send_command(self, worker_ip, command, timeout=5):
-        """Send command using persistent connection pool"""
-        socket_pool = None
-        if getattr(self, "cluster_zmq_object", None) is not None:
-            socket_pool = getattr(self.cluster_zmq_object, "llama_socket_pool", None)
-        if socket_pool is None:
-            socket_pool = getattr(self, "llama_socket_pool", None)
-
-        if socket_pool and worker_ip in socket_pool:
-            socket_eth = socket_pool[worker_ip]
-            try:
-                # MUST send bytes, NOT str.
-                socket_eth.send(command.encode('utf-8'))
-                return True
-            except Exception as e:
-                print(f"❌ Error sending command to {worker_ip}: {e}")
-                return False
-        else:
-            print(f"❌ No socket found for worker {worker_ip}")
-            return False
-	 
-    def zmq_send_file(self, worker_ip, local_file_path):
-        socket_pool = None
-        if getattr(self, "cluster_zmq_object", None) is not None:
-            socket_pool = getattr(self.cluster_zmq_object, "llama_socket_pool", None)
-        if socket_pool is None:
-            socket_pool = getattr(self, "llama_socket_pool", None)
-
-        if socket_pool and worker_ip in socket_pool:
-            socket_eth = socket_pool[worker_ip]
-            with open(local_file_path, 'rb') as f:
-                file_data = f.read()
-            
-            # Use os.path.basename to get filename
-            filename_only = os.path.basename(local_file_path)
-            
-            socket_eth.send_multipart([
-                filename_only.encode(),
-                file_data
-            ])
-            print(f"📤 Sent file {filename_only} to {worker_ip}")
-	        
-    def stream_matrix_binary(self, worker_ip, matrix, save_name):
-        """
-        Stream a matrix as binary data directly to a remote node without saving locally.
-        Creates the binary file data in memory and sends it via ZeroMQ.
-        
-        Args:
-            matrix: PyTorch tensor to stream
-            worker_ip: IP address of the target worker node
-            save_name: Filename to use for the streamed file
-        """
-        verbose = os.environ.get("STREAM_MATRIX_BINARY_VERBOSE", "1") == "1"
-        if verbose:
-            print(f"📤 Streaming matrix to {worker_ip} as {save_name}")
-        
-        socket_pool = None
-        if getattr(self, "cluster_zmq_object", None) is not None:
-            socket_pool = getattr(self.cluster_zmq_object, "llama_socket_pool", None)
-        if socket_pool is None:
-            socket_pool = getattr(self, "llama_socket_pool", None)
-
-        if not socket_pool or worker_ip not in socket_pool:
-            print(f"  ERROR: No socket connection to {worker_ip}")
-            return
-        
-        socket_eth = socket_pool[worker_ip]
-
-        # ===== CREATE BINARY FILE DATA IN MEMORY (FAST PATH) =====
-        if verbose:
-            print("  Creating binary file data in memory...")
-
-        # Binary wire format (v2):
-        # [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
-        #
-        # dtype_tag is NEGATIVE to stay backward compatible with legacy files where
-        # the first int was `ndim` (typically 4).
-        #   -1 = float32
-        #   -2 = float16
-        #   -3 = bfloat16 (payload is raw bf16 bits as int16/uint16)
-        #
-        # Legacy format (v1) is still accepted by readers:
-        # [ndim(int32), dims..., data(float32)]
-
-        if isinstance(matrix, torch.Tensor):
-            t = matrix.detach()
-            if t.device.type != "cpu":
-                t = t.cpu()
-            if t.ndim == 2:
-                t = t.reshape(1, 1, t.shape[0], t.shape[1])
-            elif t.ndim == 3:
-                t = t.reshape(1, t.shape[0], t.shape[1], t.shape[2])
-            elif t.ndim == 4:
-                pass
-            else:
-                raise ValueError(f"Unsupported number of dimensions: {t.ndim}")
-            if not t.is_contiguous():
-                t = t.contiguous()
-
-            if t.dtype == torch.float32:
-                dtype_tag = -1
-                matrix_np = t.numpy()  # zero-copy view on CPU
-            elif t.dtype == torch.float16:
-                dtype_tag = -2
-                matrix_np = t.numpy()  # zero-copy view on CPU
-            elif t.dtype == torch.bfloat16:
-                dtype_tag = -3
-                # numpy can't represent bf16 directly; send raw bf16 bits as int16.
-                matrix_np = t.view(torch.int16).numpy()
-            else:
-                raise ValueError(f"Unsupported tensor dtype for binary stream: {t.dtype}")
-        elif isinstance(matrix, np.ndarray):
-            matrix_np = matrix
-            if not matrix_np.flags.get("C_CONTIGUOUS", False):
-                matrix_np = np.asarray(matrix_np, order="C")
-            if matrix_np.ndim == 2:
-                matrix_np = matrix_np.reshape(1, 1, matrix_np.shape[0], matrix_np.shape[1])
-            elif matrix_np.ndim == 3:
-                matrix_np = matrix_np.reshape(1, matrix_np.shape[0], matrix_np.shape[1], matrix_np.shape[2])
-            elif matrix_np.ndim == 4:
-                pass
-            else:
-                raise ValueError(f"Unsupported number of dimensions: {matrix_np.ndim}")
-
-            if matrix_np.dtype == np.float32:
-                dtype_tag = -1
-            elif matrix_np.dtype == np.float16:
-                dtype_tag = -2
-            else:
-                raise ValueError(f"Unsupported numpy dtype for binary stream: {matrix_np.dtype}")
-        else:
-            raise ValueError(f"Unsupported matrix type: {type(matrix)}")
-
-        b, c, h, w = (int(x) for x in matrix_np.shape)
-        header_size = 4 + 4 * 4  # ndim + 4 dims
-        payload_size = header_size + matrix_np.nbytes
-        payload = bytearray(payload_size)
-        struct.pack_into("iiiii", payload, 0, dtype_tag, b, c, h, w)
-
-        # Fill the payload data area without creating an intermediate `tobytes()` copy.
-        out_view = np.frombuffer(
-            payload,
-            dtype=matrix_np.dtype,
-            offset=header_size,
-            count=matrix_np.size,
-        ).reshape(matrix_np.shape)
-        out_view[...] = matrix_np
-
-        if verbose:
-            print(f"  Dimensions: {b} × {c} × {h} × {w}")
-            print(f"  Binary data size: {payload_size:,} bytes ({payload_size/(1024*1024):.2f} MB)")
-        
-        # ===== SEND VIA ZMQ =====
-        # Use the exact same pattern as zmq_send_file
-        try:
-            # Zero-copy into ZMQ when possible (pyzmq will hold a reference to the bytearray buffer).
-            socket_eth.send_multipart([save_name.encode(), payload], copy=False)
-            if verbose:
-                print(f"  ✓ Matrix streamed to {worker_ip}")
-                print(f"  Sent: {save_name} ({payload_size:,} bytes)")
-        except Exception as e:
-            print(f"  ERROR streaming matrix to {worker_ip}: {e}")
-            raise
-        
-        return payload_size
-
-    def cleanup(self):
-        # Network resources are owned by `cluster_zmq_object` and are meant to be shared across
-        # multiple `cluster_matrix` instances. Only tear them down if this instance created its
-        # own `cluster_zmq_object` (backwards-compatible mode).
-        if getattr(self, "_owns_cluster_zmq_object", False):
-            for socket in self.llama_socket_pool.values():
-                socket.close()
-            for socket in self.llama_socket_pool_wifi.values():
-                socket.close()
-            if self.zmq_context is not None:
-                self.zmq_context.term()
-
     def convert_to_cluster_matrix_grid(self):
         """
         System 2 (round-robin / block-tiling):
@@ -986,16 +971,16 @@ class cluster_matrix:
                 save_name += '.bin'
                 print(f"  Remote node {node_IP}: Beginning distribution")
 
-                self.stream_matrix_binary(node_IP, self.node_matrices[shard_index], save_name)
+                self.cluster_zmq_object.stream_matrix_binary(node_IP, self.node_matrices[shard_index], save_name)
 
-                self.wait_for_acks(1,save_name)
+                self.cluster_zmq_object.wait_for_acks(1, save_name)
                 # Step 3: Tell remote node to copy from RAM to DISK
                 remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, save_name)
                 remote_disk_dir_full = os.path.join(self.remote_project_dir, self.remote_DISK_folder)
                 remote_save_file_path_DISK = os.path.join(remote_disk_dir_full, save_name)
                 copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
                 print(f"  Step 3: Sending copy command to remote")
-                self.zmq_send_command(node_IP, copy_command)
+                self.cluster_zmq_object.zmq_send_command(node_IP, copy_command)
                 # Step 4: Store remote RAM path (not local)
                 self.matrix_file_paths_list.append(remote_save_file_path_RAM)
                 print(f"  Added remote RAM path to file list: {remote_save_file_path_RAM}")
@@ -1055,14 +1040,14 @@ class cluster_matrix:
                 print(f"Sending to {node_ip}")
 
                 # Step 1: Send the file to remote node's RAM
-                self.zmq_send_file(node_ip, save_file_path_DISK)
+                self.cluster_zmq_object.zmq_send_file(node_ip, save_file_path_DISK)
                 
                 # Wait for acknowledgments from remote nodes
-                self.wait_for_acks(1,save_name)
+                self.cluster_zmq_object.wait_for_acks(1, save_name)
 
                 # Step 2: Tell remote node to copy from RAM to DISK for persistence
                 copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
-                self.zmq_send_command(node_ip, copy_command)
+                self.cluster_zmq_object.zmq_send_command(node_ip, copy_command)
         print(f"Full matrix distribution completed")
         return 0
 
@@ -1133,7 +1118,7 @@ class cluster_matrix:
                 if node_IP != self.IP:
                     if shard_type == 0 and node_IP not in shard0_sent_to_ips:
                         # Send the file to remote RAM
-                        self.zmq_send_file(node_IP, matrixA1_file_path)
+                        self.cluster_zmq_object.zmq_send_file(node_IP, matrixA1_file_path)
                                                 
                         # Send command to copy from RAM to disk
                         remote_filename = os.path.basename(matrixA1_file_path)
@@ -1141,20 +1126,20 @@ class cluster_matrix:
                         remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, remote_filename)
                         remote_save_file_path_DISK = os.path.join(self.remote_project_dir, self.remote_DISK_folder, remote_filename)
                         copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
-                        self.zmq_send_command(node_IP, copy_command)
+                        self.cluster_zmq_object.zmq_send_command(node_IP, copy_command)
                         shard0_sent_to_ips.add(node_IP)
                         print(f'Sent shard 0 to IP: {node_IP}')
                     
                     elif shard_type == 1 and node_IP not in shard1_sent_to_ips:
                         # Send the file to remote RAM
-                        self.zmq_send_file(node_IP, matrixA2_file_path)
+                        self.cluster_zmq_object.zmq_send_file(node_IP, matrixA2_file_path)
                         # Send command to copy from RAM to disk
                         remote_filename = os.path.basename(matrixA2_file_path)
-                        self.wait_for_acks(1,remote_filename)
+                        self.cluster_zmq_object.wait_for_acks(1, remote_filename)
                         remote_save_file_path_RAM = os.path.join(self.remote_RAM_folder, remote_filename)
                         remote_save_file_path_DISK = os.path.join(self.remote_project_dir, self.remote_DISK_folder, remote_filename)
                         copy_command = f'cp {remote_save_file_path_RAM} {remote_save_file_path_DISK}'
-                        self.zmq_send_command(node_IP, copy_command)
+                        self.cluster_zmq_object.zmq_send_command(node_IP, copy_command)
                         
                         shard1_sent_to_ips.add(node_IP)
                         print(f'Sent shard 1 to IP: {node_IP}')
@@ -1429,11 +1414,11 @@ class cluster_matrix:
             for node_ip in unique_node_IP_list:
                 if node_ip != self.IP:
                     # Send file to remote node
-                    self.zmq_send_file(node_ip, source_path)
+                    self.cluster_zmq_object.zmq_send_file(node_ip, source_path)
                     
                     # Send command to copy from remote disk to remote RAM
                     copy_command = f'cp {self.remote_project_dir}{remote_disk_path} {self.remote_RAM_folder}'
-                    self.zmq_send_command(node_ip, copy_command)
+                    self.cluster_zmq_object.zmq_send_command(node_ip, copy_command)
                     
         except Exception as e:
             print(f"Error loading matrix: {e}")
@@ -1517,7 +1502,7 @@ class cluster_matrix:
                 remote_ram_path = os.path.join(self.remote_RAM_folder, shard_filename)
                 remote_copy_command = f'cp "{self.remote_project_dir}{remote_disk_path}" "{remote_ram_path}"'
                 print(f"  Remote node {node_ip}: {remote_copy_command}")
-                self.zmq_send_command(node_ip, remote_copy_command)
+                self.cluster_zmq_object.zmq_send_command(node_ip, remote_copy_command)
 
         print(f"\nMatrix shard loading complete")
         return True
@@ -1643,7 +1628,7 @@ class cluster_matrix:
                     remote_copy_command = f'cp "{self.remote_project_dir}{remote_disk_path}" "{remote_ram_path}"'
                     
                     print(f"    Sending to remote {node_IP}: {remote_copy_command}")
-                    self.zmq_send_command(node_IP, remote_copy_command)
+                    self.cluster_zmq_object.zmq_send_command(node_IP, remote_copy_command)
                     shard0_processed_ips.add(node_IP)
                     
             else:
@@ -1659,7 +1644,7 @@ class cluster_matrix:
                     remote_copy_command = f'cp "{self.remote_project_dir}{remote_disk_path}" "{remote_ram_path}"'
                     
                     print(f"    Sending to remote {node_IP}: {remote_copy_command}")
-                    self.zmq_send_command(node_IP, remote_copy_command)
+                    self.cluster_zmq_object.zmq_send_command(node_IP, remote_copy_command)
                     shard1_processed_ips.add(node_IP)
         
         # ===== LOADING COMPLETE =====
@@ -1777,7 +1762,7 @@ class cluster_matrix:
                     f'cp "{self.remote_project_dir}{remote_disk_path}" '
                     f'"{remote_ram_path}"'
                 )
-                self.zmq_send_command(node_IP, remote_copy_command)
+                self.cluster_zmq_object.zmq_send_command(node_IP, remote_copy_command)
                 processed_remote_pairs.add((node_IP, op_index))
 
         print(f"\n✅ Matrix B grid loading complete")
@@ -1911,7 +1896,7 @@ class cluster_matrix:
         # ===== WAIT FOR ACKS FROM ALL NODES =====
         expected_acks = len(self.node_IP_list)  # one ACK per shard/operation
         print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
-        self.wait_for_acks(expected_acks, "ACK_matrixOp_complete")
+        self.cluster_zmq_object.wait_for_acks(expected_acks, "ACK_matrixOp_complete")
         # ===== OPERATION COMPLETE =====
         print(f"✅ CLUSTER OPERATION COMPLETE")
 
@@ -1941,7 +1926,7 @@ class cluster_matrix:
 
         # CASE 2: Multiple nodes, want combined result → wait for combined PT
         if send_back_result and node_IP_list_len > 1:  
-            combined_matrix = self.wait_for_combined_pt(base_result_name)
+            combined_matrix = self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
             return combined_matrix
 
         # CASE 3: Multiple nodes, keep distributed → return cluster_matrix
@@ -1958,16 +1943,4 @@ class cluster_matrix:
 
         # fallback (should rarely happen)
         return False
-
-    def __del__(self):
-        """Destructor as fallback cleanup."""
-        try:
-            # Check if cleanup hasn't been called yet
-            if hasattr(self, '_cleaned_up') and not self._cleaned_up:
-                print(f"🧹 Destructor cleaning up ZMQ resources...")
-                self.cleanup()
-        except:
-            pass  # Avoid exceptions in destructor
-
-
 
