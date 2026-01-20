@@ -330,8 +330,8 @@ big_new_matrixC = big_new_matrixA_single_node.cluster_shard_operation(
     False ## IF YOU ARE USING 1 NODE DO NOT USE SEND BACK NOT NEEDED IT MUST BE SET TO FALSE FOR SINGLE NODE MATRIX OPERATION'S 
 )
 #small_c_ref = A3 @ B3.T
-#torch.save(small_c_ref, 'model_matrixs/small_c_ref.pt')
-#check_combined_result_values('model_matrixs/small_c_ref.pt',small_new_matrixC) # use the 'check_combined_result_values' function to make ssure
+#torch.save(small_c_ref, 'model_model_matrices/small_c_ref.pt')
+#check_combined_result_values('model_model_matrices/small_c_ref.pt',small_new_matrixC) # use the 'check_combined_result_values' function to make ssure
 #values are correct 
 ```
 
@@ -345,11 +345,11 @@ import numpy as np
 A3 = torch.from_numpy(np.random.rand(1500, 4500).astype(np.float16))
 B3 = torch.from_numpy(np.random.rand(1000, 4500).astype(np.float16))
 
-torch.save(A3, 'model_matrixs/small_matrixA.pt')
-torch.save(B3, 'model_matrixs/small_matrixB.pt')
+torch.save(A3, 'model_model_matrices/small_matrixA.pt')
+torch.save(B3, 'model_model_matrices/small_matrixB.pt')
 
-small_test_matrix_pathA = 'model_matrixs/small_matrixA.pt'
-small_test_matrix_pathB = 'model_matrixs/small_matrixB.pt'
+small_test_matrix_pathA = 'model_model_matrices/small_matrixA.pt'
+small_test_matrix_pathB = 'model_model_matrices/small_matrixB.pt'
 
 ################################ BELOW IS 6 NODE DEFAULT SETUP ################################
 
@@ -448,10 +448,10 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
 ```python
     A3 = torch.from_numpy(np.random.rand(1500, 4500).astype(np.float16))
     B3 = torch.from_numpy(np.random.rand(1000, 4500).astype(np.float16))
-    torch.save(A3, 'model_matrixs/small_matrixA.pt')
-    torch.save(B3, 'model_matrixs/small_matrixB.pt')
-    small_test_matrix_pathA = 'model_matrixs/small_matrixA.pt'  
-    small_test_matrix_pathB = 'model_matrixs/small_matrixB.pt'  
+    torch.save(A3, 'model_model_matrices/small_matrixA.pt')
+    torch.save(B3, 'model_model_matrices/small_matrixB.pt')
+    small_test_matrix_pathA = 'model_model_matrices/small_matrixA.pt'  
+    small_test_matrix_pathB = 'model_model_matrices/small_matrixB.pt'  
 
     IP_list = ['192.168.2.100','192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.101','192.168.2.104']    
     CPU_GPU_select_list = [ True, True, True, True, True, True ]  
