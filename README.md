@@ -446,93 +446,122 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
 ---
 
 ```python
+import torch
+import numpy as np
 
-    import torch
-    import numpy as np
+A3 = torch.from_numpy(np.random.rand(1500, 4500).astype(np.float16))
+B3 = torch.from_numpy(np.random.rand(1000, 4500).astype(np.float16))
 
-    A3 = torch.from_numpy(np.random.rand(1500, 4500).astype(np.float16))
-    B3 = torch.from_numpy(np.random.rand(1000, 4500).astype(np.float16))
-    torch.save(A3, 'model_model_matrices/small_matrixA.pt')
-    torch.save(B3, 'model_model_matrices/small_matrixB.pt')
-    small_test_matrix_pathA = 'model_model_matrices/small_matrixA.pt'  
-    small_test_matrix_pathB = 'model_model_matrices/small_matrixB.pt'  
+torch.save(A3, 'model_model_matrices/small_matrixA.pt')
+torch.save(B3, 'model_model_matrices/small_matrixB.pt')
 
-    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.101','192.168.2.104']    
-    CPU_GPU_select_list = [ True, True, True, True, True, True ]  
-    backend_select_list = ['llama','llama','llama','llama','llama','llama']
+small_test_matrix_pathA = 'model_model_matrices/small_matrixA.pt'
+small_test_matrix_pathB = 'model_model_matrices/small_matrixB.pt'
 
-    cluster_zmq_obj = cluster_zmq(IP_list)
+IP_list = [
+    '192.168.2.100',
+    '192.168.2.100',
+    '192.168.2.100',
+    '192.168.2.101',
+    '192.168.2.101',
+    '192.168.2.104'
+]
 
-    small_big_new_matrixA = cluster_matrix(small_test_matrix_pathA, 
-                                    cluster_zmq_object=cluster_zmq_obj,
-                                    CPU_GPU_select_list=CPU_GPU_select_list, 
-                                    back_end_select_list=backend_select_list,
-                                    split_matrix=True,
-                                    dim=0,
-                                    auto_set_up=[2, "save"],
-                                    matrix_labeling='a'
-                                    )
+CPU_GPU_select_list = [True, True, True, True, True, True]
+backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama']
 
+cluster_zmq_obj = cluster_zmq(IP_list)
 
-    small_new_matrixB = cluster_matrix(small_test_matrix_pathB, 
-                                    cluster_zmq_object=cluster_zmq_obj,
-                                    CPU_GPU_select_list=CPU_GPU_select_list, 
-                                    back_end_select_list=backend_select_list,
-                                    split_matrix=True,
-                                    dim=0,
-                                    auto_set_up=[2, "save"],
-                                    matrix_labeling='b'
-                                    )
+small_big_new_matrixA = cluster_matrix(
+    small_test_matrix_pathA,
+    cluster_zmq_object=cluster_zmq_obj,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    back_end_select_list=backend_select_list,
+    split_matrix=True,
+    dim=0,
+    auto_set_up=[2, "save"],
+    matrix_labeling='a'
+)
 
-    small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)  
+small_new_matrixB = cluster_matrix(
+    small_test_matrix_pathB,
+    cluster_zmq_object=cluster_zmq_obj,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    back_end_select_list=backend_select_list,
+    split_matrix=True,
+    dim=0,
+    auto_set_up=[2, "save"],
+    matrix_labeling='b'
+)
 
-    small_big_new_matrixA = cluster_matrix(small_test_matrix_pathA, 
-                                    cluster_zmq_object=cluster_zmq_obj,
-                                    CPU_GPU_select_list=CPU_GPU_select_list, 
-                                    back_end_select_list=backend_select_list,
-                                    split_matrix=True,
-                                    dim=0,
-                                    auto_set_up=[2, "load"],
-                                    matrix_labeling='a'
-                                    )
+small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(
+    small_new_matrixB, False, True, True
+)
 
-    small_new_matrixB = cluster_matrix(small_test_matrix_pathB, 
-                                    cluster_zmq_object=cluster_zmq_obj,
-                                    CPU_GPU_select_list=CPU_GPU_select_list, 
-                                    back_end_select_list=backend_select_list,
-                                    split_matrix=True,
-                                    dim=0,
-                                    auto_set_up=[2, "load"],
-                                    matrix_labeling='b'
-                                    )
+small_big_new_matrixA = cluster_matrix(
+    small_test_matrix_pathA,
+    cluster_zmq_object=cluster_zmq_obj,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    back_end_select_list=backend_select_list,
+    split_matrix=True,
+    dim=0,
+    auto_set_up=[2, "load"],
+    matrix_labeling='a'
+)
 
-    small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)
+small_new_matrixB = cluster_matrix(
+    small_test_matrix_pathB,
+    cluster_zmq_object=cluster_zmq_obj,
+    CPU_GPU_select_list=CPU_GPU_select_list,
+    back_end_select_list=backend_select_list,
+    split_matrix=True,
+    dim=0,
+    auto_set_up=[2, "load"],
+    matrix_labeling='b'
+)
 
+small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(
+    small_new_matrixB, False, True, True
+)
 
-    #############################TESTING CLUSTER MATRIX DEFULTS OPERATIONS SYSTEM 2#############################
-    
-    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
+############################# TESTING CLUSTER MATRIX DEFAULT OPERATIONS SYSTEM 2 #############################
 
-    cluster_zmq_obj = cluster_zmq(IP_list)
-    
-    matrixA_float16 = cluster_matrix(matrix_pathA_float16, 
-                                    cluster_zmq_object=cluster_zmq_obj, 
-                                    split_matrix=True,
-                                    dim=1,
-                                    auto_set_up=[2, "save"],
-                                    matrix_labeling='a'
-                                    )
+IP_list = [
+    '192.168.2.100',
+    '192.168.2.100',
+    '192.168.2.101',
+    '192.168.2.104'
+]
 
-    matrixB_float16 = cluster_matrix(matrix_pathB_float16, 
-                                    cluster_zmq_object=cluster_zmq_obj,  
-                                    split_matrix=True,
-                                    dim=1,
-                                    auto_set_up=[2, "save"],
-                                    matrix_labeling='b'
-                                    )
+cluster_zmq_obj = cluster_zmq(IP_list)
 
-    big_new_matrixC = matrixA_float16.cluster_shard_operation(matrixB_float16, False, True, True)  
-    check_combined_result_values('model_matrices/c_ref_float16.pt',c_ref_float16)
+matrixA_float16 = cluster_matrix(
+    matrix_pathA_float16,
+    cluster_zmq_object=cluster_zmq_obj,
+    split_matrix=True,
+    dim=1,
+    auto_set_up=[2, "save"],
+    matrix_labeling='a'
+)
+
+matrixB_float16 = cluster_matrix(
+    matrix_pathB_float16,
+    cluster_zmq_object=cluster_zmq_obj,
+    split_matrix=True,
+    dim=1,
+    auto_set_up=[2, "save"],
+    matrix_labeling='b'
+)
+
+big_new_matrixC = matrixA_float16.cluster_shard_operation(
+    matrixB_float16, False, True, True
+)
+
+check_combined_result_values(
+    'model_matrices/c_ref_float16.pt',
+    c_ref_float16
+)
+
 ```
 
 ---
