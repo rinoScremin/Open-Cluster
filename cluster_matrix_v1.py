@@ -20,54 +20,80 @@ import sys
 import io
 import pyopencl as cl
 
+
 def check_combined_result_values(c_ref_path, combined):
     c_ref = torch.load(c_ref_path)
     if c_ref.shape != combined.shape:
         print(f"❌ Shape mismatch! Reference: {c_ref.shape}, Combined: {combined.shape}")
+        return
+    print(f"✅ Shapes match: {c_ref.shape}")
+    # Ensure tensors
+    if not isinstance(c_ref, torch.Tensor):
+        c_ref = torch.from_numpy(c_ref)
+    if not isinstance(combined, torch.Tensor):
+        combined = torch.from_numpy(combined)
+    # -------------------------------
+    # DTYPE & DEVICE HANDLING
+    # -------------------------------
+    print(f"Reference dtype: {c_ref.dtype}")
+    print(f"Combined  dtype: {combined.dtype}")
+    # Move to same device
+    device = combined.device
+    c_ref = c_ref.to(device=device)
+    # Promote BOTH to a safe comparison dtype
+    compare_dtype = torch.float32
+    c_ref = c_ref.to(dtype=compare_dtype)
+    combined = combined.to(dtype=compare_dtype)
+    # -------------------------------
+    # DIFFERENCE METRICS
+    # -------------------------------
+    diff = torch.abs(c_ref - combined)
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    print(f"Max absolute difference:  {max_diff:.6e}")
+    print(f"Mean absolute difference: {mean_diff:.6e}")
+    # -------------------------------
+    # DTYPE-AWARE TOLERANCE
+    # -------------------------------
+    tolerance_map = {
+        torch.float16: 1e-1,
+        torch.bfloat16: 1e-1,
+        torch.float32: 1e-3,
+        torch.float64: 1e-6,
+    }
+    original_dtype = combined.dtype
+    tolerance = tolerance_map.get(original_dtype, 1e-3)
+    if torch.allclose(c_ref, combined, rtol=tolerance, atol=tolerance):
+        print(f"✅ Results match within tolerance ({tolerance})")
     else:
-        print(f"✅ Shapes match: {c_ref.shape}")
-
-        # Ensure both are Torch tensors (defensive)
-        if not isinstance(c_ref, torch.Tensor):
-            c_ref = torch.from_numpy(c_ref)
-        if not isinstance(combined, torch.Tensor):
-            combined = torch.from_numpy(combined)
-
-        c_ref = c_ref.to(dtype=combined.dtype, device=combined.device)
-
-        # Calculate absolute differences
-        diff = torch.abs(c_ref - combined)
-
-        # Basic statistics
-        max_diff = torch.max(diff).item()
-        mean_diff = torch.mean(diff).item()
-
-        print(f"Max absolute difference:  {max_diff:.6e}")
-        print(f"Mean absolute difference: {mean_diff:.6e}")
-
-        # Looser tolerance for shard / float accumulation
-        tolerance = 0.15
-
-        if torch.allclose(c_ref, combined, rtol=tolerance, atol=tolerance):
-            print(f"✅ Results match within tolerance ({tolerance})")
-        else:
-            print(f"⚠️  Results differ beyond tolerance ({tolerance})")
-
-        significant_diff = diff > tolerance
-        num_different = torch.sum(significant_diff).item()
-        total_elements = c_ref.numel()
-
-        print(
-            f"Elements with > {tolerance} difference: "
-            f"{num_different}/{total_elements} "
-            f"({(num_different / total_elements * 100):.2f}%)"
-        )
+        print(f"⚠️  Results differ beyond tolerance ({tolerance})")
+    significant_diff = diff > tolerance
+    num_different = significant_diff.sum().item()
+    total_elements = c_ref.numel()
+    print(
+        f"Elements with > {tolerance} difference: "
+        f"{num_different}/{total_elements} "
+        f"({(num_different / total_elements * 100):.2f}%)"
+    )
 
 class cluster_zmq:
     def __init__(self, node_IP_list):
         # Keep the caller-provided slot list (may include duplicates).
         self.node_IP_list = list(node_IP_list)
-        
+        # =============== DEFAULT NODE PERCENTAGES SET UP ===============
+        self.num_nodes = len(node_IP_list)
+        base = 100 // self.num_nodes
+        remainder = 100 % self.num_nodes
+        # Start with an even split
+        node_percentages = [base] * self.num_nodes
+        # Distribute the remainder (+1) across the first nodes
+        for i in range(remainder):
+            node_percentages[i] += 1
+        # Normalize to fractions (e.g., 17 -> 0.17)
+        self.default_node_percentages = [p / 100 for p in node_percentages]
+        self.default_back_end_select_list = ['llama'] * self.num_nodes
+        self.default_CPU_GPU_select_list = [True] * self.num_nodes
+
         # =============== FOLDER PATH CONFIGURATION ===============
         print("\n📁 CONFIGURING STORAGE PATHS...")
         
@@ -268,13 +294,14 @@ class cluster_matrix:
         print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
         print("=" * 70)
 
-        # =============== NODE CONFIGURATION VALIDATION ===============        
+        # =============== NODE CONFIGURATION VALIDATION ===============
         # Check consistency of the node configuration
-
         if node_percentages is None:
-            node_percentages = []
+            node_percentages = list(cluster_zmq_object.default_node_percentages)
         if back_end_select_list is None:
-            back_end_select_list = []
+            back_end_select_list = list(cluster_zmq_object.default_back_end_select_list)
+        if CPU_GPU_select_list is None:
+            CPU_GPU_select_list = list(cluster_zmq_object.default_CPU_GPU_select_list)
         if auto_set_up is None:
             auto_set_up = []
 
@@ -385,11 +412,11 @@ class cluster_matrix:
             print(f"   Split Matrix: {split_matrix}")
             print(f"   Dimension: {dim}")
         
-        # If no backend specified, default to 'torch' for all nodes
+        # If no backend specified, default to 'llama' for all nodes
         if self.back_end_select_list == []:
-            print("   No backend specified, defaulting to 'torch' for all nodes")
+            print("   No backend specified, defaulting to 'llama' for all nodes")
             for CPU_GPU_select in self.CPU_GPU_select_list:
-                self.back_end_select_list.append('torch')
+                self.back_end_select_list.append('llama')
         
         self.node_matrices = []
         self.matrix_file_paths_list = []  # List for storing matrix file paths
@@ -1882,7 +1909,6 @@ class cluster_matrix:
             print(f"  ✅ Command sent to node {node_IP}")
         
         # ===== WAIT FOR ACKS FROM ALL NODES =====
-        unique_nodes = list(set(self.node_IP_list))
         expected_acks = len(self.node_IP_list)  # one ACK per shard/operation
         print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
         self.wait_for_acks(expected_acks, "ACK_matrixOp_complete")
@@ -1942,3 +1968,6 @@ class cluster_matrix:
                 self.cleanup()
         except:
             pass  # Avoid exceptions in destructor
+
+
+
