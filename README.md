@@ -66,26 +66,27 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
 ### Input
 
 ```python
-M = (1000, 512)
+A = (1000, 512)
+B = (1000, 512)
 split dim = 0
 ```
 
 ### Split
 
 ```
-M0 = (250, 512)
-M1 = (250, 512)
-M2 = (250, 512)
-M3 = (250, 512)
+B0 = (250, 512)
+B1 = (250, 512)
+B2 = (250, 512)
+B3 = (250, 512)
 ```
 
 ### Compute
 
 ```
-C0 = f(M0)
-C1 = f(M1)
-C2 = f(M2)
-C3 = f(M3)
+C0 = A @ B0.T
+C1 = A @ B1.T
+C2 = A @ B2.T
+C3 = A @ B3.T
 ```
 
 ### Join
