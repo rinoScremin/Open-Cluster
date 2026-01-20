@@ -502,10 +502,34 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
                                     matrix_labeling='b'
                                     )
 
-    small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)  
-```
+    small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(small_new_matrixB, False, True, True)
 
-Here’s a polished, GitHub-ready version of your README section. I’ve cleaned up spelling, formatting, headings, and markdown so it’s **clear, consistent, and professional**, while keeping all your examples intact.
+
+    #############################TESTING CLUSTER MATRIX DEFULTS OPERATIONS SYSTEM 2#############################
+    
+    IP_list = ['192.168.2.100','192.168.2.100','192.168.2.101','192.168.2.104']   
+
+    cluster_zmq_obj = cluster_zmq(IP_list)
+    
+    matrixA_float16 = cluster_matrix(matrix_pathA_float16, 
+                                    cluster_zmq_object=cluster_zmq_obj, 
+                                    split_matrix=True,
+                                    dim=1,
+                                    auto_set_up=[2, "save"],
+                                    matrix_labeling='a'
+                                    )
+
+    matrixB_float16 = cluster_matrix(matrix_pathB_float16, 
+                                    cluster_zmq_object=cluster_zmq_obj,  
+                                    split_matrix=True,
+                                    dim=1,
+                                    auto_set_up=[2, "save"],
+                                    matrix_labeling='b'
+                                    )
+
+    big_new_matrixC = matrixA_float16.cluster_shard_operation(matrixB_float16, False, True, True)  
+    check_combined_result_values('model_matrices/c_ref_float16.pt',c_ref_float16)
+```
 
 ---
 
