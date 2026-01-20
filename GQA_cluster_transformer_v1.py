@@ -1,5 +1,5 @@
 import os
-from transformers import AutoModel, AutoTokenizer, AutoConfig
+from transformers import AutoTokenizer, AutoConfig
 from cluster_matrix_v1 import cluster_matrix
 from cluster_matrix_v1 import cluster_zmq
 import torch
