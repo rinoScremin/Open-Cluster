@@ -408,11 +408,11 @@ small_big_new_matrixA = cluster_matrix(
     small_test_matrix_pathA,
     cluster_zmq_object=cluster_zmq_obj,
     split_matrix=False,
-    dim=0,
     auto_set_up=[1, "save"]
 )
 
 ## BELOW IS HOW THE DEFAULT VALUES WILL BE SET
+# # dim = 0
 # CPU_GPU_select_list = [True, True]
 # backend_select_list = ['llama', 'llama']
 # percentages = [0.5, 0.5]
@@ -421,11 +421,11 @@ small_big_new_matrixB = cluster_matrix(
     small_test_matrix_pathB,
     cluster_zmq_object=cluster_zmq_obj,
     split_matrix=True,
-    dim=0,
     auto_set_up=[1, "save"]
 )
 
 ## BELOW IS HOW THE DEFAULT VALUES WILL BE SET
+# dim = 0
 # CPU_GPU_select_list = [True, True]
 # backend_select_list = ['llama', 'llama']
 # percentages = [0.5, 0.5]
