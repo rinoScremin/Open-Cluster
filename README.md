@@ -59,6 +59,61 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
 
 ---
 
+---
+## 🧩 System 1 — Linear Shard Split & Join
+---
+
+## 🔹 End-to-End Example
+
+### Input
+
+```python
+M = (1000, 512)
+split dim = 0
+```
+
+### Split
+
+```
+M0 = (250, 512)
+M1 = (250, 512)
+M2 = (250, 512)
+M3 = (250, 512)
+```
+
+### Compute
+
+```
+C0 = f(M0)
+C1 = f(M1)
+C2 = f(M2)
+C3 = f(M3)
+```
+
+### Join
+
+```
+C = cat([C0, C1, C2, C3], dim=0)
+C shape → (1000, 512)
+```
+
+---
+
+## 🔹 Key Properties
+
+✔ Deterministic ordering
+✔ Zero numerical error (no accumulation)
+✔ Fast reconstruction (single `torch::cat`)
+✔ Ideal for:
+
+* embedding transforms
+* linear layers
+* inference sharding
+* batch-parallel workloads
+
+---
+---
+
 ## 📡 Cluster Configuration
 
 ### Node IP List
