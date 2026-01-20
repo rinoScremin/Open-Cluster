@@ -15,7 +15,7 @@ class cluster_llm_transformer:
         # --------------------------------------------------
         self.local_project_dir = "/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/"
         self.model_path = model_path
-        self.model_matrix_fold_dir = "model_matrixs/"
+        self.model_matrix_fold_dir = "model_matrices/"
 
         os.makedirs(self.model_matrix_fold_dir, exist_ok=True)
 
@@ -537,7 +537,7 @@ class cluster_llm_transformer:
         allow_full_model_load: bool = False,
     ) -> int:
         """
-        Save the model weights needed by this project to `model_matrixs/` without loading the full model in RAM.
+        Save the model weights needed by this project to `model_matrices/` without loading the full model in RAM.
 
         Notes:
         - Prefers streaming tensors from `.safetensors` shards (lowest memory).
