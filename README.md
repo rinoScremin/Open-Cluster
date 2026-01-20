@@ -827,9 +827,6 @@ python cluster_matrix_test.py
 ### Notes
 
 * The backend server **must be running** before executing the Python script.
-* Vulkan is enabled by default in this build configuration.
-* CUDA, Metal, and OpenCL are explicitly disabled.
-* BLAS acceleration uses **OpenBLAS**.
 
 ---
 
