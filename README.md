@@ -333,10 +333,110 @@ big_new_matrixC = big_new_matrixA_single_node.cluster_shard_operation(
 #torch.save(small_c_ref, 'model_matrixs/small_c_ref.pt')
 #check_combined_result_values('model_matrixs/small_c_ref.pt',small_new_matrixC) # use the 'check_combined_result_values' function to make ssure
 #values are correct 
-
-
 ```
 
+---
+USING 'cluster_matrix_v1 system #1' DEFAULTS
+---
+```python
+import torch
+import numpy as np
+
+A3 = torch.from_numpy(np.random.rand(1500, 4500).astype(np.float16))
+B3 = torch.from_numpy(np.random.rand(1000, 4500).astype(np.float16))
+
+torch.save(A3, 'model_matrixs/small_matrixA.pt')
+torch.save(B3, 'model_matrixs/small_matrixB.pt')
+
+small_test_matrix_pathA = 'model_matrixs/small_matrixA.pt'
+small_test_matrix_pathB = 'model_matrixs/small_matrixB.pt'
+
+################################ BELOW IS 6 NODE DEFAULT SETUP ################################
+
+IP_list = [
+    '192.168.2.100',
+    '192.168.2.100',
+    '192.168.2.100',
+    '192.168.2.101',
+    '192.168.2.101',
+    '192.168.2.104'
+]
+
+cluster_zmq_obj = cluster_zmq(IP_list)
+
+small_big_new_matrixA = cluster_matrix(
+    small_test_matrix_pathA,
+    cluster_zmq_object=cluster_zmq_obj,
+    split_matrix=False,
+    dim=0,
+    auto_set_up=[1, "save"]
+)
+
+## BELOW IS HOW THE DEFAULT VALUES WILL BE SET
+# CPU_GPU_select_list = [True, True, True, True, True, True]
+# backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama']
+# percentages = [0.17, 0.17, 0.17, 0.16, 0.16]
+
+small_big_new_matrixB = cluster_matrix(
+    small_test_matrix_pathB,
+    cluster_zmq_object=cluster_zmq_obj,
+    split_matrix=True,
+    dim=0,
+    auto_set_up=[1, "save"]
+)
+
+small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(
+    small_big_new_matrixB,
+    False,
+    True,
+    True
+)
+
+## BELOW IS HOW THE DEFAULT VALUES WILL BE SET
+# CPU_GPU_select_list = [True, True, True, True, True, True]
+# backend_select_list = ['llama', 'llama', 'llama', 'llama', 'llama', 'llama']
+# percentages = [0.17, 0.17, 0.17, 0.16, 0.16]
+
+
+################################ BELOW IS 2 NODE DEFAULT SETUP ################################
+
+IP_list = ['192.168.2.100', '192.168.2.100']  # 50/50 split default
+
+cluster_zmq_obj = cluster_zmq(IP_list)
+
+small_big_new_matrixA = cluster_matrix(
+    small_test_matrix_pathA,
+    cluster_zmq_object=cluster_zmq_obj,
+    split_matrix=False,
+    dim=0,
+    auto_set_up=[1, "save"]
+)
+
+## BELOW IS HOW THE DEFAULT VALUES WILL BE SET
+# CPU_GPU_select_list = [True, True]
+# backend_select_list = ['llama', 'llama']
+# percentages = [0.5, 0.5]
+
+small_big_new_matrixB = cluster_matrix(
+    small_test_matrix_pathB,
+    cluster_zmq_object=cluster_zmq_obj,
+    split_matrix=True,
+    dim=0,
+    auto_set_up=[1, "save"]
+)
+
+## BELOW IS HOW THE DEFAULT VALUES WILL BE SET
+# CPU_GPU_select_list = [True, True]
+# backend_select_list = ['llama', 'llama']
+# percentages = [0.5, 0.5]
+
+small_new_matrixC = small_big_new_matrixA.cluster_shard_operation(
+    small_big_new_matrixB,
+    False,
+    True,
+    True
+)
+```
 ---
 
 # USING `cluster_matrix_v1 system #2`
