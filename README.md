@@ -774,4 +774,65 @@ C = C1 + C2 + C3 + C4 + C5 + C6 + C7 + C8  → shape: (500, 1000)
 
 ---
 
+---
+
+## Installing and Using `cluster_matrix_v1`
+
+> ⚠️ Install script coming soon
+
+### Build the C++ ZMQ backend
+
+From your project root, run the following commands:
+
+```bash
+cd /your_project_dir/Open_Cluster_AI_Station_beta/cluster_matrix/ggml
+```
+
+Configure the build with CMake:
+
+```bash
+cmake -B build \
+      -DGGML_VULKAN=ON \
+      -DGGML_CUDA=OFF \
+      -DGGML_METAL=OFF \
+      -DGGML_OPENCL=OFF \
+      -DGGML_BLAS=ON \
+      -DGGML_BLAS_VENDOR=OpenBLAS
+```
+
+Build the ZMQ backend server:
+
+```bash
+cmake --build build --target matrix_zmq_server -j$(nproc)
+```
+
+Start the backend server:
+
+```bash
+./build/cluster_backend/cluster_backend_main/matrix_zmq_server
+```
+
+---
+
+### Run the Python test script
+
+In a **new terminal window**, run:
+
+```bash
+python cluster_matrix_test.py
+```
+
+---
+
+### Notes
+
+* The backend server **must be running** before executing the Python script.
+* Vulkan is enabled by default in this build configuration.
+* CUDA, Metal, and OpenCL are explicitly disabled.
+* BLAS acceleration uses **OpenBLAS**.
+
+---
+
+
+
 
