@@ -446,6 +446,10 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
 ---
 
 ```python
+
+    import torch
+    import numpy as np
+
     A3 = torch.from_numpy(np.random.rand(1500, 4500).astype(np.float16))
     B3 = torch.from_numpy(np.random.rand(1000, 4500).astype(np.float16))
     torch.save(A3, 'model_model_matrices/small_matrixA.pt')
