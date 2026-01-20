@@ -68,7 +68,7 @@ This document demonstrates how to use `cluster_matrix_v1` system #1 for **distri
 ```python
 A = (1000, 512)
 B = (1000, 512)
-split dim = 0
+Split dimension = 0  (rows of B)
 ```
 
 ### Split
@@ -83,17 +83,19 @@ B3 = (250, 512)
 ### Compute
 
 ```
-C0 = A @ B0.T
-C1 = A @ B1.T
-C2 = A @ B2.T
-C3 = A @ B3.T
+C0 = A @ B0ᵀ → (1000, 250)
+C1 = A @ B1ᵀ → (1000, 250)
+C2 = A @ B2ᵀ → (1000, 250)
+C3 = A @ B3ᵀ → (1000, 250)
+
 ```
 
 ### Join
 
 ```
-C = cat([C0, C1, C2, C3], dim=0)
-C shape → (1000, 512)
+C = cat([C0, C1, C2, C3], dim=1)
+C shape → (1000, 1000)
+
 ```
 
 ---
