@@ -1,1416 +1,2576 @@
-import os
-from transformers import AutoTokenizer, AutoConfig
-from cluster_matrix_v1 import cluster_matrix
-from cluster_matrix_v1 import cluster_zmq
 import torch
+import os
 import time
+import subprocess
+import struct
+import numpy as np
+import zmq
+import mmap
 import math
-import gc
-import glob
 
-class cluster_llm_transformer:
-    def __init__(self, model_path, IP_list, percentages, CPU_GPU_select_list, backend_select_list):
-        # --------------------------------------------------
-        # Paths
-        # --------------------------------------------------
-        self.local_project_dir = "/home/rino/Desktop/Open_Cluster_AI_Station_beta/cluster_matrix/"
-        self.model_path = model_path
-        self.model_matrix_fold_dir = "model_matrices/"
+def check_combined_result_values(c_ref_path, combined):
+    if torch.is_tensor(c_ref_path) == False:
+        c_ref = torch.load(c_ref_path)
+    else:
+        c_ref = c_ref_path
+    if c_ref.shape != combined.shape:
+        print(f"❌ Shape mismatch! Reference: {c_ref.shape}, Combined: {combined.shape}")
+        return
+    print(f"✅ Shapes match: {c_ref.shape}")
+    # Ensure tensors
+    if not isinstance(c_ref, torch.Tensor):
+        c_ref = torch.from_numpy(c_ref)
+    if not isinstance(combined, torch.Tensor):
+        combined = torch.from_numpy(combined)
+    # -------------------------------
+    # DTYPE & DEVICE HANDLING
+    # -------------------------------
+    ref_dtype = c_ref.dtype
+    combined_dtype = combined.dtype
+    print(f"Reference dtype: {ref_dtype}")
+    print(f"Combined  dtype: {combined_dtype}")
+    # Move to same device
+    device = combined.device
+    c_ref = c_ref.to(device=device)
+    # Promote BOTH to a safe comparison dtype
+    compare_dtype = torch.float32
+    c_ref = c_ref.to(dtype=compare_dtype)
+    combined = combined.to(dtype=compare_dtype)
+    # -------------------------------
+    # DIFFERENCE METRICS
+    # -------------------------------
+    diff = (c_ref - combined).abs()
+    max_abs = diff.max().item()
+    mean_abs = diff.mean().item()
 
-        os.makedirs(self.model_matrix_fold_dir, exist_ok=True)
+    denom = c_ref.abs().clamp_min(1e-12)
+    rel = (diff / denom)
+    max_rel = rel.max().item()
+    mean_rel = rel.mean().item()
 
-        # --------------------------------------------------
-        # LOAD METADATA ONLY (NO MODEL WEIGHTS)
-        # --------------------------------------------------
-        self.config = AutoConfig.from_pretrained(model_path)
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-        self.num_layers = self.config.num_hidden_layers
+    print(f"Max absolute difference:  {max_abs:.6e}")
+    print(f"Mean absolute difference: {mean_abs:.6e}")
+    print(f"Max relative difference:  {max_rel:.6e}")
+    print(f"Mean relative difference: {mean_rel:.6e}")
 
+    # -------------------------------
+    # DTYPE-AWARE ALLCLOSE (rtol/atol)
+    # -------------------------------
+    tol_map = {
+        torch.float16: (1e-2, 1e-2),
+        torch.bfloat16: (1e-2, 1e-2),
+        torch.float32: (1e-3, 1e-3),
+        torch.float64: (1e-6, 1e-6),
+    }
+    rtol, atol = tol_map.get(combined_dtype, (1e-3, 1e-3))
 
-        # --------------------------------------------------
-        # ATTENTION / MODEL GEOMETRY
-        # --------------------------------------------------
-        self.hidden_size = self.config.hidden_size
+    # Mirror `torch.allclose(c_ref, combined, ...)` logic for diagnostics:
+    # |c_ref - combined| <= atol + rtol * |combined|
+    allowed = atol + rtol * combined.abs()
+    bad = diff.isnan() | (diff > allowed)
+    bad_count = int(bad.sum().item())
+    total = int(c_ref.numel())
+    bad_pct = (bad_count / total * 100.0) if total else 0.0
 
-        # You already have this logic
-        self.attention_type, self.num_q_heads, self.num_kv_heads = self.detect_attention_type()
+    ok = torch.allclose(c_ref, combined, rtol=rtol, atol=atol)
+    print(f"Allclose thresholds: rtol={rtol} atol={atol}")
+    if ok:
+        print("✅ Results match within allclose thresholds")
+    else:
+        print("⚠️  Results differ beyond allclose thresholds")
+    print(f"Elements outside threshold: {bad_count}/{total} ({bad_pct:.2f}%)")
 
-        self.head_dim = self.hidden_size // self.num_q_heads
-        self.kv_dim = self.num_kv_heads * self.head_dim
+class cluster_zmq:
+    def __init__(self, node_IP_list):
+        # Keep the caller-provided slot list (may include duplicates).
+        self.node_IP_list = list(node_IP_list)
+        # =============== DEFAULT NODE PERCENTAGES SET UP ===============
+        self.num_nodes = len(node_IP_list)
+        base = 100 // self.num_nodes
+        remainder = 100 % self.num_nodes
+        # Start with an even split
+        node_percentages = [base] * self.num_nodes
+        # Distribute the remainder (+1) across the first nodes
+        for i in range(remainder):
+            node_percentages[i] += 1
+        # Normalize to fractions (e.g., 17 -> 0.17)
+        self.default_node_percentages = [p / 100 for p in node_percentages]
+        self.default_back_end_select_list = ['llama'] * self.num_nodes
+        self.default_CPU_GPU_select_list = [True] * self.num_nodes
 
-        self.Model_Attention = self.attention_type
-        self.attention_Heads = [self.num_q_heads, self.num_kv_heads]
-        self.Hidden_size = self.hidden_size
-
-        # --------------------------------------------------
-        # RUNTIME STATE
-        # --------------------------------------------------
-        self.tokens = None
-        self.seq_len = 0
-
-        # --------------------------------------------------
-        # CLUSTER CONFIG
-        # --------------------------------------------------
-        self.IP_list = IP_list
-        self.cluster_zmq_object = cluster_zmq(self.IP_list)
-        self.percentages = percentages
-        self.CPU_GPU_select_list = CPU_GPU_select_list
-        self.backend_select_list = backend_select_list
-
-        # --------------------------------------------------
-        # INFERENCE OPTIMIZATION FLAGS / CACHES
-        # --------------------------------------------------
-        # NOTE: These optimizations are inference-only and preserve numerics/outputs.
-        self.verbose = False  # Set True for per-layer debug prints.
-        self._inv_sqrt_head_dim = 1.0 / math.sqrt(float(self.head_dim))
-        if self.num_q_heads % self.num_kv_heads != 0:
-            raise ValueError(
-                f"Invalid head config: num_q_heads={self.num_q_heads} not divisible by num_kv_heads={self.num_kv_heads}"
-            )
-        self._kv_group_size = self.num_q_heads // self.num_kv_heads
-
-        # Cache: on-demand loaded small tensors (layernorms, etc.)
-        self._tensor_cache: dict[str, torch.Tensor] = {}
-        # Cache: precomputed o_proj matmul matrices (per layer).
-        self._attn_o_proj_mat: list[torch.Tensor | None] = [None] * int(self.num_layers)
-
-        # Cache: cluster_matrix objects for weight shards (per matrix name).
-        self._cluster_weight_cache: dict[str, cluster_matrix] = {}
-
-        # KV cache (compact): [layers, kv_heads, capacity, head_dim], float32 for stable numerics.
-        self._kv_cache_k: torch.Tensor | None = None
-        self._kv_cache_v: torch.Tensor | None = None
-        self._kv_cache_capacity: int = 0
-
-        # RoPE cache: precompute cos/sin for positions up to current generation max.
-        self._rope_theta = float(getattr(self.config, "rope_theta", 10000.0))
-        self._rope_rotary_dim = int(self.head_dim)
-        self._rope_inv_freq: torch.Tensor | None = None
-        self._rope_cos: torch.Tensor | None = None  # [max_pos, rotary_dim]
-        self._rope_sin: torch.Tensor | None = None  # [max_pos, rotary_dim]
-
-        # Precompute common per-layer file paths once (cuts Python string overhead in decode loop).
-        self._layer_paths: list[dict[str, str]] = []
-        for layer_idx in range(int(self.num_layers)):
-            self._layer_paths.append(
-                {
-                    "attn_q": f"{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_q_proj_weight.pt",
-                    "attn_k": f"{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_k_proj_weight.pt",
-                    "attn_v": f"{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt",
-                    "attn_o": f"{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt",
-                    "ln_in": f"{self.model_matrix_fold_dir}layers_{layer_idx}_input_layernorm_weight.pt",
-                    "ln_post": f"{self.model_matrix_fold_dir}layers_{layer_idx}_post_attention_layernorm_weight.pt",
-                    "mlp_gate": f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt",
-                    "mlp_up": f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt",
-                    "mlp_down": f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt",
-                }
-            )
-
-        # --------------------------------------------------
-        # PLACEHOLDERS (NO TENSORS LOADED HERE)
-        # --------------------------------------------------
-        self.token_embedding_matrix = None
-        self.embed_tokens_weight = None
-        self.lm_head_weight = None
-        self.final_norm_weight = None
-        self.token_embedding_matrix_path = ""
-        self.cluster_token_embedding_matrix = None
-        self.full_token_embedding_matrix = None
-        self._cluster_anchor = None
-        self._final_norm_weight = None
-        self._lm_head_weight = None
-
-        # --------------------------------------------------
-        # LOG
-        # --------------------------------------------------
-        print(f"🔍 Model: {getattr(self.config, 'model_type', 'unknown')}")
-        print(f"🔍 Attention: {self.attention_type}")
-        print(f"🔍 Heads: Q={self.num_q_heads}, KV={self.num_kv_heads}")
-        print(f"🔍 Hidden size: {self.hidden_size}")
-        print(f"🔍 Head dimension: {self.head_dim}")
-        print(f"🔍 KV dimension: {self.kv_dim}")
-
-    def _as_batch_first_2d(self, t: torch.Tensor, batch: int, width: int, *, name: str) -> torch.Tensor:
-        """
-        Normalize cluster outputs into [B, W] for micro-batching.
-
-        The cluster backend sometimes returns:
-          - [B, W] (ideal)
-          - [W, B] (needs transpose)
-          - [1, B*W] (flattened)
-          - [B*W, 1] (flattened column)
-        """
-        batch = int(batch)
-        width = int(width)
-        if batch <= 0 or width <= 0:
-            raise ValueError(f"{name}: invalid target shape batch={batch} width={width}")
-
-        if not isinstance(t, torch.Tensor):
-            raise TypeError(f"{name}: expected torch.Tensor, got {type(t)}")
-
-        if t.ndim == 1:
-            if int(t.numel()) != batch * width:
-                raise ValueError(f"{name}: got 1D numel={int(t.numel())}, expected {batch*width}")
-            return t.reshape(batch, width).contiguous()
-
-        if t.ndim != 2:
-            raise ValueError(f"{name}: expected 1D/2D, got {tuple(t.shape)}")
-
-        if tuple(t.shape) == (batch, width):
-            return t.contiguous()
-        if tuple(t.shape) == (width, batch):
-            return t.t().contiguous()
-
-        if t.shape[0] == 1 and int(t.shape[1]) == batch * width:
-            return t.reshape(batch, width).contiguous()
-        if t.shape[1] == 1 and int(t.shape[0]) == batch * width:
-            return t.reshape(batch, width).contiguous()
-
-        raise ValueError(f"{name}: got {tuple(t.shape)}, cannot coerce to ({batch}, {width})")
-
-    def _get_cluster_weight_cached(self, matrix_file_path: str) -> cluster_matrix:
-        """
-        Cache `cluster_matrix` objects for *static* weight matrices (q/k/v/o, MLP weights).
-
-        This removes repeated `cluster_matrix(...)` construction (and its Python/IO overhead)
-        inside the token decode loop. It preserves numerics because the underlying shards
-        and `cluster_shard_operation` calls are unchanged.
-        """
-        def _regenerate_weight_shards() -> None:
-            # Fallback path: only regenerate if `auto_set_up=[1, "load"]` fails.
-            # This avoids false-positive "missing shard" checks on the head node, because
-            # shards are intentionally distributed across nodes (not centralized on the head's disk).
-            matrix_name = os.path.basename(matrix_file_path).split(".pt")[0]
-
-            # Recreate shards with the same transpose policy used by `save_distribute_model_matrices`.
-            w = torch.load(matrix_file_path, map_location="cpu")
-            if not isinstance(w, torch.Tensor) or w.ndim != 2:
-                raise ValueError(f"Expected 2D torch.Tensor at {matrix_file_path}, got {type(w)} {getattr(w, 'shape', None)}")
-
-            hidden = int(self.hidden_size)
-            if matrix_file_path.endswith("_mlp_gate_proj_weight.pt") or matrix_file_path.endswith("_mlp_up_proj_weight.pt"):
-                if w.shape[0] == hidden:
-                    w = w.contiguous()
-                elif w.shape[1] == hidden:
-                    w = w.t().contiguous()
-                else:
-                    raise ValueError(f"Unexpected MLP gate/up shape at {matrix_file_path}: {tuple(w.shape)} (hidden={hidden})")
-            elif matrix_file_path.endswith("_mlp_down_proj_weight.pt"):
-                if w.shape[1] == hidden:
-                    w = w.contiguous()
-                elif w.shape[0] == hidden:
-                    w = w.t().contiguous()
-                else:
-                    raise ValueError(f"Unexpected MLP down shape at {matrix_file_path}: {tuple(w.shape)} (hidden={hidden})")
-            else:
-                w = w.t().contiguous()
-
-            cluster_matrix(
-                matrix_file_path=w,
-                cluster_zmq_object=self.cluster_zmq_object,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                auto_set_up=[1, "save"],
-                matrix_name=matrix_name,
-            )
-            del w
-            gc.collect()
-
-        cm = self._cluster_weight_cache.get(matrix_file_path)
-        if cm is None:
-            try:
-                cm = cluster_matrix(
-                    matrix_file_path=matrix_file_path,
-                    cluster_zmq_object=self.cluster_zmq_object,
-                    CPU_GPU_select_list=self.CPU_GPU_select_list,
-                    node_percentages=self.percentages,
-                    back_end_select_list=self.backend_select_list,
-                    split_matrix=True,
-                    dim=1,
-                    auto_set_up=[1, "load"],
-                )
-            except Exception as e:
-                print(f"⚠️  Weight load failed for {os.path.basename(matrix_file_path)}: {e}")
-                print("   Regenerating shards via save path, then retrying load...")
-                _regenerate_weight_shards()
-                cm = cluster_matrix(
-                    matrix_file_path=matrix_file_path,
-                    cluster_zmq_object=self.cluster_zmq_object,
-                    CPU_GPU_select_list=self.CPU_GPU_select_list,
-                    node_percentages=self.percentages,
-                    back_end_select_list=self.backend_select_list,
-                    split_matrix=True,
-                    dim=1,
-                    auto_set_up=[1, "load"],
-                )
-            self._cluster_weight_cache[matrix_file_path] = cm
-        return cm
-
-    def _get_attn_o_proj_mat(self, layer_idx: int) -> torch.Tensor:
-        """
-        Returns a cached matrix `M` such that `attn_output_flat @ M` matches the original
-        o_proj application, regardless of whether the checkpoint weight is [out,in] or [in,out].
-        """
-        layer_idx = int(layer_idx)
-        mat = self._attn_o_proj_mat[layer_idx]
-        if mat is not None:
-            return mat
-
-        attn_o_proj_path = self._layer_paths[layer_idx]["attn_o"]
-        w = torch.load(attn_o_proj_path, map_location="cpu")
-        if not isinstance(w, torch.Tensor) or w.ndim != 2:
-            raise ValueError(f"attn_o_proj must be 2D torch.Tensor, got {type(w)} {getattr(w, 'shape', None)}")
-
-        hidden = int(self.hidden_size)
-        if w.shape == (hidden, hidden):
-            # Ambiguous: could be HF [out,in] (common) or already transposed [in,out].
-            # We preserve the previous runtime behavior:
-            #   if w.shape[1] == hidden (true) -> treat as [out,in] and use w.T
-            mat = w.t().contiguous()
-        elif w.shape[1] == hidden:
-            # HF weight: [out, in] -> use w.T so x @ w.T
-            mat = w.t().contiguous()
-        elif w.shape[0] == hidden:
-            # Already transposed: [in, out] -> use w directly so x @ w
-            mat = w.contiguous()
-        else:
-            raise ValueError(f"attn_o_proj shape {tuple(w.shape)} incompatible with hidden={hidden}")
-
-        self._attn_o_proj_mat[layer_idx] = mat
-        return mat
-
-    def transpose_save_matrix(self, layer_path: str) -> int:
-        matrix = torch.load(layer_path, map_location="cpu")
-        if not isinstance(matrix, torch.Tensor):
-            raise TypeError(f"Expected torch.Tensor in {layer_path}, got {type(matrix)}")
-        if matrix.ndim != 2:
-            raise ValueError(f"Expected 2D tensor in {layer_path}, got {tuple(matrix.shape)}")
-        torch.save(matrix.t().contiguous(), layer_path)
-        return 0
-
-    def transpose_mlp_layers(self) -> int:
-        """
-        In-place transpose+contiguous of MLP weight .pt files so runtime doesn't need `.t().contiguous()`.
-
-        After running, files will be:
-          - up/gate: [hidden, intermediate]
-          - down:    [intermediate, hidden]
-        """
-        for layer_index in range(self.num_layers):
-            mlp_up_path = f"{self.model_matrix_fold_dir}layers_{layer_index}_mlp_up_proj_weight.pt"
-            mlp_down_path = f"{self.model_matrix_fold_dir}layers_{layer_index}_mlp_down_proj_weight.pt"
-            mlp_gate_path = f"{self.model_matrix_fold_dir}layers_{layer_index}_mlp_gate_proj_weight.pt"
-            print(f"transposing mlp layers {layer_index}")
-            for path in (mlp_up_path, mlp_down_path, mlp_gate_path):
-                if not os.path.exists(path):
-                    print(f"⚠️  Missing MLP weight (skip): {path}")
-                    continue
-                self.transpose_save_matrix(path)
-        return 0
-
-    def cache_mlp_weight_shards(self, start_layer: int = 0, end_layer: int | None = None) -> int:
-        """
-        One-time cache: distribute transposed MLP weights as cluster shards so `mlp_layer` can `load` instead of `save`.
-        """
-        if end_layer is None:
-            end_layer = self.num_layers - 1
-        for layer_idx in range(int(start_layer), int(end_layer) + 1):
-            hidden = int(self.Hidden_size)
-            mlp_up_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt"
-            mlp_down_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt"
-            mlp_gate_path = f"{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt"
-
-            mlp_gate_w = torch.load(mlp_gate_path, map_location="cpu")
-            mlp_up_w = torch.load(mlp_up_path, map_location="cpu")
-            mlp_down_w = torch.load(mlp_down_path, map_location="cpu")
-
-            # Backward compatible: if user didn't run transpose_mlp_layers yet, fix orientation here.
-            if mlp_gate_w.ndim != 2 or mlp_up_w.ndim != 2 or mlp_down_w.ndim != 2:
-                raise ValueError(
-                    f"Expected 2D MLP weights at layer {layer_idx}: "
-                    f"gate={tuple(mlp_gate_w.shape)} up={tuple(mlp_up_w.shape)} down={tuple(mlp_down_w.shape)}"
-                )
-            if mlp_gate_w.shape[0] != hidden and mlp_gate_w.shape[1] == hidden:
-                mlp_gate_w = mlp_gate_w.t().contiguous()
-            else:
-                mlp_gate_w = mlp_gate_w.contiguous()
-            if mlp_up_w.shape[0] != hidden and mlp_up_w.shape[1] == hidden:
-                mlp_up_w = mlp_up_w.t().contiguous()
-            else:
-                mlp_up_w = mlp_up_w.contiguous()
-            if mlp_down_w.shape[1] != hidden and mlp_down_w.shape[0] == hidden:
-                mlp_down_w = mlp_down_w.t().contiguous()
-            else:
-                mlp_down_w = mlp_down_w.contiguous()
-
-            cluster_matrix(
-                matrix_file_path=mlp_gate_w,
-                cluster_zmq_object=self.cluster_zmq_object,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                auto_set_up=[1, "save"],
-                matrix_name=f"layer{layer_idx}_mlp_gate_w",
-            )
-            cluster_matrix(
-                matrix_file_path=mlp_up_w,
-                cluster_zmq_object=self.cluster_zmq_object,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                auto_set_up=[1, "save"],
-                matrix_name=f"layer{layer_idx}_mlp_up_w",
-            )
-            cluster_matrix(
-                matrix_file_path=mlp_down_w,
-                cluster_zmq_object=self.cluster_zmq_object,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                auto_set_up=[1, "save"],
-                matrix_name=f"layer{layer_idx}_mlp_down_w",
-            )
-        return 0
-
-    def _has_weight_shards(self, matrix_name: str) -> bool:
-        local_ram_folder = os.environ.get("LOCAL_RAM_FOLDER", "/dev/shm/matrix_shards/")
-        local_disk_folder = os.environ.get("LOCAL_DISK_FOLDER", "matrix_shards/")
-        local_project_dir = os.environ.get("LOCAL_PROJECT_DIR", self.local_project_dir)
-        ram_path = os.path.join(local_ram_folder, f"{matrix_name}_shard_0.bin")
-        disk_path = os.path.join(local_project_dir, local_disk_folder, f"{matrix_name}_shard_0.bin")
-        return os.path.exists(ram_path) or os.path.exists(disk_path)
-
-    def _get_final_norm_weight_path(self) -> str:
-        candidates = (
-            f"{self.model_matrix_fold_dir}model_norm_weight.pt",
-            f"{self.model_matrix_fold_dir}norm_weight.pt",
+        # =============== FOLDER PATH CONFIGURATION ===============
+        print("\n📁 CONFIGURING STORAGE PATHS...")
+        
+        # Local paths (head node)
+        self.local_matrix_results_RAM_folder = os.environ.get(
+            'LOCAL_MATRIX_RESULTS_RAM_FOLDER', '/dev/shm/matrix_results/'
         )
-        for path in candidates:
-            if os.path.exists(path):
-                return path
-        raise FileNotFoundError(f"Final norm weight not found. Tried: {candidates}")
+        self.local_DISK_folder = os.environ.get('LOCAL_DISK_FOLDER', 'matrix_shards/')
+        # Deprecated: shard data is no longer stored in /dev/shm; matrices live in the C++ server memory.
+        self.local_RAM_folder = None
 
-    def _get_lm_head_weight_path(self) -> str:
-        path = f"{self.model_matrix_fold_dir}lm_head_weight.pt"
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"LM head weight not found: {path}")
-        return path
+        default_project_dir = os.path.dirname(os.path.abspath(__file__)) + os.sep
+        self.local_project_dir = os.environ.get('LOCAL_PROJECT_DIR', default_project_dir)
+        if not self.local_project_dir.endswith(os.sep):
+            self.local_project_dir += os.sep
+        
+        self.local_DISK_folder = self.local_project_dir + self.local_DISK_folder
 
-    def decode_next_token(
-        self,
-        hidden_out: torch.Tensor,
-        *,
-        temperature: float = 0.0,
-        top_k: int = 0,
-        use_cluster: bool = False,
-    ) -> tuple[int, torch.Tensor]:
-        """
-        Convert the final hidden state for a single token into logits and pick the next token id.
-        Uses final RMSNorm + LM head.
-
-        Returns:
-            (next_token_id, logits_1d[vocab])
-        """
-        if hidden_out.ndim != 1:
-            raise ValueError(f"decode_next_token expects [hidden], got {tuple(hidden_out.shape)}")
-
-        if self._final_norm_weight is None:
-            self._final_norm_weight = torch.load(self._get_final_norm_weight_path(), map_location="cpu")
-        norm_w = self._final_norm_weight
-        if norm_w.ndim != 1 or norm_w.shape[0] != hidden_out.shape[0]:
-            raise ValueError(f"final_norm_weight mismatch: weight={tuple(norm_w.shape)} hidden={tuple(hidden_out.shape)}")
-
-        hidden_norm = self.rms_norm(hidden_out.unsqueeze(0), norm_w).squeeze(0)  # [hidden]
-
-        if self._lm_head_weight is None:
-            self._lm_head_weight = torch.load(self._get_lm_head_weight_path(), map_location="cpu")
-        lm_head_w = self._lm_head_weight  # [vocab, hidden]
-        if lm_head_w.ndim != 2 or lm_head_w.shape[1] != hidden_norm.shape[0]:
-            raise ValueError(f"lm_head_weight mismatch: weight={tuple(lm_head_w.shape)} hidden={tuple(hidden_norm.shape)}")
-
-        if use_cluster:
-            # Cluster decode is optional; local decode is the default for correctness.
-            hidden_cluster = cluster_matrix(
-                matrix_file_path=hidden_norm.unsqueeze(1).contiguous(),  # [hidden, 1]
-                cluster_zmq_object=self.cluster_zmq_object,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=False,
-                dim=1,
-                auto_set_up=[1, "save"],
-                matrix_name="decode_hidden",
-            )
-            lm_head_w_t_cluster = cluster_matrix(
-                matrix_file_path=lm_head_w.t().contiguous(),  # [hidden, vocab]
-                cluster_zmq_object=self.cluster_zmq_object,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                auto_set_up=[1, "save"],
-                matrix_name="lm_head_w_t",
-            )
-            logits_2d = hidden_cluster.cluster_shard_operation(lm_head_w_t_cluster, True, False, True)  # [1, vocab]
-            logits = logits_2d.squeeze(0)
-        else:
-            logits = (hidden_norm.unsqueeze(0) @ lm_head_w.t()).squeeze(0)  # [vocab]
-
-        if temperature is None or temperature <= 0.0:
-            next_id = int(torch.argmax(logits).item())
-            return next_id, logits
-
-        scaled = logits / float(temperature)
-        if top_k and top_k > 0:
-            k = min(int(top_k), scaled.numel())
-            top_vals, top_idx = torch.topk(scaled, k)
-            probs = torch.softmax(top_vals, dim=-1)
-            next_local = int(torch.multinomial(probs, num_samples=1).item())
-            next_id = int(top_idx[next_local].item())
-            return next_id, logits
-
-        probs = torch.softmax(scaled, dim=-1)
-        next_id = int(torch.multinomial(probs, num_samples=1).item())
-        return next_id, logits
-
-    def detect_attention_type(self):
-        """
-        Detect attention type (MHA / GQA / MQA) using config only.
-        NO model weights required.
-        """
-
-        config = self.config
-
-        # Default assumptions
-        num_q_heads = getattr(config, "num_attention_heads", None)
-        num_kv_heads = getattr(config, "num_key_value_heads", None)
-
-        if num_q_heads is None:
-            raise ValueError("Config missing num_attention_heads")
-
-        # If num_key_value_heads not present → standard MHA
-        if num_kv_heads is None:
-            num_kv_heads = num_q_heads
-            attention_type = "MHA"
-        else:
-            if num_kv_heads == 1:
-                attention_type = "MQA"
-            elif num_kv_heads < num_q_heads:
-                attention_type = "GQA"
-            else:
-                attention_type = "MHA"
-
-        return attention_type, num_q_heads, num_kv_heads
-
-    def list_llm_layer(self):
-        for name, param in self.model.named_parameters():
-            print("LLM layer --> ", name)
-
-    def tokenize_text(self, text, use_chat_template=False):
-        if use_chat_template and getattr(self.tokenizer, "chat_template", None) and hasattr(self.tokenizer, "apply_chat_template"):
-            messages = [{"role": "user", "content": text}]
-            chat_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            self.tokens = self.tokenizer(chat_prompt, return_tensors="pt", add_special_tokens=False)
-        else:
-            self.tokens = self.tokenizer(text, return_tensors="pt")
-        return self.tokens.input_ids
-
-    def save_all_model_layers(
-        self,
-        start_layer: int = 0,
-        end_layer: int | None = None,
-        batch_size: int = 4,
-        *,
-        dtype: str = "float16",
-        overwrite: bool = False,
-        prefer_safetensors: bool = True,
-        allow_full_model_load: bool = False,
-    ) -> int:
-        """
-        Save the model weights needed by this project to `model_matrices/` without loading the full model in RAM.
-
-        Notes:
-        - Prefers streaming tensors from `.safetensors` shards (lowest memory).
-        - Falls back to a full model load only if safetensors aren't found (may OOM on large models).
-        - `batch_size` is kept for backward compatibility; streaming mode ignores it.
-        """
-        import gc
-        import glob
-        import re
-        import shutil
-        import time
-
-        if end_layer is None:
-            end_layer = getattr(self.config, "num_hidden_layers", 32) - 1
-
-        dtype_map = {"float16": torch.float16, "float32": torch.float32, "bf16": torch.bfloat16}
-        if dtype not in dtype_map:
-            raise ValueError(f"Unsupported dtype={dtype!r}. Use one of: {sorted(dtype_map)}")
-        save_dtype = dtype_map[dtype]
-
-        os.makedirs(self.model_matrix_fold_dir, exist_ok=True)
-
-        print(f"💾 SAVING MODEL WEIGHTS SAFELY {start_layer} to {end_layer}")
-        print(f"📦 Output dir: {self.model_matrix_fold_dir}")
-        print(f"🔢 Save dtype: {dtype}")
-        print(f"🧱 Batch size (compat): {batch_size}")
-        print("=" * 60)
-
-        allowed_layer_suffixes = {
-            "input_layernorm.weight",
-            "post_attention_layernorm.weight",
-            "self_attn.q_proj.weight",
-            "self_attn.k_proj.weight",
-            "self_attn.v_proj.weight",
-            "self_attn.o_proj.weight",
-            "mlp.gate_proj.weight",
-            "mlp.up_proj.weight",
-            "mlp.down_proj.weight",
-        }
-
-        def key_to_outfile(key: str) -> str | None:
-            if key == "model.embed_tokens.weight":
-                return "embed_tokens_weight.pt"
-            if key == "lm_head.weight":
-                return "lm_head_weight.pt"
-            if key == "model.norm.weight":
-                return "model_norm_weight.pt"
-
-            m = re.match(r"^model\\.layers\\.(\\d+)\\.(.+)$", key)
-            if not m:
-                return None
-            layer_idx = int(m.group(1))
-            if layer_idx < int(start_layer) or layer_idx > int(end_layer):
-                return None
-            suffix = m.group(2)
-            if suffix not in allowed_layer_suffixes:
-                return None
-            # e.g. model.layers.0.self_attn.q_proj.weight -> layers_0_self_attn_q_proj_weight.pt
-            return f"layers_{layer_idx}_{suffix.replace('.', '_')}.pt"
-
-        total_saved = 0
-
-        safetensors_files: list[str] = []
-        if prefer_safetensors:
-            safetensors_files = sorted(glob.glob(os.path.join(self.model_path, "*.safetensors")))
-
-        if safetensors_files:
-            try:
-                from safetensors.torch import safe_open  # type: ignore
-            except Exception as e:
-                raise RuntimeError(
-                    f"Found .safetensors weights but failed to import safetensors: {e}. "
-                    "Install `safetensors` in your env."
-                )
-
-            print(f"✅ Using safetensors streaming from {len(safetensors_files)} file(s)")
-
-            for st_path in safetensors_files:
-                print(f"\n📦 Reading: {st_path}")
-                with safe_open(st_path, framework="pt", device="cpu") as f:
-                    for key in f.keys():
-                        out_name = key_to_outfile(key)
-                        if out_name is None:
-                            continue
-                        out_path = os.path.join(self.model_matrix_fold_dir, out_name)
-                        if (not overwrite) and os.path.exists(out_path):
-                            continue
-
-                        tensor = f.get_tensor(key)
-                        if tensor.dtype != save_dtype:
-                            tensor = tensor.to(dtype=save_dtype)
-                        tensor = tensor.contiguous()
-                        torch.save(tensor, out_path)
-                        total_saved += 1
-
-                        del tensor
-                        gc.collect()
-
-                time.sleep(0.05)
-
-            # Convenience: keep `norm_weight.pt` as a copy if needed by older code.
-            model_norm_path = os.path.join(self.model_matrix_fold_dir, "model_norm_weight.pt")
-            norm_path = os.path.join(self.model_matrix_fold_dir, "norm_weight.pt")
-            if os.path.exists(model_norm_path) and (overwrite or not os.path.exists(norm_path)):
-                shutil.copyfile(model_norm_path, norm_path)
-                total_saved += 1
-
-            print(f"\n🎉 SAFELY SAVED {total_saved} tensors via safetensors")
-            return total_saved
-
-        if not allow_full_model_load:
-            raise RuntimeError(
-                "No `.safetensors` weight shards found in `model_path`, and `allow_full_model_load=False`.\n"
-                "To avoid crashing the PC, this function defaults to safetensors streaming only.\n"
-                "Fix: ensure your model has `*.safetensors` files, or call with `allow_full_model_load=True` "
-                "(may use lots of RAM)."
-            )
-
-        # Fallback: full model load (can OOM on large models).
-        print("⚠️  No .safetensors files found; doing full model load (may use a lot of RAM).")
-        try:
-            from transformers import AutoModelForCausalLM  # type: ignore
-        except Exception as e:
-            raise RuntimeError(f"transformers not available for fallback load: {e}")
-
-        model = AutoModelForCausalLM.from_pretrained(
-            self.model_path,
-            torch_dtype=save_dtype,
-            low_cpu_mem_usage=True,
-            device_map="cpu",
+        print(f"   Local Paths:")
+        print(f"     - Disk Folder: {self.local_DISK_folder}")
+        print(f"     - Project Dir: {self.local_project_dir}")
+        
+        # Remote paths (worker nodes)
+        self.remote_matrix_results_RAM_folder = os.environ.get(
+            'REMOTE_MATRIX_RESULTS_RAM_FOLDER', '/dev/shm/matrix_results/'
         )
-        model.eval()
-
-        wanted_files: dict[str, torch.Tensor] = {}
-        state = model.state_dict()
-        for key, tensor in state.items():
-            out_name = key_to_outfile(key)
-            if out_name is None:
-                continue
-            out_path = os.path.join(self.model_matrix_fold_dir, out_name)
-            if (not overwrite) and os.path.exists(out_path):
-                continue
-            wanted_files[out_path] = tensor.detach().to(dtype=save_dtype).contiguous().cpu()
-
-        for out_path, tensor in wanted_files.items():
-            torch.save(tensor, out_path)
-            total_saved += 1
-            del tensor
-            gc.collect()
-
-        del state
-        del model
-        gc.collect()
-
-        print(f"\n🎉 SAVED {total_saved} tensors via full-model fallback")
-        return total_saved
-
-    def get_token_embeddings(self, input_prompt='tell me a short joke', use_chat_template=False):
-        """Get and distribute token embeddings"""
-        # Tokenize the input prompt
-        self.tokenize_text(input_prompt, use_chat_template=use_chat_template)
+        self.remote_DISK_folder = os.environ.get('REMOTE_DISK_FOLDER', 'matrix_shards/')
+        # Deprecated: shard data is no longer stored in /dev/shm; matrices live in the C++ server memory.
+        self.remote_RAM_folder = None
+        self.remote_project_dir = os.environ.get('REMOTE_PROJECT_DIR', default_project_dir)
+        if not self.remote_project_dir.endswith(os.sep):
+            self.remote_project_dir += os.sep
         
-        if self.tokens is None:
-            print("❌ No tokens found.")
-            return None
-        
-        print("🔍 Getting and distributing token embeddings...")
-        
-        # Load embedding matrix once (hot across multiple `generate_text` calls).
-        embedding_path = self.model_matrix_fold_dir + 'embed_tokens_weight.pt'
-        if self.embed_tokens_weight is None:
-            if not os.path.exists(embedding_path):
-                print("❌ Embedding weights not found.")
-                return None
-            self.embed_tokens_weight = torch.load(embedding_path, map_location="cpu")
-        embedding_matrix = self.embed_tokens_weight
-        print(f"📊 Embedding matrix shape: {embedding_matrix.shape}")
-        
-        # Get token IDs
-        token_ids = self.tokens.input_ids[0]
-        print(f"📊 Token IDs: {token_ids.tolist()}")
-        
-        # Vectorized embedding lookup: [seq] -> [seq, hidden]
-        all_embeddings = embedding_matrix[token_ids]
-        print(f"📦 Token embeddings shape: {all_embeddings.shape}")
-        
-        self.token_embedding_matrix = all_embeddings
-        return self.token_embedding_matrix
+        self.remote_DISK_folder = self.remote_project_dir + self.remote_DISK_folder
 
-    def save_distribute_model_matrices(
-        self,
-        start_layer = 0,
-        end_layer = 0,
-        include_embed_tokens: bool = False,
-        include_lm_head: bool = False,
-        include_final_norm: bool = False,
-        transpose_for_runtime: bool = True,
-        keep_ram_copies: bool = False,
-        cleanup_sleep_s: float = 0.0,
-        gc_collect: bool = True,
-    ):
-        def _zmq_send_command(worker_ip: str, command: str) -> bool:
-            socket_pool = getattr(self.cluster_zmq_object, "llama_socket_pool", None)
-            if socket_pool and worker_ip in socket_pool:
+        print(f"   Remote Paths:")
+        print(f"     - Disk Folder: {self.remote_DISK_folder}")
+        print(f"     - Project Dir: {self.remote_project_dir}")
+        
+        # =============== NETWORK AND PORT CONFIGURATION ===============
+        print("\n🌐 CONFIGURING NETWORK SETTINGS...")
+                
+        # Get head node IP addresses from environment variables
+        self.IP = os.environ.get('HEAD_NODE_IP', '192.168.2.100')
+        self.wifi_IP = os.environ.get('HEAD_NODE_IP_WIFI', '192.168.50.113')
+
+        # Optional WiFi IP mapping (best-effort)
+        wifi_env = os.environ.get("WORKER_WIFI_IPS", "")
+        if wifi_env:
+            self.IP_list_wifi = [ip.strip() for ip in wifi_env.split(",") if ip.strip()]
+        else:
+            self.IP_list_wifi = ['192.168.3.13', '192.168.3.243', '192.168.3.165', '192.168.3.94']
+        
+        print(f"   Head Node Ethernet IP: {self.IP}")
+        print(f"   Head Node WiFi IP: {self.wifi_IP}")
+        
+        # ZeroMQ ports for llama communication
+        self.llama_head_node_PULL_port = os.environ.get("HEAD_NODE_PULL_PORT_C", "7779")
+        self.llama_head_node_PUSH_port = os.environ.get("HEAD_NODE_PUSH_PORT_C", "7780")
+        self.llama_worker_node_PULL_port = os.environ.get("WORKER_NODE_PULL_PORT_C", "5557")
+        self.llama_worker_node_PUSH_port = os.environ.get("WORKER_NODE_PUSH_PORT_C", "5558")
+        
+        print(f"   Head Node Ports: PULL={self.llama_head_node_PULL_port}, PUSH={self.llama_head_node_PUSH_port}")
+        print(f"   Worker Node Ports: PULL={self.llama_worker_node_PULL_port}, PUSH={self.llama_worker_node_PUSH_port}")
+        
+        # Python frontend ACK / cluster barrier port
+        self.python_front_end_cluster_port = os.environ.get("PYTHON_FRONT_END_CLUSTER_PORT", "7790")
+        print(f"   Cluster Barrier Port: {self.python_front_end_cluster_port}")
+
+        # =============== ZEROMMQ SOCKET SETUP ===============
+        print("\n🔌 SETTING UP ZEROMQ CONNECTIONS...")
+
+        # Check if we're in worker mode (all IPs are 0.0.0.0)
+        all_ips_are_zero = all(ip == '0.0.0.0' for ip in self.node_IP_list)
+
+        if all_ips_are_zero:
+            print("   ⚙️ Worker mode detected - skipping network connections")
+            self.zmq_context = None
+            self.llama_socket_pool = {}
+            self.llama_socket_pool_wifi = {}
+            self.ack_receiver_socket = None
+        else:
+            # Initialize ZeroMQ context
+            self.zmq_context = zmq.Context()
+            self.llama_socket_pool = {}  # For llama communication - ports 5557/5558
+            self.llama_socket_pool_wifi = {}  # Placeholder to avoid cleanup errors
+            self.timeout = 5000  # 5 second timeout
+            
+            # Create PUSH sockets for ALL remote nodes
+            unique_IP_list = list(dict.fromkeys(self.node_IP_list))
+            print(f"   Connecting to {len(unique_IP_list)} unique nodes...")
+            
+            for node_ip in unique_IP_list:
+                if node_ip != self.IP:  # Remote nodes only
+                    # Llama socket (port 5557 for computation)
+                    try:
+                        llama_socket = self.zmq_context.socket(zmq.PUSH)
+                        llama_socket.connect(f"tcp://{node_ip}:{self.llama_worker_node_PULL_port}")
+                        self.llama_socket_pool[node_ip] = llama_socket
+                        print(f"   ✅ Connected to worker node {node_ip}:{self.llama_worker_node_PULL_port}")
+                    except Exception as e:
+                        print(f"   ❌ Failed to connect to {node_ip}: {e}")
+            
+            # Optional WiFi sockets (parallel transfer)
+            for idx, node_ip in enumerate(unique_IP_list):
+                if idx < len(self.IP_list_wifi):
+                    wifi_ip = self.IP_list_wifi[idx]
+                    try:
+                        wifi_socket = self.zmq_context.socket(zmq.PUSH)
+                        wifi_socket.connect(f"tcp://{wifi_ip}:{self.llama_worker_node_PULL_port}")
+                        self.llama_socket_pool_wifi[wifi_ip] = wifi_socket
+                        print(f"   ✅ Connected to worker WiFi {wifi_ip}:{self.llama_worker_node_PULL_port}")
+                    except Exception as e:
+                        print(f"   ❌ Failed to connect WiFi {wifi_ip}: {e}")
+
+            # Connect to local head node as well
+            try:
+                llama_socket = self.zmq_context.socket(zmq.PUSH)
+                llama_socket.connect(f"tcp://{self.IP}:{self.llama_head_node_PULL_port}")
+                self.llama_socket_pool[self.IP] = llama_socket
+                print(f"   ✅ Connected to head node (self) {self.IP}:{self.llama_head_node_PULL_port}")
+            except Exception as e:
+                print(f"   ❌ Failed to connect to head node: {e}")
+            
+            print(f"   Total sockets in pool: {len(self.llama_socket_pool)}")
+
+            # =============== CLUSTER BARRIER/ACK RECEIVER SETUP ===============
+            print("\n🔄 SETTING UP CLUSTER BARRIER/ACK RECEIVER...")
+            
+            # Initialize ack receiver socket (singleton pattern)
+            if not hasattr(cluster_zmq, '_ack_receiver_socket'):
                 try:
-                    socket_pool[worker_ip].send(command.encode("utf-8"))
-                    return True
+                    cluster_zmq._ack_receiver_socket = self.zmq_context.socket(zmq.PULL)
+                    cluster_zmq._ack_receiver_socket.bind(f"tcp://0.0.0.0:{self.python_front_end_cluster_port}")
+                    cluster_zmq._ack_owner_context = self.zmq_context
+                    print(f"✅ Python frontend ACK receiver bound to port {self.python_front_end_cluster_port}")
                 except Exception as e:
-                    print(f"❌ Error sending command to {worker_ip}: {e}")
-                    return False
+                    print(f"❌ Failed to bind ACK receiver: {e}")
+                    raise
+            else:
+                print(f"✅ ACK receiver already exists on port {self.python_front_end_cluster_port}")
+            
+            # Reference it in the instance
+            self.ack_receiver_socket = cluster_zmq._ack_receiver_socket
+            # Cache for combined PT blobs streamed from C++ (PT_COMBINED=<name>)
+            if not hasattr(cluster_zmq, "_combined_pt_payloads"):
+                cluster_zmq._combined_pt_payloads = {}
+            self.combined_pt_payloads = cluster_zmq._combined_pt_payloads
+
+        # =============== CREATE LOCAL DIRECTORIES ===============
+        print("\n📂 CREATING LOCAL DIRECTORIES...")
+        directories_created = []
+        if not os.path.exists(self.local_DISK_folder):
+            os.makedirs(self.local_DISK_folder)
+            directories_created.append(self.local_DISK_folder)
+        if not os.path.exists(self.local_matrix_results_RAM_folder):
+            os.makedirs(self.local_matrix_results_RAM_folder)
+            directories_created.append(self.local_matrix_results_RAM_folder)
+        
+        if directories_created:
+            print(f"✅ Created directories: {', '.join(directories_created)}")
+        else:
+            print("✅ All required directories already exist")
+                
+        # =============== CREATE REMOTE DIRECTORIES ===============
+        print("\n📡 CREATING REMOTE DIRECTORIES ON WORKER NODES...")
+            
+        command = f'mkdir -p {self.remote_project_dir}{self.remote_DISK_folder} {self.remote_matrix_results_RAM_folder}'
+        print(f"   Sending command: {command}")
+            
+        for node_ip, socket in self.llama_socket_pool.items():
+            try:
+                socket.send_multipart([command.encode('utf-8')])
+                print(f"   ✅ Directory creation command sent to {node_ip}")
+            except Exception as e:
+                print(f"   ❌ Failed to send command to {node_ip}: {e}")
+
+    def send_ack_confirmation(self, ack_msg="ACK"):    
+        """    
+        Send ACK confirmation back to C++ backend    
+        """    
+        try:    
+            # Create a separate socket for sending confirmations    
+            if not hasattr(self, 'ack_confirmation_socket'):    
+                self.ack_confirmation_socket = self.zmq_context.socket(zmq.PUSH)    
+                # Use self.IP for the head node IP and define confirmation port  
+                confirmation_port = os.environ.get("PYTHON_ACK_CONFIRMATION_PORT", "7791")  
+                self.ack_confirmation_socket.connect(f"tcp://{self.IP}:{confirmation_port}")    
+            
+            # Send the confirmation message    
+            self.ack_confirmation_socket.send_string(ack_msg)    
+            print(f"✅ Sent confirmation: {ack_msg}")    
+            
+        except Exception as e:    
+            print(f"❌ Failed to send confirmation: {e}")
+
+    def wait_for_acks(self, expected_count, expected_msg="ACK", time_out=120):
+        """
+        Wait for ACKs from all expected nodes on the Python front end cluster port.
+        
+        Args:
+            expected_count: Number of ACKs to wait for
+            expected_msg: The expected message string (default: "ACK")
+            time_out: Timeout in seconds (default: 120 seconds)
+        
+        Returns:
+            Number of ACKs actually received (may be less than expected if timeout occurs)
+        """
+        ack_socket = getattr(self, "ack_receiver_socket", None) or getattr(cluster_zmq, "_ack_receiver_socket", None)
+        if ack_socket is None:
+            raise RuntimeError("ACK receiver socket is not available.")
+
+        acks = 0
+        start_time = time.time()
+        
+        while acks < expected_count:
+            # Check if timeout has been reached
+            if time.time() - start_time > time_out:
+                print(f"⏰ TIMEOUT: Only received {acks}/{expected_count} ACKs after {time_out} seconds")
+                return acks
+            try:
+                parts = ack_socket.recv_multipart(flags=zmq.NOBLOCK)
+                if not parts:
+                    continue
+
+                # Single-part string ACK
+                if len(parts) == 1:
+                    msg = parts[0].decode("utf-8", errors="replace")
+                    if msg == expected_msg:
+                        acks += 1
+                        print(f"✅ Received {expected_msg} {acks}/{expected_count}")
+                    continue
+
+                # Multipart payload: header + bytes
+                header = parts[0].decode("utf-8", errors="replace")
+                payload = parts[1]
+                if header.startswith("BIN_COMBINED=") or header.startswith("PT_COMBINED="):
+                    key = header.split("=", 1)[1]
+                    store = getattr(self, "combined_pt_payloads", None) or getattr(cluster_zmq, "_combined_pt_payloads", None)
+                    if store is not None:
+                        store[key] = payload
+            except zmq.Again:
+                # No message yet, sleep briefly to avoid 100% CPU
+                time.sleep(0.01)
+        print("✅ All ACKs received!")
+        return acks
+
+    def wait_for_combined_pt(self, base_result_name, time_out=120, force_2d=True):
+        ack_socket = getattr(self, "ack_receiver_socket", None) or getattr(cluster_zmq, "_ack_receiver_socket", None)
+        if ack_socket is None:
+            raise RuntimeError("ACK receiver socket is not available.")
+
+        store = getattr(self, "combined_pt_payloads", None) or getattr(cluster_zmq, "_combined_pt_payloads", None)
+        if store is None:
+            store = {}
+
+        def _bin_payload_to_tensor(payload: bytes):
+            # v2: [dtype_tag(int32), batch, depth, rows, cols, data]
+            mv = memoryview(payload)
+            if len(mv) < 5 * 4:
+                raise ValueError("Combined payload too small for v2 header")
+            dtype_tag, b, d, r, c = struct.unpack_from("iiiii", mv, 0)
+            offset = 5 * 4
+            numel = int(b) * int(d) * int(r) * int(c)
+
+            if dtype_tag == -1:
+                np_dtype = np.float32
+            elif dtype_tag == -2:
+                np_dtype = np.float16
+            elif dtype_tag == -3:
+                np_dtype = np.uint16  # raw bf16 bits
+            else:
+                raise ValueError(f"Unsupported dtype_tag in combined payload: {dtype_tag}")
+
+            need = numel * np.dtype(np_dtype).itemsize
+            if len(mv) < offset + need:
+                raise ValueError("Combined payload truncated")
+
+            arr = np.frombuffer(mv, dtype=np_dtype, count=numel, offset=offset).reshape((b, d, r, c))
+            if dtype_tag == -3:
+                u16 = np.array(arr, copy=True, dtype=np.uint16)
+                u32 = (u16.astype(np.uint32) << 16)
+                f32 = u32.view(np.float32)
+                t = torch.from_numpy(f32).to(dtype=torch.bfloat16)
+            else:
+                t = torch.from_numpy(np.array(arr, copy=True))
+
+            if force_2d and t.dim() == 4:
+                t = t.reshape(t.shape[0] * t.shape[1] * t.shape[2], t.shape[3])
+            return t
+
+        start_time = time.time()
+        while True:
+            if base_result_name in store:
+                payload = store.pop(base_result_name)
+                return _bin_payload_to_tensor(payload)
+
+            if time.time() - start_time > time_out:
+                raise TimeoutError(
+                    f"Timed out waiting for combined PT payload for '{base_result_name}'"
+                )
+
+            try:
+                parts = ack_socket.recv_multipart(flags=zmq.NOBLOCK)
+                if not parts:
+                    continue
+                if len(parts) == 1:
+                    # Ignore ACK strings here
+                    continue
+                header = parts[0].decode("utf-8", errors="replace")
+                payload = parts[1]
+                if header.startswith("BIN_COMBINED=") or header.startswith("PT_COMBINED="):
+                    key = header.split("=", 1)[1]
+                    store[key] = payload
+            except zmq.Again:
+                time.sleep(0.01)
+
+    def zmq_send_command(self, worker_ip, command, timeout=5):
+        """Send command using persistent connection pool"""
+        socket_pool = getattr(self, "llama_socket_pool", None)
+        if socket_pool and worker_ip in socket_pool:
+            socket_eth = socket_pool[worker_ip]
+            try:
+                # MUST send bytes, NOT str.
+                socket_eth.send(command.encode('utf-8'))
+                return True
+            except Exception as e:
+                print(f"❌ Error sending command to {worker_ip}: {e}")
+                return False
+        else:
             print(f"❌ No socket found for worker {worker_ip}")
             return False
+		 
+    def zmq_send_file(self, worker_ip, local_file_path):
+        socket_pool = getattr(self, "llama_socket_pool", None)
+        if socket_pool and worker_ip in socket_pool:
+            socket_eth = socket_pool[worker_ip]
+            with open(local_file_path, 'rb') as f:
+                file_data = f.read()
+            
+            # Use os.path.basename to get filename
+            filename_only = os.path.basename(local_file_path)
+            
+            socket_eth.send_multipart([
+                filename_only.encode(),
+                file_data
+            ])
+            print(f"📤 Sent file {filename_only} to {worker_ip}")
+	        
+    def stream_matrix_binary(self, worker_ip, matrix, save_name):
+        """
+        Stream a matrix as binary data directly to a remote node without saving locally.
+        Creates the binary file data in memory and sends it via ZeroMQ.
+        
+        Args:
+            matrix: PyTorch tensor to stream
+            worker_ip: IP address of the target worker node
+            save_name: Filename to use for the streamed file
+        """
+        verbose = os.environ.get("STREAM_MATRIX_BINARY_VERBOSE", "1") == "1"
+        if verbose:
+            print(f"📤 Streaming matrix to {worker_ip} as {save_name}")
+        
+        socket_pool = getattr(self, "llama_socket_pool", None)
 
-        def _cleanup_ram_bins(prefix: str) -> None:
-            prefix = str(prefix)
-            if not prefix:
-                return
+        if not socket_pool or worker_ip not in socket_pool:
+            print(f"  ERROR: No socket connection to {worker_ip}")
+            return
+        
+        socket_eth = socket_pool[worker_ip]
 
-            local_ram = getattr(self.cluster_zmq_object, "local_RAM_folder", "/dev/shm/matrix_shards/")
-            remote_ram = getattr(self.cluster_zmq_object, "remote_RAM_folder", "/dev/shm/matrix_shards/")
-            if not local_ram.endswith("/"):
-                local_ram += "/"
-            if not remote_ram.endswith("/"):
-                remote_ram += "/"
+        # ===== CREATE BINARY FILE DATA IN MEMORY (FAST PATH) =====
+        if verbose:
+            print("  Creating binary file data in memory...")
 
-            # Local cleanup (head node)
-            for path in glob.glob(os.path.join(local_ram, f"{prefix}*.bin")):
+        # Binary wire format (v2):
+        # [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
+        #
+        # dtype_tag is NEGATIVE to stay backward compatible with legacy files where
+        # the first int was `ndim` (typically 4).
+        #   -1 = float32
+        #   -2 = float16
+        #   -3 = bfloat16 (payload is raw bf16 bits as int16/uint16)
+        #
+        # Legacy format (v1) is still accepted by readers:
+        # [ndim(int32), dims..., data(float32)]
+
+        if isinstance(matrix, torch.Tensor):
+            t = matrix.detach()
+            if t.device.type != "cpu":
+                t = t.cpu()
+            if t.ndim == 2:
+                t = t.reshape(1, 1, t.shape[0], t.shape[1])
+            elif t.ndim == 3:
+                t = t.reshape(1, t.shape[0], t.shape[1], t.shape[2])
+            elif t.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Unsupported number of dimensions: {t.ndim}")
+            if not t.is_contiguous():
+                t = t.contiguous()
+
+            if t.dtype == torch.float32:
+                dtype_tag = -1
+                matrix_np = t.numpy()  # zero-copy view on CPU
+            elif t.dtype == torch.float16:
+                dtype_tag = -2
+                matrix_np = t.numpy()  # zero-copy view on CPU
+            elif t.dtype == torch.bfloat16:
+                dtype_tag = -3
+                # numpy can't represent bf16 directly; send raw bf16 bits as int16.
+                matrix_np = t.view(torch.int16).numpy()
+            else:
+                raise ValueError(f"Unsupported tensor dtype for binary stream: {t.dtype}")
+        elif isinstance(matrix, np.ndarray):
+            matrix_np = matrix
+            if not matrix_np.flags.get("C_CONTIGUOUS", False):
+                matrix_np = np.asarray(matrix_np, order="C")
+            if matrix_np.ndim == 2:
+                matrix_np = matrix_np.reshape(1, 1, matrix_np.shape[0], matrix_np.shape[1])
+            elif matrix_np.ndim == 3:
+                matrix_np = matrix_np.reshape(1, matrix_np.shape[0], matrix_np.shape[1], matrix_np.shape[2])
+            elif matrix_np.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Unsupported number of dimensions: {matrix_np.ndim}")
+
+            if matrix_np.dtype == np.float32:
+                dtype_tag = -1
+            elif matrix_np.dtype == np.float16:
+                dtype_tag = -2
+            else:
+                raise ValueError(f"Unsupported numpy dtype for binary stream: {matrix_np.dtype}")
+        else:
+            raise ValueError(f"Unsupported matrix type: {type(matrix)}")
+
+        b, c, h, w = (int(x) for x in matrix_np.shape)
+        header_size = 4 + 4 * 4  # ndim + 4 dims
+        payload_size = header_size + matrix_np.nbytes
+        payload = bytearray(payload_size)
+        struct.pack_into("iiiii", payload, 0, dtype_tag, b, c, h, w)
+
+        # Fill the payload data area without creating an intermediate `tobytes()` copy.
+        out_view = np.frombuffer(
+            payload,
+            dtype=matrix_np.dtype,
+            offset=header_size,
+            count=matrix_np.size,
+        ).reshape(matrix_np.shape)
+        out_view[...] = matrix_np
+
+        if verbose:
+            print(f"  Dimensions: {b} × {c} × {h} × {w}")
+            print(f"  Binary data size: {payload_size:,} bytes ({payload_size/(1024*1024):.2f} MB)")
+        
+        # ===== SEND VIA ZMQ =====
+        # Use the exact same pattern as zmq_send_file
+        try:
+            # Zero-copy into ZMQ when possible (pyzmq will hold a reference to the bytearray buffer).
+            socket_eth.send_multipart([save_name.encode(), payload], copy=False)
+            if verbose:
+                print(f"  ✓ Matrix streamed to {worker_ip}")
+                print(f"  Sent: {save_name} ({payload_size:,} bytes)")
+        except Exception as e:
+            print(f"  ERROR streaming matrix to {worker_ip}: {e}")
+            raise
+        
+        return payload_size
+
+    def cleanup(self):
+        if getattr(self, "_cleaned_up", False):
+            return
+        self._cleaned_up = True
+
+        try:
+            for socket in getattr(self, "llama_socket_pool", {}).values():
                 try:
-                    os.remove(path)
-                except FileNotFoundError:
+                    socket.close(linger=0)
+                except Exception:
                     pass
-                except Exception as e:
-                    print(f"⚠️  Failed to remove local RAM file {path}: {e}")
+            for socket in getattr(self, "llama_socket_pool_wifi", {}).values():
+                try:
+                    socket.close(linger=0)
+                except Exception:
+                    pass
+            if hasattr(self, "ack_confirmation_socket"):
+                try:
+                    self.ack_confirmation_socket.close(linger=0)
+                except Exception:
+                    pass
+        finally:
+            # Do not close/term the ack receiver singleton; it may be shared across instances.
+            # Also avoid terminating the context that owns the singleton ack receiver.
+            try:
+                ctx = getattr(self, "zmq_context", None)
+                if ctx is not None and ctx is not getattr(cluster_zmq, "_ack_owner_context", None):
+                    ctx.term()
+            except Exception:
+                pass
 
-            # Remote cleanup (worker nodes)
-            # Note: no ACK is guaranteed for Linux commands; we best-effort free RAM.
-            unique_ips = sorted(set(getattr(self.cluster_zmq_object, "node_IP_list", self.IP_list)))
-            head_ip = getattr(self.cluster_zmq_object, "IP", None)
-            for ip in unique_ips:
-                if head_ip and ip == head_ip:
-                    continue
-                cmd = f"rm -f {remote_ram}{prefix}*.bin"
-                _zmq_send_command(ip, cmd)
+    def __del__(self):
+        """Destructor as fallback cleanup."""
+        try:
+            self.cleanup()
+        except Exception:
+            pass  # Avoid exceptions in destructor
+   
+class cluster_matrix:
+    def __init__(
+        self,
+        matrix_file_path,
+        cluster_zmq_object=None,
+        node_IP_list=None,
+        CPU_GPU_select_list=None,
+        node_percentages=None,
+        back_end_select_list=None,
+        split_matrix=False,
+        dim=0,
+        matrix_name='',
+        matrix_labeling='',
+        auto_set_up=None,
+        save_bin_matrix=True
+    ):
+        
+        #print("=" * 70)
+        print("🚀 INITIALIZING CLUSTER MATRIX DISTRIBUTION SYSTEM")
+        #print("=" * 70)
 
-            if cleanup_sleep_s:
-                time.sleep(float(cleanup_sleep_s))
+        # =============== NODE CONFIGURATION VALIDATION ===============
+        # Check consistency of the node configuration
+        if node_percentages is None:
+            node_percentages = list(cluster_zmq_object.default_node_percentages)
+        if back_end_select_list is None:
+            back_end_select_list = list(cluster_zmq_object.default_back_end_select_list)
+        if CPU_GPU_select_list is None:
+            CPU_GPU_select_list = list(cluster_zmq_object.default_CPU_GPU_select_list)
+        if auto_set_up is None:
+            auto_set_up = []
 
-            if gc_collect:
-                gc.collect()
+        # Backwards-compatible positional signature support:
+        #   cluster_matrix(matrix_path, node_IP_list, CPU_GPU_select_list, node_percentages,
+        #                  back_end_select_list, split_matrix=False, dim=0, ...)
+        #
+        # After introducing `cluster_zmq_object` as the 2nd parameter, older code that passes
+        # positional args will shift everything by one. Detect that pattern and re-map.
+        if (
+            cluster_zmq_object is not None
+            and not isinstance(cluster_zmq_object, cluster_zmq)
+            and isinstance(cluster_zmq_object, (list, tuple))
+            and node_IP_list is not None
+            and isinstance(node_IP_list, (list, tuple))
+            and (len(node_IP_list) == 0 or isinstance(node_IP_list[0], bool))
+            and isinstance(back_end_select_list, bool)
+        ):
+            old_node_IP_list = list(cluster_zmq_object)
+            old_cpu_gpu = list(node_IP_list)
+            old_percentages = CPU_GPU_select_list if CPU_GPU_select_list is not None else []
+            old_backends = node_percentages if node_percentages is not None else []
+            old_split_matrix = bool(back_end_select_list)
+            old_dim = split_matrix if isinstance(split_matrix, int) else 0
 
-        num_layers = getattr(self.config, "num_hidden_layers", 32)
-        print(f"📊 Total layers: {num_layers}")
-        print("-" * 70)
+            cluster_zmq_object = None
+            node_IP_list = old_node_IP_list
+            CPU_GPU_select_list = old_cpu_gpu
+            node_percentages = old_percentages
+            back_end_select_list = old_backends
+            split_matrix = old_split_matrix
+            dim = old_dim
 
-        if end_layer > num_layers or start_layer > num_layers:
-            print("incorrect start/end layers")
-            return 0
+        if CPU_GPU_select_list is None:
+            raise ValueError("CPU_GPU_select_list is required")
 
-        if end_layer == 0:
-            end_layer = self.num_layers
+        self._owns_cluster_zmq_object = False
+        if cluster_zmq_object is None:
+            if node_IP_list is None:
+                raise ValueError("Provide either cluster_zmq_object or node_IP_list")
+            cluster_zmq_object = cluster_zmq(node_IP_list)
+            self._owns_cluster_zmq_object = True
 
-        extra_paths: list[str] = []
-        if include_embed_tokens:
-            extra_paths.append(f"{self.model_matrix_fold_dir}embed_tokens_weight.pt")
-        if include_lm_head:
-            extra_paths.append(f"{self.model_matrix_fold_dir}lm_head_weight.pt")
-        if include_final_norm:
-            extra_paths.extend(
-                [
-                    f"{self.model_matrix_fold_dir}model_norm_weight.pt",
-                    f"{self.model_matrix_fold_dir}norm_weight.pt",
-                ]
+        self.cluster_zmq_object = cluster_zmq_object
+        node_IP_list = list(cluster_zmq_object.node_IP_list)
+
+        if matrix_labeling != '' and len(node_percentages) == 0:
+            node_percentages = [0] * len(node_IP_list)
+                
+        if not (len(node_IP_list) == len(CPU_GPU_select_list) == len(back_end_select_list) == len(node_percentages)):
+            print("❌ NODE CONFIGURATION ERROR: Lengths do not match!")
+            print(f"   - node_IP_list: {len(node_IP_list)} nodes")
+            print(f"   - CPU_GPU_select_list: {len(CPU_GPU_select_list)} selections")
+            print(f"   - back_end_select_list: {len(back_end_select_list)} backends")
+            print(f"   - node_percentages: {len(node_percentages)} percentages")
+            raise ValueError("Node configuration error: All lists must have the same length")
+        
+        # Get head node IP addresses from environment variables
+        self.IP = cluster_zmq_object.IP
+        self.wifi_IP = cluster_zmq_object.wifi_IP
+
+        # ZMQ objects (shared via cluster_zmq_object)
+        self.zmq_context = cluster_zmq_object.zmq_context
+        self.llama_socket_pool = cluster_zmq_object.llama_socket_pool
+        self.llama_socket_pool_wifi = cluster_zmq_object.llama_socket_pool_wifi
+        self.ack_receiver_socket = cluster_zmq_object.ack_receiver_socket
+        
+        # =============== FOLDER PATH CONFIGURATION ===============
+        #print("\n📁 CONFIGURING STORAGE PATHS...")
+        
+        # Local paths (head node)
+        self.local_DISK_folder = cluster_zmq_object.local_DISK_folder
+        self.local_project_dir = cluster_zmq_object.local_project_dir
+        
+        # Remote paths (worker nodes)
+        self.remote_DISK_folder = cluster_zmq_object.remote_DISK_folder
+        self.remote_project_dir = cluster_zmq_object.remote_project_dir
+
+        # Deprecated: shard data is no longer stored in /dev/shm; matrices live in the C++ server memory.
+        self.local_RAM_folder = None
+        self.remote_RAM_folder = None
+                
+        #print(f"✅ Using Python path: {self.python_path}")
+
+        # =============== INSTANCE VARIABLE INITIALIZATION ===============
+        #print("\n📊 INITIALIZING INSTANCE VARIABLES...")
+        
+        self.matrix_file_path = matrix_file_path
+        # Store auto setup mode so load/save methods can branch (e.g. load vs loadC, save vs saveC).
+        self.auto_set_up = list(auto_set_up) if isinstance(auto_set_up, (list, tuple)) else []
+        self.node_IP_list = node_IP_list
+        self.node_percentages = node_percentages
+        self.dim = dim
+        self.transpose = False
+        self.CPU_GPU_select_list = CPU_GPU_select_list  # True for GPU, False for CPU
+        self.back_end_select_list = back_end_select_list  # 'torch', 'llama', 'opencl'
+        self.split_matrix = split_matrix
+        self.OG_matrix_shape = []
+        self.node_matrices_shapes_list = None
+        self.matrix_labeling= matrix_labeling
+        self.save_bin_matrix = save_bin_matrix
+
+        # Extract matrix name from file path
+        if torch.is_tensor(matrix_file_path):
+            self.matrix_name = matrix_name
+        else:
+            matrix_file_path_split = matrix_file_path.split('/')
+            self.matrix_name = matrix_file_path_split[len(matrix_file_path_split)-1].split('.pt')[0]
+            print(f"   Matrix Name: {self.matrix_name}")
+            #print(f"   Split Matrix: {split_matrix}")
+            print(f"   Dimension: {dim}")
+        
+        # If no backend specified, default to 'llama' for all nodes
+        if self.back_end_select_list == []:
+            print("   No backend specified, defaulting to 'llama' for all nodes")
+            for CPU_GPU_select in self.CPU_GPU_select_list:
+                self.back_end_select_list.append('llama')
+        
+        self.node_matrices = []
+        # List of per-slot matrix *names* (e.g. `foo_shard_0.bin`) used by the C++ server.
+        self.matrix_file_paths_list = []
+        
+        # =============== MATRIX DISTRIBUTION LOGIC ===============
+        # auto_set_up format: [system_id, "save"/"saveC"/"load"/"loadC"/"loadG"]
+        if len(auto_set_up) == 2:
+            mode = auto_set_up[1]
+            is_save = mode in ("save", "saveC")
+            is_load = mode in ("load", "loadC", "loadG")
+
+            if auto_set_up[0] == 1 and is_save and self.split_matrix == False:
+                self.save_distribute_full_matrix_bin()
+            if auto_set_up[0] == 1 and is_load and self.split_matrix == False:
+                self.load_cluster_matrix()
+
+            if auto_set_up[0] == 1 and is_save and self.split_matrix:
+                self.convert_to_cluster_matrix_shards()
+                self.save_distribute_matrix_shards_bin()
+            if auto_set_up[0] == 1 and is_load and self.split_matrix:
+                self.load_cluster_matrix_shards()    
+
+            if auto_set_up[0] == 2 and is_save and self.matrix_labeling == 'a':
+                self.convert_to_cluster_matrix_grid()
+                self.save_distribute_matrixA_grid_bin()
+            if auto_set_up[0] == 2 and is_load and self.matrix_labeling == 'a':
+                self.load_cluster_matrixA_grid()
+
+            if auto_set_up[0] == 2 and is_save and self.matrix_labeling == 'b':
+                self.convert_to_cluster_matrix_grid()
+                self.save_distribute_matrix_shards_bin()
+            if auto_set_up[0] == 2 and is_load and self.matrix_labeling == 'b':
+                self.load_cluster_matrixB_grid()   
+                     
+    def convert_to_cluster_matrix_grid(self):
+        """
+        System 2 (round-robin / block-tiling):
+
+        - Matrix A (matrix_labeling='a'): split into 2 shards along `self.dim` (50/50).
+          These two shards are broadcast by `save_distribute_matrixA_grid_bin` across the
+          operation slots (first half gets shard_0, second half gets shard_1).
+
+        - Matrix B (matrix_labeling='b'): split into `base_slots` shards along `self.dim`,
+          then repeat that list twice so the shard list length equals `op_slots = base_slots * 2`.
+
+        This enables `op_slots` independent GEMMs where:
+          shard_i uses A_shard = (i < base_slots ? A0 : A1)
+          shard_i uses B_shard = B_{i % base_slots}
+
+        Slot sizing rule (requested):
+        - Treat the passed-in lists as "compute slots" (may contain repeated IPs).
+        - Keep `op_slots` at 8 (base_slots=4) until compute slots exceed 8.
+        - When compute slots exceed 8, grow `op_slots` in steps of 4: 8, 12, 16, ...
+
+        NOTE: In System 2 we ignore `node_percentages` for B chunk sizing and do an even split.
+        We still expand `node_percentages` to match `op_slots` to keep list lengths consistent.
+        """
+        if torch.is_tensor(self.matrix_file_path):
+            full_matrix = self.matrix_file_path
+        else:
+            full_matrix = torch.load(self.matrix_file_path, map_location="cpu")
+
+        self.OG_matrix_shape = list(full_matrix.shape)
+        split_dim = int(self.dim)
+
+        # Preserve the original (unexpanded) slot lists so this function is idempotent.
+        if not hasattr(self, "_sys2_original_slot_lists"):
+            self._sys2_original_slot_lists = {
+                "node_IP_list": list(self.node_IP_list),
+                "CPU_GPU_select_list": list(self.CPU_GPU_select_list),
+                "back_end_select_list": list(self.back_end_select_list),
+                "node_percentages": list(self.node_percentages),
+            }
+
+        original_node_IP_list = self._sys2_original_slot_lists["node_IP_list"]
+        original_cpu_gpu = self._sys2_original_slot_lists["CPU_GPU_select_list"]
+        original_backend = self._sys2_original_slot_lists["back_end_select_list"]
+        original_percentages = self._sys2_original_slot_lists["node_percentages"]
+
+        compute_slots = len(original_node_IP_list)
+        if compute_slots < 1:
+            raise ValueError("System 2 requires at least 1 slot")
+
+        # Determine the grid width (base_slots) from the compute slots. This keeps the math and
+        # server-side behavior identical to the 4-slot case (8 ops) for up to 8 compute slots.
+        base_slots = max(4, 2 * math.ceil(compute_slots / 4))
+        op_slots = base_slots * 2
+
+        def _cycle_to_length(items, n):
+            if not items:
+                raise ValueError("System 2 slot lists must be non-empty")
+            return [items[i % len(items)] for i in range(n)]
+
+        # Expand slot lists so `cluster_shard_operation` can dispatch exactly `op_slots` blocks.
+        # This is round-robin "wrap-around" over the provided compute slots.
+        self.node_IP_list = _cycle_to_length(original_node_IP_list, op_slots)
+        self.CPU_GPU_select_list = _cycle_to_length(original_cpu_gpu, op_slots)
+        self.back_end_select_list = _cycle_to_length(original_backend, op_slots)
+        self.node_percentages = _cycle_to_length(original_percentages, op_slots) if original_percentages else [0.0] * op_slots
+        self._sys2_round_robin_expanded = True
+
+        self._sys2_compute_slots = compute_slots
+        self._sys2_base_slots = base_slots
+        self._sys2_op_slots = op_slots
+
+        if self.matrix_labeling == 'a':
+            # A: split into 2 shards along split_dim (views, no copy).
+            dim_size = int(full_matrix.size(split_dim))
+            s0 = dim_size // 2
+            s1 = dim_size - s0
+            self.node_matrices = [
+                full_matrix.narrow(split_dim, 0, s0),
+                full_matrix.narrow(split_dim, s0, s1),
+            ]
+            print(
+                f"✅ Matrix A: {tuple(full_matrix.shape)} → "
+                f"[{tuple(self.node_matrices[0].shape)}, {tuple(self.node_matrices[1].shape)}] "
+                f"(split along dim={split_dim})"
             )
-
-        for extra_path in extra_paths:
-            if not os.path.exists(extra_path):
-                print(f"⚠️  Missing extra weight (skip): {extra_path}")
-                continue
-            extra_name = os.path.basename(extra_path).split(".pt")[0]
-            cluster_matrix(
-                matrix_file_path=extra_path,
-                cluster_zmq_object=self.cluster_zmq_object,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=True,
-                dim=1,
-                auto_set_up=[1, "save"],
+            print(
+                f"   System 2 slots: compute_slots={compute_slots}, base_slots={base_slots}, op_slots={op_slots}"
             )
-            if not keep_ram_copies:
-                _cleanup_ram_bins(extra_name)
-         
-        for layer_idx in range(start_layer, end_layer):
-            print(f"SAVING LAYER: {layer_idx}")
-            # ------------------------------------------------------------
-            # Paths
-            # ------------------------------------------------------------
-            attn_q_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_q_proj_weight.pt'
-            attn_k_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_k_proj_weight.pt'
-            attn_v_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_v_proj_weight.pt'
-            attn_o_proj_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_self_attn_o_proj_weight.pt'
+            return self.node_matrices
 
-            mlp_gate_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_gate_proj_weight.pt'
-            mlp_up_path   = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_up_proj_weight.pt'
-            mlp_down_path = f'{self.model_matrix_fold_dir}layers_{layer_idx}_mlp_down_proj_weight.pt'
+        if self.matrix_labeling == 'b':
+            # B: split into `base_slots` shards along split_dim (even split), then repeat twice
+            # to match `op_slots`.
+            dim_size = int(full_matrix.size(split_dim))
+            if dim_size < base_slots:
+                raise ValueError(f"Cannot split size {dim_size} into {base_slots} non-empty shards")
 
-            # ============================================================
-            # ATTENTION MATRIX SHARDS (Matrix B)
-            # ============================================================
+            base = dim_size // base_slots
+            rem = dim_size % base_slots
+            sizes = [base + (1 if i < rem else 0) for i in range(base_slots)]
 
-            weight_paths = (
-                attn_q_proj_path,
-                attn_k_proj_path,
-                attn_v_proj_path,
-                attn_o_proj_path,
-                mlp_gate_path,
-                mlp_up_path,
-                mlp_down_path,
+            chunks: list[torch.Tensor] = []
+            start = 0
+            for sz in sizes:
+                chunks.append(full_matrix.narrow(split_dim, start, sz))
+                start += sz
+
+            # Order: B0..B{n-1}, then B0..B{n-1}
+            self.node_matrices = chunks + chunks
+            print(
+                f"✅ Matrix B: {tuple(full_matrix.shape)} → {op_slots} shards "
+                f"(split {base_slots} then repeat; split along dim={split_dim})"
             )
-            for weight_path in weight_paths:
-                if not os.path.exists(weight_path):
-                    print(f"⚠️  Missing weight (skip): {weight_path}")
-                    continue
-                matrix_name = os.path.basename(weight_path).split(".pt")[0]
+            print(
+                f"   System 2 slots: compute_slots={compute_slots}, base_slots={base_slots}, op_slots={op_slots}"
+            )
+            return self.node_matrices
 
-                weight = torch.load(weight_path, map_location="cpu")
-                if not isinstance(weight, torch.Tensor) or weight.ndim != 2:
-                    raise ValueError(f"Expected 2D torch.Tensor at {weight_path}, got {type(weight)} {getattr(weight, 'shape', None)}")
+        raise ValueError(f"Unknown matrix_labeling={self.matrix_labeling!r} for System 2 grid")
 
-                if transpose_for_runtime:
-                    hidden = int(self.hidden_size)
-                    # MLP shapes are non-square; avoid double-transpose if already pre-transposed.
-                    if weight_path.endswith("_mlp_gate_proj_weight.pt") or weight_path.endswith("_mlp_up_proj_weight.pt"):
-                        # desired: [hidden, intermediate]
-                        if weight.shape[0] == hidden:
-                            weight = weight.contiguous()
-                        elif weight.shape[1] == hidden:
-                            weight = weight.t().contiguous()
-                        else:
-                            raise ValueError(f"Unexpected MLP gate/up shape at {weight_path}: {tuple(weight.shape)} (hidden={hidden})")
-                    elif weight_path.endswith("_mlp_down_proj_weight.pt"):
-                        # desired: [intermediate, hidden]
-                        if weight.shape[1] == hidden:
-                            weight = weight.contiguous()
-                        elif weight.shape[0] == hidden:
-                            weight = weight.t().contiguous()
-                        else:
-                            raise ValueError(f"Unexpected MLP down shape at {weight_path}: {tuple(weight.shape)} (hidden={hidden})")
-                    else:
-                        # Attention projections (square): store transposed to match runtime matmul flags.
-                        weight = weight.t().contiguous()
+    def convert_to_cluster_matrix_shards(self):
+        matrix_path = self.matrix_file_path
+        if torch.is_tensor(matrix_path):
+            full_matrix = matrix_path
+        else:
+            # Load full matrix
+            full_matrix = torch.load(matrix_path)
+
+        dim = int(self.dim)
+        total_rows = int(full_matrix.size(dim))  # typically dim=0
+        self.node_matrices = []
+
+        node_percentages = getattr(self, "node_percentages", None)
+
+        # Convert percentages to row counts
+        if node_percentages:
+            total_percentage = sum(node_percentages)
+            if abs(total_percentage - 1.0) > 1e-6:
+                raise ValueError(f"Node percentages must sum to 1. Got {total_percentage}")
+            percentages_np = np.asarray(node_percentages, dtype=np.float64)
+            rows_per_node = np.trunc(percentages_np * total_rows).astype(np.int64)
+            # Adjust for rounding error
+            diff = total_rows - int(rows_per_node.sum())
+            if diff != 0:
+                rows_per_node[-1] += diff
+            rows_per_node = rows_per_node.tolist()
+        else:
+            # Default: even split among nodes
+            num_nodes = len(self.node_IP_list)
+            base_rows = total_rows // num_nodes
+            rows_per_node = [base_rows] * num_nodes
+            rows_per_node[-1] += total_rows - (base_rows * num_nodes)
+
+        # Vulkan FlashAttention constraint: K/V head size must be divisible by 8.
+        # Our "head size" corresponds to the split dimension when `dim == 1` for 2D matrices.
+        # Snap shard sizes to multiples of 8 when possible to avoid slow CPU fallback and instability.
+        align = 8
+        backends = getattr(self, "back_end_select_list", None) or []
+        cpu_gpu = getattr(self, "CPU_GPU_select_list", None) or []
+        want_llama = any(str(b).lower() == "llama" for b in backends)
+        want_gpu = any(cpu_gpu)
+        can_align = (
+            dim == 1
+            and want_llama
+            and want_gpu
+            and total_rows % align == 0
+            and (total_rows // align) >= len(rows_per_node)
+        )
+        if can_align and any((sz % align) != 0 for sz in rows_per_node):
+            total_units = total_rows // align
+            if node_percentages:
+                percentages_np = np.asarray(node_percentages, dtype=np.float64)
+            else:
+                n = len(rows_per_node)
+                percentages_np = np.full(n, 1.0 / n, dtype=np.float64)
+
+            ideal_units = percentages_np * total_units
+            units = np.floor(ideal_units).astype(np.int64)
+            units = np.maximum(units, 1)
+
+            # Rebalance units to match total_units (largest-deficit / largest-excess adjustment).
+            sum_units = int(units.sum())
+            if sum_units > total_units:
+                over = sum_units - total_units
+                for _ in range(over):
+                    if not np.any(units > 1):
+                        break
+                    score = np.where(units > 1, units - ideal_units, -np.inf)
+                    idx = int(score.argmax())
+                    units[idx] -= 1
+            elif sum_units < total_units:
+                add = total_units - sum_units
+                for _ in range(add):
+                    score = ideal_units - units
+                    idx = int(score.argmax())
+                    units[idx] += 1
+
+            aligned = units * align
+            if int(aligned.sum()) == total_rows and np.all(aligned > 0):
+                rows_per_node = aligned.astype(np.int64).tolist()
+
+        # Slice the full matrix into shards
+        if any(sz == 0 for sz in rows_per_node):
+            starts = np.cumsum([0] + rows_per_node[:-1]).astype(np.int64)
+            self.node_matrices = [
+                full_matrix.narrow(dim, int(start), int(count)).clone()
+                for start, count in zip(starts, rows_per_node)
+            ]
+        else:
+            shards = full_matrix.split(rows_per_node, dim=dim)
+            self.node_matrices = [shard.clone() for shard in shards]
+
+        #print(f"✅ Created {len(self.node_matrices)} shards according to node percentages")
+        #for i, shard in enumerate(self.node_matrices):
+        #    print(f"  Node {i}: shard shape {shard.shape}")
+
+        return self.node_matrices
+
+    def merged_matrix(self, matrix_shards, start_index, end_index):
+        """
+        Merge row shards from start_index (inclusive) to end_index (exclusive).
+        Returns the concatenated tensor along dim=0.
+        """
+        if start_index < 0 or end_index <= start_index:
+            raise ValueError("Invalid start_index/end_index")
+        end_index = min(end_index, len(matrix_shards))
+        pieces = [matrix_shards[i] for i in range(start_index, end_index)]
+        if not pieces:
+            raise ValueError("No shards to merge")
+        return torch.cat(pieces, dim=self.dim)
+
+    def save_distribute_matrix_shards_bin(self):
+        """Save matrix shards as binary files and distribute to appropriate nodes."""
+        self.matrix_file_paths_list = []
+        mode = self.auto_set_up[1] if len(self.auto_set_up) == 2 else "saveC"
+        prefer_vram = (mode == "save")
+        for shard_index, node_IP in enumerate(self.node_IP_list):
+            #print(f"Processing shard {shard_index} for node {node_IP}")
+            # Create filename for this shard
+            save_name = f"{self.matrix_name}_shard_{shard_index}.bin"
+            stream_name = f"VRAM|{save_name}" if prefer_vram else save_name
+            # Handle shard for HEAD NODE (local storage)
+            if node_IP == self.IP:
+                save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
+                
+                #print(f"  Head node: Saving to DISK={save_file_path_DISK}")
+                
+                # Save tensor to binary file on disk (no /dev/shm)
+                if self.save_bin_matrix:
+                    self.save_matrix_binary(self.node_matrices[shard_index], save_file_path_DISK)
+
+                # Stream to local C++ server (head node) so it is available in memory.
+                self.cluster_zmq_object.stream_matrix_binary(self.IP, self.node_matrices[shard_index], stream_name)
+                self.cluster_zmq_object.wait_for_acks(1, save_name)
+
+                # Store the matrix name (used as key on each node's C++ server).
+                self.matrix_file_paths_list.append(save_name)
+                #print(f"  Added matrix name to list: {save_name}")
+                # Drop the shard reference to free RAM as soon as it has been streamed.
+                self.node_matrices[shard_index] = None
+                    
+            # Handle shard for REMOTE NODE
+            elif node_IP != self.IP:
+                #print(f"  Remote node {node_IP}: Beginning distribution")
+
+                self.cluster_zmq_object.stream_matrix_binary(node_IP, self.node_matrices[shard_index], stream_name)
+
+                self.cluster_zmq_object.wait_for_acks(1, save_name)
+
+                # Store the matrix name (used as key on each node's C++ server).
+                self.matrix_file_paths_list.append(save_name)
+                #print(f"  Added matrix name to list: {save_name}")
+                # Drop the shard reference to free RAM as soon as it has been streamed.
+                self.node_matrices[shard_index] = None
+        # Clear the shard list after all streaming is done.
+        self.node_matrices = []
+        return self.matrix_file_paths_list
+
+    def save_distribute_full_matrix_bin(self):
+        """
+        Save a FULL matrix (no splitting) as binary and distribute to all nodes.
+        """
+        self.matrix_file_paths_list = []
+
+        # Create filename
+        save_name = f"{self.matrix_name}.bin"
+        mode = self.auto_set_up[1] if len(self.auto_set_up) == 2 else "saveC"
+        prefer_vram = (mode == "save")
+        stream_name = f"VRAM|{save_name}" if prefer_vram else save_name
+        print(f"Preparing full matrix: {save_name}")
+        
+        # Define local file paths
+        save_file_path_DISK = os.path.join(self.local_DISK_folder, save_name)
+        #print(f"Local path - DISK: {save_file_path_DISK}")
+        
+        # Load the full matrix from PyTorch file
+        if torch.is_tensor(self.matrix_file_path):
+            full_matrix = self.matrix_file_path
+        else:
+            #print(f"Loading matrix from: {self.matrix_file_path}")
+            full_matrix = torch.load(self.matrix_file_path)
+            print(f"Matrix loaded - Shape: {full_matrix.shape}")
+        
+        # Save to binary format locally
+        #print("Saving to local storage...")
+        if self.save_bin_matrix:
+            self.save_matrix_binary(full_matrix, save_file_path_DISK)
+
+        # Track matrix name for each slot (no /dev/shm paths)
+        self.matrix_file_paths_list = [save_name for _ in self.node_IP_list]
+        
+        # Get UNIQUE IPs (no duplicates)
+        unique_node_IP_list = list(set(self.node_IP_list))
+        
+        #print(f"Streaming to {len(unique_node_IP_list)} unique node(s)...")
+        
+        # Stream to each unique node (including head) so the C++ server caches it in memory.
+        for node_ip in unique_node_IP_list:
+            #print(f"Streaming to {node_ip}")
+            self.cluster_zmq_object.stream_matrix_binary(node_ip, full_matrix, stream_name)
+            self.cluster_zmq_object.wait_for_acks(1, save_name)
+        print(f"Full matrix distribution completed")
+        # Ensure any prior shard buffers are released.
+        self.node_matrices = []
+        return 0
+
+    def save_distribute_matrixA_grid_bin(self):
+        """
+        Distribute broadcast shards for distributed GEMM.
+        """
+
+        # ---------------------------
+        # MATRIX A — ROW SHARDS
+        # ---------------------------
+        if self.matrix_labeling == 'a':
+            print("\n📤 Distributing Matrix A row shards")
+            mode = self.auto_set_up[1] if len(self.auto_set_up) == 2 else "saveC"
+            prefer_vram = (mode == "save")
+            
+            # ---------------------------
+            # MATRIX A — SAVE LOCALLY (save both files to head node)
+            # ---------------------------
+            self.matrix_file_paths_list = []
+
+            shard0_filename = f"{self.matrix_name}_shard_0.bin"
+            shard1_filename = f"{self.matrix_name}_shard_1.bin"
+            if self.save_bin_matrix:
+                # Create disk folder path
+                disk_folder_path = os.path.join(self.local_project_dir, self.local_DISK_folder)
+                os.makedirs(disk_folder_path, exist_ok=True)
+
+                shard0_disk_path = os.path.join(disk_folder_path, shard0_filename)
+                shard1_disk_path = os.path.join(disk_folder_path, shard1_filename)
+
+                # Save matrices locally to DISK (no /dev/shm)
+                self.save_matrix_binary(self.node_matrices[0], shard0_disk_path)
+                self.save_matrix_binary(self.node_matrices[1], shard1_disk_path)
+                print(f"  Saved shard 0 to: {shard0_disk_path}")
+                print(f"  Saved shard 1 to: {shard1_disk_path}")
+
+            # Determine how many nodes get each shard
+            total_nodes = len(self.node_IP_list)
+            half_nodes = total_nodes // 2  # Integer division
+
+            # Build per-slot matrix name list and compute which nodes need which shard.
+            shard0_ips = set()
+            shard1_ips = set()
+            for index, node_IP in enumerate(self.node_IP_list):
+                if index < half_nodes:
+                    self.matrix_file_paths_list.append(shard0_filename)
+                    shard0_ips.add(node_IP)
                 else:
-                    weight = weight.contiguous()
+                    self.matrix_file_paths_list.append(shard1_filename)
+                    shard1_ips.add(node_IP)
 
-                cluster_matrix(
-                    matrix_file_path=weight,
+            print("\n📋 Node shard assignments:")
+            for index, node_IP in enumerate(self.node_IP_list):
+                shard_name = "shard_0" if index < half_nodes else "shard_1"
+                print(f"  Slot {index} ({node_IP}) -> {shard_name}")
+
+            # Stream the broadcast shards to each unique node so the C++ server caches them in memory.
+            for node_IP in sorted(shard0_ips):
+                stream_name0 = f"VRAM|{shard0_filename}" if prefer_vram else shard0_filename
+                self.cluster_zmq_object.stream_matrix_binary(node_IP, self.node_matrices[0], stream_name0)
+                self.cluster_zmq_object.wait_for_acks(1, shard0_filename)
+            for node_IP in sorted(shard1_ips):
+                stream_name1 = f"VRAM|{shard1_filename}" if prefer_vram else shard1_filename
+                self.cluster_zmq_object.stream_matrix_binary(node_IP, self.node_matrices[1], stream_name1)
+                self.cluster_zmq_object.wait_for_acks(1, shard1_filename)
+        return self.matrix_file_paths_list
+
+    def save_matrix_binary(self, matrix, filename):
+        """
+        Save a PyTorch tensor or numpy array as a binary file.
+        
+        Binary format (v2):
+        [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
+
+        dtype_tag is NEGATIVE to stay backward compatible with legacy files where
+        the first int was `ndim` (typically 4).
+          -1 = float32
+          -2 = float16
+          -3 = bfloat16 (payload is raw bf16 bits as int16/uint16)
+
+        Legacy format (v1):
+        [ndim(int32), dims..., data(float32)]
+
+        Always saves as 4D format (batch, channel, height, width) for consistency.
+        
+        Args:
+            matrix: PyTorch tensor or numpy array to save
+            filename: Path where the binary file will be saved
+        """
+        parent = os.path.dirname(filename)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+
+        # ===== FAST CPU SAVE PATH =====
+        # Avoid `.tobytes()` (copies the whole buffer). Use ndarray.tofile(...) instead.
+        if isinstance(matrix, torch.Tensor):
+            t = matrix.detach()
+            if t.device.type != "cpu":
+                t = t.cpu()
+            if t.ndim == 2:
+                t = t.reshape(1, 1, t.shape[0], t.shape[1])
+            elif t.ndim == 3:
+                t = t.reshape(1, t.shape[0], t.shape[1], t.shape[2])
+            elif t.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Invalid tensor dimensionality: {t.ndim}")
+
+            if not t.is_contiguous():
+                t = t.contiguous()
+
+            if t.dtype == torch.float32:
+                dtype_tag = -1
+                payload_np = t.numpy()
+            elif t.dtype == torch.float16:
+                dtype_tag = -2
+                payload_np = t.numpy()
+            elif t.dtype == torch.bfloat16:
+                dtype_tag = -3
+                payload_np = t.view(torch.int16).numpy()
+            else:
+                raise ValueError(f"Unsupported tensor dtype for save_matrix_binary: {t.dtype}")
+
+            shape = tuple(int(x) for x in t.shape)
+
+            with open(filename, "wb") as f:
+                f.write(struct.pack("iiiii", dtype_tag, shape[0], shape[1], shape[2], shape[3]))
+                payload_np.tofile(f)
+            return
+
+        if isinstance(matrix, np.ndarray):
+            arr = np.asarray(matrix, order="C")
+            if arr.dtype == np.float32:
+                dtype_tag = -1
+            elif arr.dtype == np.float16:
+                dtype_tag = -2
+            else:
+                raise ValueError(f"Unsupported numpy dtype for save_matrix_binary: {arr.dtype}")
+
+            if arr.ndim == 2:
+                arr = arr.reshape(1, 1, arr.shape[0], arr.shape[1])
+            elif arr.ndim == 3:
+                arr = arr.reshape(1, arr.shape[0], arr.shape[1], arr.shape[2])
+            elif arr.ndim == 4:
+                pass
+            else:
+                raise ValueError(f"Invalid array dimensionality: {arr.ndim}")
+
+            shape = tuple(int(x) for x in arr.shape)
+
+            with open(filename, "wb") as f:
+                f.write(struct.pack("iiiii", dtype_tag, shape[0], shape[1], shape[2], shape[3]))
+                arr.tofile(f)
+            return
+
+        raise ValueError("Unsupported input type for save_matrix_binary")
+
+    def convert_bin_matrix_to_pt(self, filename, force_2d=True):  
+        """  
+        Load a binary matrix saved in the format:
+        - v2: [dtype_tag(int32), batch(int32), depth(int32), rows(int32), cols(int32), data(bytes)]
+        - v1: [ndim(int32), dims..., data(float32)]
+        
+        Args:  
+            filename: path to binary file  
+            force_2d: if True, flatten batch*depth*rows into 2D (rows x cols)  
+            
+        Returns:  
+            PyTorch tensor  
+        """  
+        # Fast path: mmap + frombuffer avoids copying file payload into Python bytes.
+        # We still detach into a normal (owned) tensor at the end so callers can delete the file safely.
+        with open(filename, 'rb') as f:
+            mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            offset = 0
+            if mm.size() < 4:
+                raise ValueError("File too short to read ndim")
+            tag_or_ndim = struct.unpack_from('i', mm, offset)[0]
+            offset += 4
+
+            # v2 header (dtype tag)
+            if tag_or_ndim < 0:
+                dtype_tag = tag_or_ndim
+                ndim = 4
+
+                header_bytes = 4 * 4
+                if mm.size() < offset + header_bytes:
+                    raise ValueError("File too short to read 4D dimensions")
+                dims = list(struct.unpack_from('iiii', mm, offset))
+                offset += header_bytes
+
+                num_elements = int(np.prod(dims, dtype=np.int64))
+
+                if dtype_tag == -1:
+                    np_dtype = np.float32
+                elif dtype_tag == -2:
+                    np_dtype = np.float16
+                elif dtype_tag == -3:
+                    np_dtype = np.uint16  # raw bf16 bits
+                else:
+                    raise ValueError(f"Unsupported dtype_tag in binary file: {dtype_tag}")
+
+                data_bytes_needed = num_elements * np.dtype(np_dtype).itemsize
+                if mm.size() < offset + data_bytes_needed:
+                    raise ValueError(f"File too short to read {num_elements} elements of {np_dtype}")
+
+                data_np = np.frombuffer(mm, dtype=np_dtype, count=num_elements, offset=offset)
+                tensor_np = data_np.reshape(dims)
+
+            # v1 legacy header (ndim)
+            else:
+                ndim = tag_or_ndim
+                dtype_tag = -1  # legacy files are float32
+
+                header_bytes = ndim * 4
+                if mm.size() < offset + header_bytes:
+                    raise ValueError("File too short to read dimensions")
+                dims = list(struct.unpack_from('i' * ndim, mm, offset))
+                offset += header_bytes
+
+                num_elements = int(np.prod(dims, dtype=np.int64))
+                data_bytes_needed = num_elements * 4
+                if mm.size() < offset + data_bytes_needed:
+                    raise ValueError(f"File too short to read {num_elements} floats")
+
+                data_np = np.frombuffer(mm, dtype=np.float32, count=num_elements, offset=offset)
+                tensor_np = data_np.reshape(dims)
+        finally:
+            # `tensor_np` is a view over `mm`; we will detach below, so it's safe to close here.
+            try:
+                mm.close()
+            except Exception:
+                pass
+    
+        # Optionally flatten batch*depth*rows -> 2D for LLAMA-like 4D tensors  
+        if force_2d and ndim == 4:  
+            batch, depth, rows, cols = dims  
+            tensor_np = tensor_np.reshape(batch * depth * rows, cols)  
+    
+        # Convert to PyTorch tensor (detach from mm-backed buffer)
+        if dtype_tag == -3:
+            # bf16 bits (uint16) -> float32 -> bfloat16
+            u16 = np.array(tensor_np, copy=True, dtype=np.uint16)
+            u32 = (u16.astype(np.uint32) << 16)
+            f32 = u32.view(np.float32)
+            tensor_pt = torch.from_numpy(f32).to(dtype=torch.bfloat16)
+        else:
+            tensor_pt = torch.from_numpy(np.array(tensor_np, copy=True))
+    
+        # Info  
+        #print(f"✅ Loaded {filename}")  
+        print(f"  Original dims: {dims}")  
+        print(f"  Result tensor shape: {tensor_pt.shape}, size: {tensor_pt.numel() * tensor_pt.element_size():,} bytes")
+        #stats_max_elems = int(os.environ.get("CONVERT_BIN_STATS_MAX_ELEMS", "2000000"))
+        #if tensor_pt.numel() <= stats_max_elems:
+        #    print(f"  Data range: [{tensor_pt.min().item():.6f}, {tensor_pt.max().item():.6f}]")
+        #else:
+        #    print(f"  Data range: [skipped; numel={tensor_pt.numel():,} > {stats_max_elems:,}]")
+    
+        return tensor_pt
+
+    def load_cluster_matrix(self):
+        """
+        Load a full matrix (not split) from disk into each node's C++ in-memory shard list.
+        """
+        try:
+            mode = self.auto_set_up[1] if len(self.auto_set_up) == 2 else "loadC"
+            if mode in ("load", "loadG"):
+                load_cmd = "load_matrix_shard_object_list_VRAM"
+            else:
+                load_cmd = "load_matrix_shard_object_list"
+
+            # Create filename for the binary matrix
+            base_name = self.matrix_name + '.bin'
+            print(f"Loading full matrix: {base_name}")
+            
+            base_disk_path = os.path.join(self.local_project_dir, self.local_DISK_folder, base_name)
+            
+            if not os.path.exists(base_disk_path):
+                print(
+                    "Error: Base matrix binary not found. Combined outputs are write-only "
+                    "and cannot be reused as inputs. Regenerate shards or rerun the operation "
+                    "with send_back=False to keep a distributed input."
+                )
+                return False
+
+            # Track matrix names for all slots
+            self.matrix_file_paths_list = [base_name for _ in self.node_IP_list]
+
+            # Ask each node's C++ server to load the matrix from its local disk into memory.
+            unique_node_IP_list = list(dict.fromkeys(self.node_IP_list))
+            for node_ip in unique_node_IP_list:
+                cmd = f"server_command={load_cmd} {base_name}"
+                self.cluster_zmq_object.zmq_send_command(node_ip, cmd)
+
+            self.cluster_zmq_object.wait_for_acks(
+                len(unique_node_IP_list),
+                "ACK_load_matrix_shard_object_list_complete",
+            )
+                    
+        except Exception as e:
+            print(f"Error loading matrix: {e}")
+            return False
+        
+        #print(f"Matrix loaded successfully")
+        return True
+
+    def load_cluster_matrix_shards(self):
+        """
+        Load distributed matrix shards from storage.
+        
+        This no longer copies disk->/dev/shm via Linux commands.
+        Instead it instructs each node's C++ server to load the required shard
+        files from disk into its in-memory `matrix_shard_object_list`.
+        """
+        
+        # Initialize the file paths list
+        self.matrix_file_paths_list = []
+
+        mode = self.auto_set_up[1] if len(self.auto_set_up) == 2 else "loadC"
+        if mode in ("load", "loadG"):
+            load_cmd = "load_matrix_shard_object_list_VRAM"
+        else:
+            load_cmd = "load_matrix_shard_object_list"
+        
+        print(f"Loading cluster matrix shards: {self.matrix_name}")
+        print(f"Number of nodes/shard locations: {len(self.node_IP_list)}")
+
+        # Map each IP to the shard filenames it must have loaded.
+        shard_files_by_ip = {}
+        for shard_index, node_ip in enumerate(self.node_IP_list):
+            shard_filename = f"{self.matrix_name}_shard_{shard_index}.bin"
+            self.matrix_file_paths_list.append(shard_filename)
+            shard_files_by_ip.setdefault(node_ip, set()).add(shard_filename)
+
+        # Send one load command per unique node.
+        for node_ip, files in shard_files_by_ip.items():
+            files_list = " ".join(sorted(files))
+            cmd = f"server_command={load_cmd} {files_list}"
+            self.cluster_zmq_object.zmq_send_command(node_ip, cmd)
+
+        self.cluster_zmq_object.wait_for_acks(
+            len(shard_files_by_ip),
+            "ACK_load_matrix_shard_object_list_complete",
+        )
+
+        #print("\nMatrix shard loading complete")
+        return True
+ 
+    def load_cluster_matrixA_grid(self):
+        """
+        Load Matrix A shards from disk to RAM for distributed GEMM.
+        Simple version: just copy from local_DISK_folder to local_RAM_folder
+        """
+                
+        print(f"\n📥 Loading Matrix A grid shards from disk to RAM")
+
+        mode = self.auto_set_up[1] if len(self.auto_set_up) == 2 else "loadC"
+        if mode in ("load", "loadG"):
+            load_cmd = "load_matrix_shard_object_list_VRAM"
+        else:
+            load_cmd = "load_matrix_shard_object_list"
+
+        # System 2 sizing: expand the provided compute slots to the derived op_slots so that
+        # `cluster_shard_operation` runs the correct number of grid operations (8 for up to 8
+        # compute slots, then 12/16/...).
+        if not hasattr(self, "_sys2_original_slot_lists"):
+            self._sys2_original_slot_lists = {
+                "node_IP_list": list(self.node_IP_list),
+                "CPU_GPU_select_list": list(self.CPU_GPU_select_list),
+                "back_end_select_list": list(self.back_end_select_list),
+                "node_percentages": list(self.node_percentages),
+            }
+
+        original_node_IP_list = self._sys2_original_slot_lists["node_IP_list"]
+        original_cpu_gpu = self._sys2_original_slot_lists["CPU_GPU_select_list"]
+        original_backend = self._sys2_original_slot_lists["back_end_select_list"]
+        original_percentages = self._sys2_original_slot_lists["node_percentages"]
+
+        compute_slots = len(original_node_IP_list)
+        if compute_slots < 1:
+            raise ValueError("System 2 requires at least 1 slot")
+
+        base_slots = max(4, 2 * math.ceil(compute_slots / 4))
+        op_slots = base_slots * 2
+
+        def _cycle_to_length(items, n):
+            if not items:
+                raise ValueError("System 2 slot lists must be non-empty")
+            return [items[i % len(items)] for i in range(n)]
+
+        self.node_IP_list = _cycle_to_length(original_node_IP_list, op_slots)
+        self.CPU_GPU_select_list = _cycle_to_length(original_cpu_gpu, op_slots)
+        self.back_end_select_list = _cycle_to_length(original_backend, op_slots)
+        self.node_percentages = (
+            _cycle_to_length(original_percentages, op_slots)
+            if original_percentages
+            else [0.0] * op_slots
+        )
+        self._sys2_round_robin_expanded = True
+        self._sys2_compute_slots = compute_slots
+        self._sys2_base_slots = base_slots
+        self._sys2_op_slots = op_slots
+
+        print(
+            f"   System 2 slots: compute_slots={compute_slots}, "
+            f"base_slots={base_slots}, op_slots={op_slots}"
+        )
+        
+        # Initialize the file paths list
+        self.matrix_file_paths_list = []
+        
+        # Determine how many nodes get each shard
+        total_nodes = len(self.node_IP_list)
+        half_nodes = total_nodes // 2  # Integer division
+        
+        # Create file names for Matrix A shards
+        shard0_filename = f'{self.matrix_name}_shard_0.bin'
+        shard1_filename = f'{self.matrix_name}_shard_1.bin'
+        
+        # Define disk paths - CORRECTED: should be in local_project_dir + local_DISK_folder
+        local_shard0_disk_path = os.path.join(self.local_project_dir, self.local_DISK_folder, shard0_filename)
+        local_shard1_disk_path = os.path.join(self.local_project_dir, self.local_DISK_folder, shard1_filename)
+        
+        # Check if shards exist in disk
+        print(f"Looking for shards in: {os.path.join(self.local_project_dir, self.local_DISK_folder)}")
+        print(f"  Shard 0 path: {local_shard0_disk_path}")
+        print(f"  Shard 1 path: {local_shard1_disk_path}")
+        
+        if not os.path.exists(local_shard0_disk_path):
+            print(f"❌ Error: shard_0 not found at: {local_shard0_disk_path}")
+            return False
+        
+        if not os.path.exists(local_shard1_disk_path):
+            print(f"❌ Error: shard_1 not found at: {local_shard1_disk_path}")
+            return False
+
+        # Ask each node's C++ server to load the required shards from disk into memory.
+        print(f"\n📋 Creating distribution pattern for {total_nodes} nodes:")
+        files_by_ip = {}
+
+        for index, node_IP in enumerate(self.node_IP_list):
+            if index < half_nodes:
+                self.matrix_file_paths_list.append(shard0_filename)
+                files_by_ip.setdefault(node_IP, set()).add(shard0_filename)
+                print(f"  Node {index} ({node_IP}): assigned shard_0")
+            else:
+                self.matrix_file_paths_list.append(shard1_filename)
+                files_by_ip.setdefault(node_IP, set()).add(shard1_filename)
+                print(f"  Node {index} ({node_IP}): assigned shard_1")
+
+        for node_ip, files in files_by_ip.items():
+            files_list = " ".join(sorted(files))
+            cmd = f"server_command={load_cmd} {files_list}"
+            self.cluster_zmq_object.zmq_send_command(node_ip, cmd)
+
+        self.cluster_zmq_object.wait_for_acks(
+            len(files_by_ip),
+            "ACK_load_matrix_shard_object_list_complete",
+        )
+        
+        # ===== LOADING COMPLETE =====
+        print(f"\n✅ Matrix A grid loading complete")
+        print(f"   Total nodes: {total_nodes}")
+        print(f"   First {half_nodes} nodes: shard_0")
+        print(f"   Remaining {total_nodes - half_nodes} nodes: shard_1")
+        print(f"   File paths tracked: {len(self.matrix_file_paths_list)}")
+        
+        return True
+
+    def load_cluster_matrixB_grid(self):
+        """
+        System 2 (grid) Matrix B loader.
+
+        Loads the required B shards from local disk into RAM and prepares
+        `matrix_file_paths_list` for `cluster_shard_operation` using the same
+        op-slot sizing rule as `convert_to_cluster_matrix_grid`.
+
+        This is System 2 only and does not change System 1 behavior.
+        """
+        if self.matrix_labeling != 'b':
+            raise ValueError(
+                "load_cluster_matrixB_grid is only valid for System 2 Matrix B "
+                "(matrix_labeling='b')."
+            )
+
+        print(f"\n📥 Loading Matrix B grid shards from disk to RAM")
+
+        mode = self.auto_set_up[1] if len(self.auto_set_up) == 2 else "loadC"
+        if mode in ("load", "loadG"):
+            load_cmd = "load_matrix_shard_object_list_VRAM"
+        else:
+            load_cmd = "load_matrix_shard_object_list"
+
+        # Preserve the original (unexpanded) slot lists so sizing is stable across calls.
+        if not hasattr(self, "_sys2_original_slot_lists"):
+            self._sys2_original_slot_lists = {
+                "node_IP_list": list(self.node_IP_list),
+                "CPU_GPU_select_list": list(self.CPU_GPU_select_list),
+                "back_end_select_list": list(self.back_end_select_list),
+                "node_percentages": list(self.node_percentages),
+            }
+
+        original_node_IP_list = self._sys2_original_slot_lists["node_IP_list"]
+        original_cpu_gpu = self._sys2_original_slot_lists["CPU_GPU_select_list"]
+        original_backend = self._sys2_original_slot_lists["back_end_select_list"]
+        original_percentages = self._sys2_original_slot_lists["node_percentages"]
+
+        compute_slots = len(original_node_IP_list)
+        if compute_slots < 1:
+            raise ValueError("System 2 requires at least 1 slot")
+
+        base_slots = max(4, 2 * math.ceil(compute_slots / 4))
+        op_slots = base_slots * 2
+
+        def _cycle_to_length(items, n):
+            if not items:
+                raise ValueError("System 2 slot lists must be non-empty")
+            return [items[i % len(items)] for i in range(n)]
+
+        # Expand compute slots to exactly op_slots (wrap-around).
+        self.node_IP_list = _cycle_to_length(original_node_IP_list, op_slots)
+        self.CPU_GPU_select_list = _cycle_to_length(original_cpu_gpu, op_slots)
+        self.back_end_select_list = _cycle_to_length(original_backend, op_slots)
+        self.node_percentages = (
+            _cycle_to_length(original_percentages, op_slots)
+            if original_percentages
+            else [0.0] * op_slots
+        )
+
+        self._sys2_round_robin_expanded = True
+        self._sys2_compute_slots = compute_slots
+        self._sys2_base_slots = base_slots
+        self._sys2_op_slots = op_slots
+
+        print(
+            f"   System 2 slots: compute_slots={compute_slots}, "
+            f"base_slots={base_slots}, op_slots={op_slots}"
+        )
+
+        # Initialize the file paths list (must be length op_slots).
+        self.matrix_file_paths_list = []
+
+        # In System 2, Matrix B shard files are saved per *operation slot* index
+        # (e.g. ..._shard_0.bin .. ..._shard_{op_slots-1}.bin) on the node that executed that
+        # slot during the save path. During load we instruct each node's C++ server to
+        # load the shard(s) it needs from disk into its in-memory `matrix_shard_object_list`.
+        files_by_ip = {}
+
+        for op_index, node_IP in enumerate(self.node_IP_list):
+            shard_filename = f"{self.matrix_name}_shard_{op_index}.bin"
+            self.matrix_file_paths_list.append(shard_filename)
+            files_by_ip.setdefault(node_IP, set()).add(shard_filename)
+
+        for node_ip, files in files_by_ip.items():
+            files_list = " ".join(sorted(files))
+            cmd = f"server_command={load_cmd} {files_list}"
+            self.cluster_zmq_object.zmq_send_command(node_ip, cmd)
+
+        self.cluster_zmq_object.wait_for_acks(
+            len(files_by_ip),
+            "ACK_load_matrix_shard_object_list_complete",
+        )
+
+        print(f"\n✅ Matrix B grid loading complete")
+        print(f"   File paths tracked: {len(self.matrix_file_paths_list)}")
+        return True
+
+    def cluster_shard_operation(self, cluster_matrixB, TransposeA=False, TransposeB=False, send_back_result=True, operation='mul'):
+        """
+        Perform a distributed matrix operation across the cluster.
+        
+        Args:
+            cluster_matrixB: Another cluster_matrix instance for the second operand
+            TransposeA: Whether to transpose matrix A
+            TransposeB: Whether to transpose matrix B  
+            send_back_result: Whether to combine results into single file (True) 
+                            or keep distributed (False)
+            operation: Operation to perform ('mul', 'add', 'sub')
+        
+        Returns:
+            Base name of the result file(s)
+        """
+        
+        #print(f"\n{'='*60}")
+        #print(f"🚀 STARTING CLUSTER OPERATION")
+        #print(f"{'='*60}")
+        #print(f"Matrix A: {self.matrix_name}")
+        #print(f"Matrix B: {cluster_matrixB.matrix_name}")
+        print(f"Operation: {operation}")
+        print(f"Transpose A: {TransposeA}, Transpose B: {TransposeB}")
+        node_IP_list_len = len(self.node_IP_list)
+
+        print(f"Send back result: {send_back_result}")
+        print(f"Number of shards: {node_IP_list_len}")
+        
+        # ===== TRACK GPU USAGE PER NODE =====
+        # This ensures multiple GPUs on the same node get used properly
+        node_gpu_counters = {}
+        
+        #print(f"\n📤 DISTRIBUTING OPERATIONS TO NODES")
+        
+        # Send operation commands to each node for its assigned shard
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix) in enumerate(zip(
+            self.node_IP_list,  
+            self.CPU_GPU_select_list,
+            self.back_end_select_list, 
+            self.matrix_file_paths_list
+        )):
+            print(f"\nProcessing shard {shard_index}:")
+            
+            # Get GPU number for this node
+            if node_IP not in node_gpu_counters:
+                node_gpu_counters[node_IP] = 0
+            
+            current_gpu_number = node_gpu_counters[node_IP]
+            
+            # INCREMENT NOW for next operation on this node
+            if CPU_GPU_select:
+                node_gpu_counters[node_IP] += 1
+            
+            print(f"  Node: {node_IP}")
+            #print(f"  Backend: {back_end_select}")
+            #print(f"  Use GPU: {CPU_GPU_select} (GPU #{current_gpu_number})")
+            print(f"  Next GPU for this node will be: #{node_gpu_counters[node_IP]}")
+            
+            # Get file paths for both matrices
+            matrix_a = node_matrix  # Current matrix shard
+            matrix_b = cluster_matrixB.matrix_file_paths_list[shard_index]  # Other matrix shard
+            
+            # Convert booleans to lowercase strings for command
+            use_gpu_str = str(CPU_GPU_select).lower()  # "true" or "false"
+            
+            # ===== TRANSPOSE LOGIC HANDLING =====
+            # Handle backend-specific transpose quirks.
+            # GGML (llama) uses column-major; flip TransposeB and swap operand order
+            # to mirror the previously working cross-backend behavior.
+            local_TransposeA = TransposeA
+            local_TransposeB = TransposeB
+            if back_end_select == 'llama':
+                local_TransposeB = not TransposeB
+
+            TransposeA_str = str(local_TransposeA).lower()
+            TransposeB_str = str(local_TransposeB).lower()
+            #print(f"  Final transpose flags - A: {TransposeA_str}, B: {TransposeB_str}")
+            
+            # ===== PREPARE SEND_BACK FLAG =====
+            if node_IP_list_len == 1:
+                # Always request an in-memory combined payload on single-node runs.
+                # This avoids any filesystem readback of result shards.
+                join_dim = self.dim  # 0 or 1
+                send_back = join_dim * 10 + 1
+                if self.matrix_labeling in ('a', 'b'):
+                    send_back = -send_back
+                print(f"Send back result: Yes (single-node) ({send_back})")
+                print(f"  → system={'2' if send_back < 0 else '1'}, join_dim={join_dim}, shards=1")
+            elif not send_back_result:
+                send_back = 0
+                print("Send back result: No (keep distributed)")
+            else:
+                shard_count = node_IP_list_len
+                join_dim = self.dim  # 0 or 1
+                send_back = join_dim * 10 + shard_count
+                if self.matrix_labeling in ('a', 'b'):
+                    send_back = -send_back
+                print(f"Send back result: Yes ({send_back})")
+                print(f"  → system={'2' if send_back < 0 else '1'}, join_dim={join_dim}, shards={shard_count}")
+
+            # ===== BUILD COMMAND FOR SPECIFIC BACKEND =====
+            command = (
+                f"server_command={back_end_select} "
+                f"{matrix_a} "          # GGML expects B first
+                f"{TransposeA_str} "
+                f"{matrix_b} "          # Then A
+                f"{TransposeB_str} "
+                f"{use_gpu_str} "
+                f"{current_gpu_number} "
+                f"{send_back} "
+                f"{operation} "
+                f"2 "
+                f"{shard_index}"
+            )
+    
+            # ===== SEND COMMAND TO NODE =====
+            #print(f"  Sending command to node...")
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            #print(f"  ✅ Command sent to node {node_IP}")
+        
+        # ===== WAIT FOR ACKS FROM ALL NODES =====
+        expected_acks = len(self.node_IP_list)  # one ACK per shard/operation
+        print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
+        self.cluster_zmq_object.wait_for_acks(expected_acks, "ACK_matrixOp_complete")
+        # ===== OPERATION COMPLETE =====
+        print(f"✅ CLUSTER OPERATION COMPLETE")
+
+        # When keep-distributed, return a cluster_matrix wired to the shard outputs
+        # ===== SETUP RESULT FILENAMES =====
+        # Result names match the operand order we send to the server:
+        # self (matrix A) first, then cluster_matrixB (matrix B)
+        base_result_name=''
+        if back_end_select == 'torch':
+            base_result_name = f"{self.matrix_name}x{cluster_matrixB.matrix_name}"
+            print(f"\n📊 Result base: {base_result_name} (send_back={send_back})")
+        if back_end_select == 'llama':
+            base_result_name = f"{cluster_matrixB.matrix_name}x{self.matrix_name}"
+            print(f"\n📊 Result base: {base_result_name} (send_back={send_back})")
+
+        # CASE 1: Single node → always wait for combined PT (no filesystem)
+        if node_IP_list_len == 1:
+            combined_matrix = self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+            return combined_matrix
+
+        # CASE 2: Multiple nodes, want combined result → wait for combined PT
+        if send_back != 0 and node_IP_list_len > 1:
+            combined_matrix = self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+            return combined_matrix
+
+        # CASE 3: Multiple nodes, keep distributed → return cluster_matrix
+        if not send_back_result and node_IP_list_len > 1: 
+            # Build a lightweight distributed `cluster_matrix` without touching the filesystem.
+            result = cluster_matrix.__new__(cluster_matrix)
+            result.cluster_zmq_object = self.cluster_zmq_object
+            result.zmq_context = self.zmq_context
+            result.llama_socket_pool = self.llama_socket_pool
+            result.llama_socket_pool_wifi = self.llama_socket_pool_wifi
+            result.ack_receiver_socket = self.ack_receiver_socket
+
+            result.IP = self.IP
+            result.wifi_IP = self.wifi_IP
+
+            result.local_DISK_folder = self.local_DISK_folder
+            result.local_project_dir = self.local_project_dir
+            result.remote_DISK_folder = self.remote_DISK_folder
+            result.remote_project_dir = self.remote_project_dir
+            result.local_RAM_folder = None
+            result.remote_RAM_folder = None
+
+            result.matrix_file_path = base_result_name
+            result.matrix_name = base_result_name
+            result.matrix_labeling = self.matrix_labeling
+
+            result.node_IP_list = list(self.node_IP_list)
+            result.CPU_GPU_select_list = list(self.CPU_GPU_select_list)
+            result.back_end_select_list = list(self.back_end_select_list)
+            result.node_percentages = list(self.node_percentages)
+            result.dim = self.dim
+            result.transpose = False
+            result.split_matrix = True
+
+            result.node_matrices = []
+            result.OG_matrix_shape = []
+
+            result.matrix_file_paths_list = [
+                f"{base_result_name}_shard_{i}.bin" for i in range(node_IP_list_len)
+            ]
+
+            return result
+
+        # fallback (should rarely happen)
+        return False
+
+    def ggml_cluster_single_matrix_operation(self, Transpose=False, operation='soft_max', send_back_result=False):
+        """
+        Perform a distributed GGML unary operation on all matrix shards.
+        Examples: soft_max, silu, gelu, gelu_quick, gelu_erf, rms_norm
+        """
+
+        print(f"\n{'='*60}")
+        print(f"🚀 STARTING CLUSTER GGML SINGLE-MATRIX OPERATION")
+        print(f"{'='*60}")
+        print(f"Matrix: {self.matrix_name}")
+        print(f"Operation: {operation}")
+        print(f"Transpose: {Transpose}")
+        print(f"Send back result: {send_back_result}")
+
+        node_IP_list_len = len(self.node_IP_list)
+
+        # Track GPU usage per node (same logic as cluster_shard_operation)
+        node_gpu_counters = {}
+
+        print(f"\n📤 DISTRIBUTING UNARY OPS TO NODES")
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix) in enumerate(zip(
+            self.node_IP_list,
+            self.CPU_GPU_select_list,
+            self.back_end_select_list,
+            self.matrix_file_paths_list
+        )):
+            print(f"\nProcessing shard {shard_index}:")
+
+            assert back_end_select == "llama", "ggml_cluster_single_matrix_operation only supports llama backend"
+
+            if node_IP not in node_gpu_counters:
+                node_gpu_counters[node_IP] = 0
+
+            current_gpu_number = node_gpu_counters[node_IP]
+            if CPU_GPU_select:
+                node_gpu_counters[node_IP] += 1
+
+            print(f"  Node: {node_IP}")
+            print(f"  Backend: llama")
+            print(f"  Use GPU: {CPU_GPU_select} (GPU #{current_gpu_number})")
+
+            use_gpu_str = str(CPU_GPU_select).lower()
+            Transpose_str = str(Transpose).lower()
+
+            split_join_system = 1
+            # ===== SEND_BACK LOGIC (same system as shard op) =====
+            if node_IP_list_len == 1:
+                join_dim = self.dim
+                send_back = join_dim * 10 + 1
+                if self.matrix_labeling in ('a', 'b'):
+                    send_back = -send_back
+                    split_join_system = 2
+            elif not send_back_result:
+                send_back = 0
+            else:
+                shard_count = node_IP_list_len
+                join_dim = self.dim
+                send_back = join_dim * 10 + shard_count
+                if self.matrix_labeling in ('a', 'b'):
+                    send_back = -send_back
+                    split_join_system = 2
+
+            print(f"  Send back: {send_back}")
+
+            # ===== BUILD COMMAND =====
+            command = (
+                f"server_command=transformerOp "
+                f"{node_matrix} "
+                f"{Transpose_str} "
+                f"{use_gpu_str} "
+                f"{current_gpu_number} "
+                f"{send_back} "
+                f"{operation} "
+                f"{self.dim} "
+                f"{shard_index}"
+            )
+
+            print(f"  Sending command...")
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            print(f"  ✅ Command sent")
+
+        # ===== WAIT FOR ACKS =====
+        expected_acks = node_IP_list_len
+        print(f"\n⏳ WAITING FOR ACKS ({expected_acks})")
+        self.cluster_zmq_object.wait_for_acks(expected_acks, "ACK_transformerOp_complete")
+        print(f"✅ CLUSTER GGML OP COMPLETE")
+
+        # ===== RESULT HANDLING =====
+        base_result_name = self.matrix_name
+
+        # Single node → always combined
+        if node_IP_list_len == 1:
+            return self.cluster_zmq_object.wait_for_combined_pt(f"{base_result_name}_shard_0.bin")
+
+        # Multi-node + combine
+        if send_back != 0:
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+
+        result = cluster_matrix(base_result_name, 
+                                cluster_zmq_object=self.cluster_zmq_object, 
+                                CPU_GPU_select_list=self.CPU_GPU_select_list, 
+                                node_percentages=self.node_percentages,
+                                back_end_select_list=self.back_end_select_list,
+                                split_matrix=self.split_matrix,
+                                dim=self.dim, 
+                                auto_set_up=[split_join_system, "load"])
+
+        return result
+
+    def cluster_flash_attn(
+            self,                      # self == Q
+            cluster_matrixK,           # K
+            cluster_matrixV,           # V
+            TransposeQ=False,
+            TransposeK=False,
+            TransposeV=False,
+            send_back_result=False,    # default: keep distributed
+            operation='flash_attn_ext',
+            extra_param_value=None,    # numeric value for extra param (scale, etc.)
+            mask=None                  # optional causal mask (torch.Tensor or cluster_matrix)
+        ):
+        """
+        Perform a distributed FlashAttention operation across the cluster.
+
+        Rules:
+        1. Q/K/V already in correct layout.
+        2. No backend transpose hacks allowed here.
+        3. Shards aligned by shard index and node.
+        4. Best performance: keep results distributed if possible.
+        """
+
+        #print(f"\n{'='*60}")
+        print(f"🚀 STARTING CLUSTER FLASH ATTENTION")
+        #print(f"{'='*60}")
+        print(f"Matrix Q: {self.matrix_name}")
+        print(f"Matrix K: {cluster_matrixK.matrix_name}")
+        print(f"Matrix V: {cluster_matrixV.matrix_name}")
+        print(f"Operation: {operation}")
+
+        node_count = len(self.node_IP_list)
+        print(f"Number of shards: {node_count}")
+        print(f"Send back combined result: {send_back_result}")
+
+        # GPU tracking per node
+        node_gpu_counters = {}
+
+        #print(f"\n📤 DISTRIBUTING FLASH ATTENTION TO NODES")
+
+        mask_matrix = None
+        if mask is not None:
+            if isinstance(mask, cluster_matrix):
+                mask_matrix = mask
+            else:
+                mask_tensor = torch.as_tensor(mask, dtype=torch.float32)
+                mask_matrix = cluster_matrix(
+                    matrix_file_path=mask_tensor,
                     cluster_zmq_object=self.cluster_zmq_object,
                     CPU_GPU_select_list=self.CPU_GPU_select_list,
-                    node_percentages=self.percentages,
-                    back_end_select_list=self.backend_select_list,
-                    split_matrix=True,
-                    dim=1,
+                    node_percentages=self.node_percentages,
+                    back_end_select_list=self.back_end_select_list,
+                    split_matrix=False,
+                    dim=self.dim,
                     auto_set_up=[1, "save"],
-                    matrix_name=matrix_name,
+                    matrix_name=f"{self.matrix_name}_causal_mask",
                 )
-                # Release CPU memory pressure early (these weights are huge).
-                del weight
-                if not keep_ram_copies:
-                    _cleanup_ram_bins(matrix_name)
-                elif gc_collect:
-                    gc.collect()
 
-    def rms_norm(self, x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-5) -> torch.Tensor:
-        # x: [..., hidden]
-        # weight: [hidden]
-        x_fp32 = x.float()
-        rms = torch.rsqrt(x_fp32.pow(2).mean(dim=-1, keepdim=True) + eps)
-        y = (x_fp32 * rms).to(x.dtype)
-        return y * weight.to(x.dtype)
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select) in enumerate(
+            zip(self.node_IP_list,
+                self.CPU_GPU_select_list,
+                self.back_end_select_list)
+        ):
+            print(f"\nProcessing shard {shard_index}")
 
-    def _get_tensor_cached(self, path: str) -> torch.Tensor:
-        """
-        Small-tensor cache for weights that are reused every token (layernorms, etc.).
-        Keeps numerics identical; avoids repeated disk I/O + Python overhead.
-        """
-        t = self._tensor_cache.get(path)
-        if t is None:
-            t = torch.load(path, map_location="cpu")
-            self._tensor_cache[path] = t
-        return t
+            # ---------- GPU SELECTION ----------
+            if node_IP not in node_gpu_counters:
+                node_gpu_counters[node_IP] = 0
+            current_gpu_number = node_gpu_counters[node_IP]
+            if CPU_GPU_select:
+                node_gpu_counters[node_IP] += 1
 
-    def _ensure_rope_cache(self, max_pos: int) -> None:
-        """
-        Precompute RoPE cos/sin tables for positions [0..max_pos).
-        This removes per-token `torch.arange` + trig overhead and preserves numerics.
-        """
-        max_pos = int(max_pos)
-        if max_pos <= 0:
-            return
+            print(f"  Node: {node_IP}")
+            print(f"  Backend: {back_end_select}")
+            print(f"  GPU enabled: {CPU_GPU_select} (GPU #{current_gpu_number})")
 
-        if self._rope_cos is not None and self._rope_sin is not None and self._rope_cos.shape[0] >= max_pos:
-            return
+            backend_for_flash = back_end_select if back_end_select in ("llama", "torch") else "llama"
+            if backend_for_flash != back_end_select:
+                print(f"  ⚠️  flash_attn backend '{back_end_select}' unsupported, using '{backend_for_flash}'")
 
-        rotary_dim = int(self._rope_rotary_dim)
-        if self._rope_inv_freq is None:
-            self._rope_inv_freq = 1.0 / (
-                self._rope_theta
-                ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / float(rotary_dim))
-            )  # [rotary_dim/2], float32 on CPU
+            # ---------- SHARD ALIGNMENT ----------
+            matrix_q = self.matrix_file_paths_list[shard_index]
+            matrix_k = cluster_matrixK.matrix_file_paths_list[shard_index]
+            matrix_v = cluster_matrixV.matrix_file_paths_list[shard_index]
 
-        positions = torch.arange(max_pos, dtype=torch.float32).unsqueeze(1)  # [max_pos, 1]
-        freqs = positions * self._rope_inv_freq.unsqueeze(0)  # [max_pos, rotary_dim/2]
-        emb = torch.cat((freqs, freqs), dim=-1)  # [max_pos, rotary_dim]
-        self._rope_cos = emb.cos()
-        self._rope_sin = emb.sin()
+            # ---------- FLASH ATTENTION TRANSPOSE / GPU ----------
+            TransposeQ_str = str(TransposeQ).lower()
+            TransposeK_str = str(TransposeK).lower()
+            TransposeV_str = str(TransposeV).lower()
+            use_gpu_str = str(CPU_GPU_select).lower()
 
-    def _ensure_kv_cache(self, capacity: int) -> None:
-        """
-        Preallocate compact KV cache buffers and write by index (no torch.cat in decode loop).
-        """
-        capacity = int(capacity)
-        if capacity <= self._kv_cache_capacity and self._kv_cache_k is not None and self._kv_cache_v is not None:
-            return
-
-        # (Re)allocate. Values beyond current sequence length are never read.
-        self._kv_cache_capacity = max(capacity, 1)
-        self._kv_cache_k = torch.empty(
-            (int(self.num_layers), int(self.num_kv_heads), self._kv_cache_capacity, int(self.head_dim)),
-            dtype=torch.float32,
-        )
-        self._kv_cache_v = torch.empty(
-            (int(self.num_layers), int(self.num_kv_heads), self._kv_cache_capacity, int(self.head_dim)),
-            dtype=torch.float32,
-        )
-
-    def rope_apply(self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        position: int,
-        rope_theta: float = 10000.0,
-        rotary_dim: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply Llama-style RoPE to Q and K for a single position.
-
-        q: [..., head_dim]
-        k: [..., head_dim]
-        position: int (token index)
-        """
-        if rotary_dim is None:
-            rotary_dim = self.head_dim
-        if rotary_dim <= 0:
-            return q, k
-
-        dtype = q.dtype
-        rotary_dim = int(rotary_dim)
-        self._rope_theta = float(rope_theta)
-        self._rope_rotary_dim = rotary_dim
-        self._ensure_rope_cache(int(position) + 1)
-        assert self._rope_cos is not None and self._rope_sin is not None
-        cos = self._rope_cos[int(position)].to(dtype=dtype)
-        sin = self._rope_sin[int(position)].to(dtype=dtype)
-
-        def rotate_half(x: torch.Tensor) -> torch.Tensor:
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-        q_rot = (q_rot * cos) + (rotate_half(q_rot) * sin)
-        k_rot = (k_rot * cos) + (rotate_half(k_rot) * sin)
-
-        q_out = torch.cat((q_rot, q_pass), dim=-1)
-        k_out = torch.cat((k_rot, k_pass), dim=-1)
-        return q_out, k_out
-
-    def rope_apply_batch(
-        self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        positions: torch.Tensor,
-        rope_theta: float = 10000.0,
-        rotary_dim: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Apply Llama-style RoPE to Q and K for multiple positions at once.
-
-        q: [B, ..., head_dim]
-        k: [B, ..., head_dim]
-        positions: [B] absolute token indices (int64)
-        """
-        if rotary_dim is None:
-            rotary_dim = self.head_dim
-        rotary_dim = int(rotary_dim)
-        if rotary_dim <= 0:
-            return q, k
-
-        if positions.ndim != 1:
-            raise ValueError(f"positions must be 1D [B], got {tuple(positions.shape)}")
-        positions = positions.to(dtype=torch.long)
-
-        self._rope_theta = float(rope_theta)
-        self._rope_rotary_dim = rotary_dim
-        max_pos = int(positions.max().item()) + 1
-        self._ensure_rope_cache(max_pos)
-        assert self._rope_cos is not None and self._rope_sin is not None
-
-        dtype = q.dtype
-        cos = self._rope_cos.index_select(0, positions).to(dtype=dtype)  # [B, rotary_dim]
-        sin = self._rope_sin.index_select(0, positions).to(dtype=dtype)  # [B, rotary_dim]
-
-        def rotate_half(x: torch.Tensor) -> torch.Tensor:
-            x1 = x[..., : x.shape[-1] // 2]
-            x2 = x[..., x.shape[-1] // 2 :]
-            return torch.cat((-x2, x1), dim=-1)
-
-        q_rot, q_pass = q[..., :rotary_dim], q[..., rotary_dim:]
-        k_rot, k_pass = k[..., :rotary_dim], k[..., rotary_dim:]
-
-        # Broadcast cos/sin across all non-batch dims (heads, etc.).
-        view_shape = (cos.shape[0],) + (1,) * (q_rot.ndim - 2) + (cos.shape[1],)
-        cos_view = cos.view(view_shape)
-        sin_view = sin.view(view_shape)
-
-        q_rot = (q_rot * cos_view) + (rotate_half(q_rot) * sin_view)
-        k_rot = (k_rot * cos_view) + (rotate_half(k_rot) * sin_view)
-
-        q_out = torch.cat((q_rot, q_pass), dim=-1)
-        k_out = torch.cat((k_rot, k_pass), dim=-1)
-        return q_out, k_out
-
-    def expand_kv(self, k, v):
-        """
-        Expand KV heads for Grouped Query Attention (GQA).
-
-        Args:
-            k: Tensor (num_kv_heads, head_dim)
-            v: Tensor (num_kv_heads, head_dim)
-
-        Returns:
-            k_expanded: (num_q_heads, head_dim)
-            v_expanded: (num_q_heads, head_dim)
-        """
-        assert k.shape == (self.num_kv_heads, self.head_dim)
-        assert v.shape == (self.num_kv_heads, self.head_dim)
-
-        group_size = self.num_q_heads // self.num_kv_heads
-        assert self.num_q_heads % self.num_kv_heads == 0, "Invalid GQA head configuration"
-
-        k_expanded = k.repeat_interleave(group_size, dim=0)
-        v_expanded = v.repeat_interleave(group_size, dim=0)
-
-        return k_expanded, v_expanded
-
-    def run_transformer(
-        self,
-        prompt: str,
-        *,
-        max_new_tokens: int = 16,
-        use_chat_template: bool = False,
-        temperature: float = 0.0,
-        top_k: int = 0,
-        micro_batch_size: int = 16,
-        print_output: bool = True,
-    ) -> str:
-        out = self.generate_text(
-            prompt,
-            max_new_tokens=max_new_tokens,
-            use_chat_template=use_chat_template,
-            temperature=temperature,
-            top_k=top_k,
-            micro_batch_size=micro_batch_size,
-        )
-        if print_output:
-            print("\n=== model output ===\n")
-            print(out)
-            print("\n====================\n")
-        return out
-
-    def generate_text(
-        self,
-        prompt: str = "tell me a short joke",
-        *,
-        max_new_tokens: int = 20,
-        use_chat_template: bool = False,
-        temperature: float = 0.0,
-        top_k: int = 0,
-        micro_batch_size: int = 16,
-    ) -> str:
-        with torch.inference_mode():
-            prompt_embeddings = self.get_token_embeddings(prompt, use_chat_template=use_chat_template)
-            if prompt_embeddings is None:
-                raise RuntimeError("Failed to get prompt token embeddings")
-
-            if self.tokens is None:
-                raise RuntimeError("Tokenization failed; self.tokens is None")
-
-            token_ids: list[int] = self.tokens.input_ids[0].tolist()
-
-            # Preallocate compact KV cache once for the whole generation run (no torch.cat in decode loop).
-            # Capacity is prompt_len + max_new_tokens (safe upper bound; values beyond seq_len are never read).
-            capacity = len(token_ids) + int(max_new_tokens)
-            self._ensure_kv_cache(capacity)
-
-            last_hidden: torch.Tensor | None = None
-            mb = max(int(micro_batch_size), 1)
-            if mb == 1:
-                for token_position, token_embedding in enumerate(prompt_embeddings):
-                    last_hidden = self.run_transformer_layers(token_embedding, token_position)
+            # ---------- SEND_BACK LOGIC ----------
+            if node_count == 1 and send_back_result:
+                send_back = self.dim * 10 + 1
+            elif send_back_result:
+                send_back = self.dim * 10 + node_count
             else:
-                seq_len = int(prompt_embeddings.shape[0])
-                print(f"[MICROBATCH] prompt prefill enabled: micro_batch_size={mb}, prompt_len={seq_len}")
-                for start in range(0, seq_len, mb):
-                    chunk = prompt_embeddings[start : start + mb]  # [B, hidden]
-                    print(f"[MICROBATCH] prefill chunk: start={start}, batch={int(chunk.shape[0])}")
-                    chunk_out = self.run_transformer_layers_microbatch(chunk, start)  # [B, hidden]
-                    last_hidden = chunk_out[-1]
+                send_back = 0
+            print(f"  Send back: {send_back}")
 
-            if last_hidden is None:
-                raise RuntimeError("Prompt was empty; no hidden state produced")
+            # ---------- EXTRA PARAM ----------
+            # Must be numeric for C++ stoi parsing; default 0
+            extra_param_numeric = 0
+            if extra_param_value is not None:
+                extra_param_numeric = float(extra_param_value)
 
-            eos_id = getattr(self.tokenizer, "eos_token_id", None)
+            # ---------- MASK ----------
+            mask_arg = ""
+            if mask_matrix is not None:
+                if mask_matrix.matrix_file_paths_list:
+                    if len(mask_matrix.matrix_file_paths_list) > shard_index:
+                        mask_name = mask_matrix.matrix_file_paths_list[shard_index]
+                    else:
+                        mask_name = mask_matrix.matrix_file_paths_list[0]
+                    mask_arg = f" mask={mask_name}"
 
-            for _ in range(int(max_new_tokens)):
-                next_id, _logits = self.decode_next_token(last_hidden, temperature=temperature, top_k=top_k)
-                token_ids.append(next_id)
+            backend_arg = f" backend={backend_for_flash}"
 
-                if eos_id is not None and next_id == int(eos_id):
-                    break
+            # ---------- BUILD COMMAND ----------
+            command = (
+                f"server_command=flash_attn "
+                f"{matrix_q} {TransposeQ_str} "
+                f"{matrix_k} {TransposeK_str} "
+                f"{matrix_v} {TransposeV_str} "
+                f"{use_gpu_str} {current_gpu_number} {send_back} "
+                f"{operation} {extra_param_numeric}{backend_arg}{mask_arg} {shard_index}"
+            )
 
-                next_embedding = self.embed_tokens_weight[next_id]
-                last_hidden = self.run_transformer_layers(next_embedding, len(token_ids) - 1)
+            # ---------- SEND COMMAND ----------
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            #print(f"  ✅ Command sent: {command}")
 
-            return self.tokenizer.decode(token_ids, skip_special_tokens=False)
+        # ================= ACK HANDLING =================
+        print(f"\n⏳ Waiting for {node_count} ACKs")
+        self.cluster_zmq_object.wait_for_acks(
+            node_count,
+            "ACK_matrixOp_complete"
+        )
 
-    def run_transformer_layers(self, input_token_embeddings, token_position: int):
-        out = self.run_transformer_layers_microbatch(input_token_embeddings, int(token_position))
-        if out.ndim != 2 or out.shape[0] != 1:
-            raise RuntimeError(f"Expected microbatch output [1, hidden], got {tuple(out.shape)}")
-        return out[0]
+        print(f"✅ FLASH ATTENTION COMPLETE")
 
-    def run_transformer_layers_microbatch(self, input_token_embeddings: torch.Tensor, token_position: int) -> torch.Tensor:
+        # ================= RETURN HANDLING =================
+        # Must match C++ naming: "<Q>x<K>x<V>_shard_<i>.bin"
+        base_result_name = f"{self.matrix_name}x{cluster_matrixK.matrix_name}x{cluster_matrixV.matrix_name}"
+
+        # CASE 1: single node, combined
+        if node_count == 1 and send_back_result:
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+
+        # CASE 2: multi-node combined
+        if send_back_result:
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+
+        # CASE 3: keep distributed (FAST PATH)
+        result = cluster_matrix.__new__(cluster_matrix)
+        result.cluster_zmq_object = self.cluster_zmq_object
+        result.llama_socket_pool = self.llama_socket_pool
+        result.matrix_name = base_result_name
+        result.matrix_labeling = 'attn'
+        result.node_IP_list = list(self.node_IP_list)
+        result.CPU_GPU_select_list = list(self.CPU_GPU_select_list)
+        result.back_end_select_list = list(self.back_end_select_list)
+        result.node_percentages = list(self.node_percentages)
+        result.dim = self.dim
+        result.split_matrix = True
+        result.transpose = False
+        result.matrix_file_paths_list = [
+            f"{base_result_name}_shard_{i}.bin" for i in range(node_count)
+        ]
+
+        return result
+
+    def cluster_rope_operation(
+            self,
+            Transpose=False,
+            send_back_result=False,
+            operation='rope',
+            rope_type=0,              # 0=base, 1=ext, 2=multi
+            exter_parmiters=[]        # list of extra params for C++ RoPE structs
+        ):
         """
-        Micro-batched forward for a *consecutive* run of tokens.
+        Perform a distributed RoPE operation across the cluster.
+        """
 
-        Args:
-            input_token_embeddings: [B, hidden] or [hidden]
-            token_position: absolute position of the first token in the micro-batch
+        print(f"\n{'='*60}")
+        print(f"🚀 STARTING CLUSTER RoPE OPERATION")
+        print(f"{'='*60}")
+        print(f"Matrix: {self.matrix_name}")
+        print(f"Operation: {operation}")
+        print(f"Transpose: {Transpose}")
+        print(f"Send back result: {send_back_result}")
+        print(f"RoPE type: {rope_type}")
+
+        node_count = len(self.node_IP_list)
+        node_gpu_counters = {}
+
+        print(f"\n📤 DISTRIBUTING RoPE TO NODES")
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix) in enumerate(
+            zip(
+                self.node_IP_list,
+                self.CPU_GPU_select_list,
+                self.back_end_select_list,
+                self.matrix_file_paths_list
+            )
+        ):
+            print(f"\nProcessing shard {shard_index}")
+
+            # ---------- GPU SELECTION ----------
+            if node_IP not in node_gpu_counters:
+                node_gpu_counters[node_IP] = 0
+            current_gpu_number = node_gpu_counters[node_IP]
+            if CPU_GPU_select:
+                node_gpu_counters[node_IP] += 1
+
+            print(f"  Node: {node_IP}")
+            print(f"  Backend: {back_end_select}")
+            print(f"  GPU enabled: {CPU_GPU_select} (GPU #{current_gpu_number})")
+
+            # ---------- FLAGS ----------
+            Transpose_str = str(Transpose).lower()
+            use_gpu_str = str(CPU_GPU_select).lower()
+
+            # ---------- SEND_BACK ----------
+            # RoPE is feature-wise → force dim=1 semantics
+            if node_count == 1 and send_back_result:
+                send_back = 11
+            elif send_back_result:
+                send_back = 10 + node_count
+            else:
+                send_back = 0
+
+            print(f"  Send back: {send_back}")
+
+            # ---------- EXTRA PARAMS ----------
+            if exter_parmiters:
+                extra_param_str = ",".join(str(float(x)) for x in exter_parmiters)
+            else:
+                extra_param_str = "0"
+
+            # ---------- COMMAND ----------
+            command = (
+                f"server_command=rope "
+                f"{node_matrix} "
+                f"{Transpose_str} "
+                f"{use_gpu_str} "
+                f"{current_gpu_number} "
+                f"{send_back} "
+                f"{operation} "
+                f"{rope_type} "
+                f"{shard_index} "
+                f"{extra_param_str}"
+            )
+
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            print(f"  ✅ Command sent: {command}")
+
+        # ================= ACKS =================
+        print(f"\n⏳ Waiting for {node_count} ACKs")
+        self.cluster_zmq_object.wait_for_acks(node_count, "ACK_matrixOp_complete")
+        print(f"✅ CLUSTER RoPE OPERATION COMPLETE")
+
+        # ================= RESULT IDENTITY =================
+        base_result_name = f"{self.matrix_name}"
+
+        # 🔑 Rebind THIS matrix to the new RoPE output
+        self.matrix_name = base_result_name
+        self.matrix_file_paths_list = [
+            f"{base_result_name}_shard_{i}.bin"
+            for i in range(node_count)
+        ]
+
+        # RoPE creates a new semantic tensor
+        self.matrix_labeling = f"{self.matrix_labeling}"
+
+        # ================= RETURN =================
+        if send_back_result:
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+
+        return self
+
+    def cluster_reshape_operation(
+            self,
+            output_dims,
+            global_input_shape,
+            shard_input_shapes,
+            shard_percentages=None,
+            Transpose=False,
+            num_head=None,
+            send_back_result=False,
+        ):
+
+        if shard_percentages is None:
+            shard_percentages = self.node_percentages
+        if shard_percentages is None:
+            shard_percentages = []
+
+        print(f"\n{'='*60}")
+        print(f"🚀 STARTING CLUSTER RESHAPE OPERATION")
+        print(f"Matrix: {self.matrix_name}")
+        print(f"Target output shape (torch order): {output_dims}")
+        print(f"Global input shape: {global_input_shape}")
+        print(f"Shard input shapes: {shard_input_shapes}")
+        print(f"Shard percentages: {shard_percentages}")
+        print(f"Number of heads: {num_head}")
+
+        B, H_global, T, head_dim = output_dims
+        total_heads = H_global
+
+        print(f"\nTarget total heads: {total_heads}")
+
+        # --- STEP 1: DERIVE HEADS FROM ACTUAL SHARD COLUMNS ---
+        shard_heads = []
+        for shape in shard_input_shapes:
+            shard_heads.append(shape[1] // head_dim)
+
+        print(f"Derived shard head counts from columns: {shard_heads}")
+        print(f"Sum of shard heads: {sum(shard_heads)} (should equal {total_heads})")
+
+        # --- STEP 2: REPORT IF MISMATCH (NO FIXING, NO MAGIC) ---
+        if sum(shard_heads) != total_heads:
+            print(
+                f"⚠️ WARNING: Physical shard heads ({sum(shard_heads)}) "
+                f"do not match expected ({total_heads})"
+            )
+
+        # --- STEP 3: BUILD OUTPUT SHAPES ---
+        shard_output_shapes = [
+            [B, H, T, head_dim] for H in shard_heads
+        ]
+
+        # --- STEP 4: VALIDATE RESHAPE POSSIBILITY ---
+        for shard_index, (shard_in_shape, out_dims) in enumerate(
+            zip(shard_input_shapes, shard_output_shapes)
+        ):
+            _, H_shard, _, _ = out_dims
+            expected_input_cols = H_shard * head_dim
+
+            print(f"\nShard {shard_index}:")
+            print(f"  Input shape: {shard_in_shape}")
+            print(f"  Target output: {out_dims}")
+            print(f"  Expected input cols for reshape: {expected_input_cols}")
+            print(f"  Actual input cols: {shard_in_shape[1]}")
+            print(f"  Match: {'✓' if shard_in_shape[1] == expected_input_cols else '✗'}")
+
+            if shard_in_shape[1] != expected_input_cols:
+                delta = expected_input_cols - shard_in_shape[1]
+                print(f"  ERROR: Cannot reshape directly!")
+                if delta > 0:
+                    print(f"         -> Requires padding of {delta} columns")
+                else:
+                    print(f"         -> Requires trimming of {-delta} columns")
+
+        print(f"\n⏳ NOT SENDING COMMANDS - SHAPES ONLY")
+        print(f"✅ SHAPE ANALYSIS COMPLETE")
+
+        return self
+
+    def cluster_repeat_operation( 
+            self,  
+            repeat_dims,
+            num_heads=8,  
+            Transpose=False,  
+            send_back_result=False  
+        ):  
+        """  
+        Perform a distributed repeat operation across the cluster.  
+
+        repeat_dims : tuple/list : repeat factors for each dimension (4 elements)  
+        """  
+
+        print(f"\n{'='*60}")  
+        print(f"🚀 STARTING CLUSTER REPEAT OPERATION")  
+        print(f"{'='*60}")  
+        print(f"Matrix: {self.matrix_name}")  
+        print(f"Repeat dims: {repeat_dims}")  
+        print(f"Transpose: {Transpose}")  
+        print(f"Send back result: {send_back_result}")  
+
+        if len(repeat_dims) != 4:  
+            raise ValueError(f"repeat_dims must have 4 elements, got {len(repeat_dims)}")  
+
+        # --------- FIND REPEAT DIM ----------
+        repeat_dim = None
+        for index, num in enumerate(repeat_dims):
+            if num != 1:
+                repeat_dim = index
+                break
+
+        if repeat_dim is None:
+            raise ValueError("No repeat dimension specified (all repeat_dims == 1)")
+
+        node_count = len(self.node_IP_list)  
+        node_gpu_counters = {}  
+
+        print(f"\n📤 DISTRIBUTING REPEAT TO NODES")  
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix, node_percentage) in enumerate(  
+            zip(  
+                self.node_IP_list,  
+                self.CPU_GPU_select_list,  
+                self.back_end_select_list,  
+                self.matrix_file_paths_list,
+                self.node_percentages  
+            )  
+        ):  
+            print(f"\nProcessing shard {shard_index}")  
+
+            # ---------- GPU SELECTION ----------  
+            if node_IP not in node_gpu_counters:  
+                node_gpu_counters[node_IP] = 0  
+            current_gpu_number = node_gpu_counters[node_IP]  
+            if CPU_GPU_select:  
+                node_gpu_counters[node_IP] += 1  
+
+            print(f"  Node: {node_IP}")  
+            print(f"  Backend: {back_end_select}")  
+            print(f"  GPU enabled: {CPU_GPU_select} (GPU #{current_gpu_number})")  
+
+            # ---------- FLAGS ----------  
+            Transpose_str = str(Transpose).lower()  
+            use_gpu_str = str(CPU_GPU_select).lower()  
+
+            # ---------- SEND_BACK ----------  
+            join_dim = self.dim if self.dim in (0, 1) else 0
+            if node_count == 1 and send_back_result:  
+                send_back = join_dim * 10 + 1  
+            elif send_back_result:  
+                send_back = join_dim * 10 + node_count  
+            else:  
+                send_back = 0  
+
+            if self.matrix_labeling in ('a', 'b') and send_back != 0:
+                send_back = -send_back  
+
+            print(f"  Send back: {send_back}")  
+
+            # ---------- REPEAT DIMS ----------
+            try:
+                shard_repeat_dims = [1, 1, 1, 1]
+
+                node_repeat = num_heads * node_percentage
+                node_repeat_int = int(round(node_repeat))
+
+                if node_repeat_int <= 0:
+                    raise ValueError
+
+                shard_repeat_dims[repeat_dim] = node_repeat_int
+
+                repeat_dims_str = ",".join(str(x) for x in shard_repeat_dims)
+
+            except Exception:
+                raise ValueError(
+                    "Invalid GQA repeat configuration: "
+                    "num_heads * node_percentage must resolve to a positive integer"
+                )
+
+            # ---------- COMMAND ----------  
+            command = (  
+                f"server_command=repeat "  
+                f"{node_matrix} "  
+                f"{Transpose_str} "  
+                f"{use_gpu_str} "  
+                f"{current_gpu_number} "  
+                f"{send_back} "  
+                f"{repeat_dims_str} "  
+                f"{shard_index}"  
+            )  
+
+            socket_eth = self.llama_socket_pool[node_IP]  
+            socket_eth.send_multipart([command.encode()])  
+            print(f"  ✅ Command sent: {command}")  
+
+        # ================= ACKS =================  
+        print(f"\n⏳ Waiting for {node_count} ACKs")  
+        self.cluster_zmq_object.wait_for_acks(node_count, "ACK_matrixOp_complete")  
+        print(f"✅ CLUSTER REPEAT OPERATION COMPLETE")  
+
+        # ================= RESULT HANDLING =================  
+        base_result_name = f"{self.matrix_name}"  
+
+        if node_count == 1 and send_back_result:  
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)  
+
+        if send_back_result:  
+            return self.cluster_zmq_object.wait_for_combined_pt(base_result_name)  
+
+        result = cluster_matrix.__new__(cluster_matrix)  
+        result.cluster_zmq_object = self.cluster_zmq_object  
+        result.llama_socket_pool = self.llama_socket_pool  
+        result.matrix_name = base_result_name  
+        result.matrix_labeling = self.matrix_labeling  
+        result.node_IP_list = list(self.node_IP_list)  
+        result.CPU_GPU_select_list = list(self.CPU_GPU_select_list)  
+        result.back_end_select_list = list(self.back_end_select_list)  
+        result.node_percentages = list(self.node_percentages)  
+        result.dim = self.dim  
+        result.split_matrix = True  
+        result.transpose = False  
+        result.matrix_file_paths_list = [  
+            f"{base_result_name}_shard_{i}.bin" for i in range(node_count)  
+        ]  
+
+        return result
+
+    def send_back(self):
+        """
+        Explicitly trigger shard combination from distributed storage back to head node.
+        Useful when you want to combine distributed results after computation.
 
         Returns:
-            hidden_out: [B, hidden] final layer output for each token in the micro-batch
+            Combined matrix as torch.Tensor if successful, False otherwise
         """
-        if self._kv_cache_k is None or self._kv_cache_v is None:
-            raise RuntimeError("KV cache not initialized. Call run_transformer() first.")
+        print(f"\n{'='*60}")
+        print(f"🚀 TRIGGERING SHARD COMBINATION")
+        print(f"{'='*60}")
+        print(f"Matrix: {self.matrix_name}")
 
-        token_position = int(token_position)
+        node_IP_list_len = len(self.node_IP_list)
+        if node_IP_list_len == 0:
+            print("❌ No nodes available for send_back")
+            return False
 
-        if input_token_embeddings.ndim == 1:
-            input_token_embeddings = input_token_embeddings.unsqueeze(0)  # [1, hidden]
-        if input_token_embeddings.ndim != 2 or input_token_embeddings.shape[1] != int(self.Hidden_size):
-            raise ValueError(
-                f"input_token_embeddings must be [B, hidden] (hidden={int(self.Hidden_size)}), got {tuple(input_token_embeddings.shape)}"
+        print(f"Number of shards: {node_IP_list_len}")
+
+        # Determine base result name for combined payloads
+        base_result_name = self.matrix_name
+        if self.matrix_file_paths_list:
+            first_name = os.path.basename(self.matrix_file_paths_list[0])
+            if "_shard_" in first_name:
+                base_result_name = first_name.split("_shard_")[0]
+            else:
+                base_result_name = os.path.splitext(first_name)[0]
+
+        # Join dim must be 0 (rows) or 1 (cols)
+        join_dim = self.dim if self.dim in (0, 1) else 0
+
+        # Encode send_back flag: join_dim * 10 + shard_count
+        send_back_flag = join_dim * 10 + node_IP_list_len
+        if self.matrix_labeling in ('a', 'b'):
+            send_back_flag = -send_back_flag
+
+        print(f"Send back flag: {send_back_flag}")
+        print(f"  → system={'2' if send_back_flag < 0 else '1'}, join_dim={join_dim}, shards={node_IP_list_len}")
+
+        print(f"\n📤 SENDING COMBINE COMMANDS TO NODES")
+
+        for shard_index, (node_IP, CPU_GPU_select, back_end_select, node_matrix) in enumerate(
+            zip(self.node_IP_list,
+                self.CPU_GPU_select_list,
+                self.back_end_select_list,
+                self.matrix_file_paths_list)
+        ):
+            print(f"\nProcessing shard {shard_index}:")
+            print(f"  Node: {node_IP}")
+            print(f"  Backend: {back_end_select}")
+            print(f"  Matrix file: {node_matrix}")
+
+            command = (
+                f"server_command=send_back "
+                f"{node_matrix} "
+                f"{shard_index} "
+                f"{send_back_flag}"
             )
 
-        batch = int(input_token_embeddings.shape[0])
-        end_pos_exclusive = token_position + batch
-        if end_pos_exclusive > int(self._kv_cache_capacity):
-            self._ensure_kv_cache(end_pos_exclusive)
+            print(f"  Command: {command}")
+            socket_eth = self.llama_socket_pool[node_IP]
+            socket_eth.send_multipart([command.encode()])
+            print(f"  ✅ Command sent to node {node_IP} (shard {shard_index})")
 
-        positions = torch.arange(token_position, end_pos_exclusive, dtype=torch.long)
+        # ===== WAIT FOR ACKS FROM ALL NODES =====
+        expected_acks = node_IP_list_len
+        print(f"\n⏳ WAITING FOR ACKS FROM NODES ({expected_acks})")
+        self.cluster_zmq_object.wait_for_acks(expected_acks, "ACK_send_back_complete")
 
-        for layer_idx in range(int(self.num_layers)):
-            paths = self._layer_paths[int(layer_idx)]
+        print(f"✅ ALL SHARDS SENT BACK")
 
-            # ------------------------------------------------------------
-            # 1) Attention pre-norm + QKV projections (cluster offload)
-            #    Shape bump: [hidden, B] instead of [hidden, 1]
-            # ------------------------------------------------------------
-            input_layernorm_weight = self._get_tensor_cached(paths["ln_in"])
-            x_norm = self.rms_norm(input_token_embeddings, input_layernorm_weight)  # [B, hidden]
-            x_col = x_norm.t().contiguous()  # [hidden, B]
-            if batch > 1 and layer_idx == 0:
-                print(f"[MICROBATCH] dispatch A: x_col shape={tuple(x_col.shape)} (hidden,B)")
+        # ===== WAIT FOR COMBINED RESULT =====
+        print(f"\n🔄 WAITING FOR COMBINED RESULT ({base_result_name})")
 
-            x_cluster = cluster_matrix(
-                matrix_file_path=x_col,
-                cluster_zmq_object=self.cluster_zmq_object,
-                CPU_GPU_select_list=self.CPU_GPU_select_list,
-                node_percentages=self.percentages,
-                back_end_select_list=self.backend_select_list,
-                split_matrix=False,
-                dim=1,
-                auto_set_up=[1, "save"],
-                matrix_name="input_token_embeddings",
-            )
+        try:
+            combined_matrix = self.cluster_zmq_object.wait_for_combined_pt(base_result_name)
+        except Exception as exc:
+            print(f"❌ FAILED TO RECEIVE COMBINED MATRIX: {exc}")
+            return False
 
-            q_w = self._get_cluster_weight_cached(paths["attn_q"])
-            k_w = self._get_cluster_weight_cached(paths["attn_k"])
-            v_w = self._get_cluster_weight_cached(paths["attn_v"])
-
-            q_flat = x_cluster.cluster_shard_operation(q_w, True, False, True)
-            k_flat = x_cluster.cluster_shard_operation(k_w, True, False, True)
-            v_flat = x_cluster.cluster_shard_operation(v_w, True, False, True)
-
-            q_flat = self._as_batch_first_2d(q_flat, batch, int(self.hidden_size), name=f"layer{layer_idx}.q_flat")
-            k_flat = self._as_batch_first_2d(k_flat, batch, int(self.kv_dim), name=f"layer{layer_idx}.k_flat")
-            v_flat = self._as_batch_first_2d(v_flat, batch, int(self.kv_dim), name=f"layer{layer_idx}.v_flat")
-
-            # [B, hidden] -> [B, heads, head_dim]
-            q = q_flat.reshape(batch, int(self.num_q_heads), int(self.head_dim))
-            k = k_flat.reshape(batch, int(self.num_kv_heads), int(self.head_dim))
-            v = v_flat.reshape(batch, int(self.num_kv_heads), int(self.head_dim))
-
-            # ------------------------------------------------------------
-            # 2) RoPE (position-aware for each token in micro-batch)
-            # ------------------------------------------------------------
-            q, k = self.rope_apply_batch(
-                q,
-                k,
-                positions=positions,
-                rope_theta=self._rope_theta,
-                rotary_dim=self.head_dim,
-            )
-
-            # ------------------------------------------------------------
-            # 3) KV cache write (single slice write for the micro-batch)
-            #    Cache layout: [layers, Hkv, T, D]
-            # ------------------------------------------------------------
-            self._kv_cache_k[layer_idx, :, token_position:end_pos_exclusive, :] = k.transpose(0, 1).to(dtype=torch.float32)
-            self._kv_cache_v[layer_idx, :, token_position:end_pos_exclusive, :] = v.transpose(0, 1).to(dtype=torch.float32)
-
-            # ------------------------------------------------------------
-            # 4) Attention with causal mask inside micro-batch
-            # ------------------------------------------------------------
-            T_all = end_pos_exclusive
-            k_cache = self._kv_cache_k[layer_idx, :, :T_all, :]  # [Hkv, T, D]
-            v_cache = self._kv_cache_v[layer_idx, :, :T_all, :]  # [Hkv, T, D]
-
-            q_group = q.reshape(batch, int(self.num_kv_heads), int(self._kv_group_size), int(self.head_dim))  # [B, Hkv, G, D]
-            q_group = q_group.permute(1, 2, 0, 3)  # [Hkv, G, B, D]
-
-            scores = torch.matmul(
-                q_group,  # [Hkv, G, B, D]
-                k_cache.transpose(-1, -2).unsqueeze(1),  # [Hkv, 1, D, T]
-            )  # -> [Hkv, G, B, T]
-            scores = scores * self._inv_sqrt_head_dim
-
-            # Causal mask for micro-batch: token at position p cannot attend to keys > p.
-            key_idx = torch.arange(T_all, dtype=torch.long, device=scores.device)
-            pos_for_mask = positions.to(device=scores.device)
-            causal = key_idx.unsqueeze(0) <= pos_for_mask.unsqueeze(1)  # [B, T]
-            scores = scores.masked_fill(~causal.unsqueeze(0).unsqueeze(0), torch.finfo(scores.dtype).min)
-
-            attn_weights = torch.softmax(scores, dim=-1)  # [Hkv, G, B, T]
-            attn_out = torch.matmul(attn_weights, v_cache.unsqueeze(1))  # [Hkv, G, B, D]
-
-            attn_out = attn_out.permute(2, 0, 1, 3)  # [B, Hkv, G, D]
-            attn_output = attn_out.reshape(batch, int(self.num_q_heads), int(self.head_dim))  # [B, Hq, D]
-
-            # o_proj + residual (identical math, just batched)
-            attn_output_flat = attn_output.reshape(batch, int(self.Hidden_size))  # [B, hidden]
-            attn_hidden = attn_output_flat @ self._get_attn_o_proj_mat(layer_idx)  # [B, hidden]
-            hidden_out = input_token_embeddings + attn_hidden  # [B, hidden]
-
-            # ------------------------------------------------------------
-            # 5) MLP block (post-attn norm + 2 matmuls) in batch
-            # ------------------------------------------------------------
-            input_token_embeddings = self.mlp_layer(layer_idx, hidden_out)
-
-        return input_token_embeddings
-
-    def mlp_layer(self,layer_idx, hidden_out):
-        layer_idx = int(layer_idx)
-        paths = self._layer_paths[layer_idx]
-        mlp_up_path = paths["mlp_up"]
-        mlp_down_path = paths["mlp_down"]
-        mlp_gate_path = paths["mlp_gate"]
-        post_attn_ln_path = paths["ln_post"]
-
-        squeeze_out = (hidden_out.ndim == 1)
-        if hidden_out.ndim == 1:
-            residual = hidden_out.unsqueeze(0)  # [1, hidden]
-        elif hidden_out.ndim == 2:
-            residual = hidden_out  # [B, hidden]
-        else:
-            raise ValueError(f"mlp_layer expects [hidden] or [B, hidden], got {tuple(hidden_out.shape)}")
-
-        # Cache post-attn RMSNorm weights (hot in decode loop).
-        post_attn_ln_w = self._get_tensor_cached(post_attn_ln_path)
-        if post_attn_ln_w.ndim != 1:
-            raise ValueError(f"post_attention_layernorm_weight must be 1D, got {tuple(post_attn_ln_w.shape)}")
-        if post_attn_ln_w.shape[0] != residual.shape[1]:
-            raise ValueError(
-                f"post_attention_layernorm_weight hidden mismatch: weight={post_attn_ln_w.shape[0]} hidden={residual.shape[1]}"
-            )
-        mlp_in = self.rms_norm(residual, post_attn_ln_w)  # [B, hidden]
-        mlp_in_col = mlp_in.t().contiguous()  # [hidden, B]
-
-        mlp_in_cluster = cluster_matrix(
-            matrix_file_path=mlp_in_col,
-            cluster_zmq_object=self.cluster_zmq_object,
-            CPU_GPU_select_list=self.CPU_GPU_select_list,
-            node_percentages=self.percentages,
-            back_end_select_list=self.backend_select_list,
-            split_matrix=False,
-            dim=1,
-            auto_set_up=[1, "save"],
-            matrix_name=f"layer{layer_idx}_mlp_in",
-        )
-
-        # Cache static MLP weight shards (avoid per-token cluster_matrix construction).
-        mlp_gate_cluster = self._get_cluster_weight_cached(mlp_gate_path)
-        mlp_up_cluster = self._get_cluster_weight_cached(mlp_up_path)
-        mlp_down_cluster = self._get_cluster_weight_cached(mlp_down_path)
-
-        gate = mlp_in_cluster.cluster_shard_operation(mlp_gate_cluster, True, False, True)  # [B, intermediate]
-        up = mlp_in_cluster.cluster_shard_operation(mlp_up_cluster, True, False, True)      # [B, intermediate]
-        gate = self._as_batch_first_2d(gate, int(residual.shape[0]), int(gate.shape[-1]), name=f"layer{layer_idx}.mlp_gate")
-        up = self._as_batch_first_2d(up, int(residual.shape[0]), int(up.shape[-1]), name=f"layer{layer_idx}.mlp_up")
-        intermediate = torch.nn.functional.silu(gate) * up                                   # [B, intermediate]
-
-        intermediate_cluster = cluster_matrix(
-            matrix_file_path=intermediate.t().contiguous(),  # [intermediate, B]
-            cluster_zmq_object=self.cluster_zmq_object,
-            CPU_GPU_select_list=self.CPU_GPU_select_list,
-            node_percentages=self.percentages,
-            back_end_select_list=self.backend_select_list,
-            split_matrix=False,
-            dim=1,
-            auto_set_up=[1, "save"],
-            matrix_name=f"layer{layer_idx}_mlp_intermediate",
-        )
-        mlp_out = intermediate_cluster.cluster_shard_operation(mlp_down_cluster, True, False, True)  # [B, hidden]
-        mlp_out = self._as_batch_first_2d(mlp_out, int(residual.shape[0]), int(residual.shape[1]), name=f"layer{layer_idx}.mlp_out")
-
-        # Residual connection (post-attn residual + MLP output)
-        layer_out = residual + mlp_out
-        if squeeze_out:
-            return layer_out.squeeze(0)
-        return layer_out
-
-if __name__ == "__main__":
-    IP_list = [
-        "192.168.2.100",
-        "192.168.2.100",
-        "192.168.2.101",
-        "192.168.2.101",
-        "192.168.2.104"
-    ]
-    percentages = [0.35,0.35,0.15,0.05,0.1]
-    CPU_GPU_select_list = [True,True,True,True,True]
-    backend_select_list = ["llama","llama","llama","llama","llama"]
-
-    test = cluster_llm_transformer(
-        "/home/rino/.cache/exo/downloads/mlabonne--Meta-Llama-3.1-8B-Instruct-abliterated",
-        IP_list,
-        percentages,
-        CPU_GPU_select_list,
-        backend_select_list,
-    )
-
-    #test.save_all_model_layers()
-    #test.transpose_mlp_layers()
-    #test.save_distribute_model_matrices(0,32)
-
-    # Example:
-
-    input_prompt = input("Enter prompt: ")
-
-    output_prompt = test.run_transformer(input_prompt, max_new_tokens=16, micro_batch_size=8)
-
-    print(input_prompt, '\n')
-    print(output_prompt, '\n')
-     
+        print(f"✅ COMBINED MATRIX RECEIVED")
+        print(f"   Shape: {combined_matrix.shape if hasattr(combined_matrix, 'shape') else 'Unknown'}")
+        return combined_matrix
